@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+
+# Local runtime data and uploaded originals
+*.db
+*.sqlite
+*.sqlite3
+parchai_storage/
+
+# Local secrets and environment overrides
+.env
+.env.*
+!.env.example
+
+# Generated exports
+*.xlsx
+*.csv
+*.psv

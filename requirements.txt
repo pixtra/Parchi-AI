@@ -1,0 +1,6 @@
+openpyxl
+pandas
+Pillow
+PyMuPDF
+streamlit
+google-genai
