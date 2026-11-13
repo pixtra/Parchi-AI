@@ -708,6 +708,111 @@ def clamp_confidence(score: Any, default: int = 50) -> int:
         return default
 
 
+DOCUMENT_TITLE_WORDS = {
+    "tax invoice", "invoice", "purchase order", "delivery challan",
+    "goods receipt note", "grn", "weighment slip", "credit note",
+    "debit note", "quotation", "receipt", "transport receipt",
+}
+
+
+def _normalised_phrase(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def is_document_title_fact(
+    label: str, value: str, document_type: str = "", page_text: str = ""
+) -> bool:
+    label_text = _normalised_phrase(label)
+    value_text = _normalised_phrase(value)
+    if not value_text or label_text != value_text:
+        return False
+    title = value_text
+    known_type = _normalised_phrase(document_type)
+    if title in DOCUMENT_TITLE_WORDS or title == known_type:
+        return True
+    first_lines = {
+        _normalised_phrase(line)
+        for line in page_text.splitlines()[:5]
+        if line.strip()
+    }
+    return title in first_lines and len(title.split()) <= 6
+
+
+def contextual_label(label: str, value: str, document_type: str = "", page_text: str = "") -> str:
+    """Make common generic labels contextual without restricting unusual labels."""
+    original = clean_text(label).strip()
+    generic = _normalised_phrase(original)
+    context = f"{_normalised_phrase(document_type)} {_normalised_phrase(page_text[:2500])}"
+    replacements = {
+        "name": (
+            ("supplier", "Supplier Name"), ("vendor", "Supplier Name"),
+            ("buyer", "Buyer Name"), ("consignee", "Consignee Name"),
+            ("transporter", "Transporter Name"), ("driver", "Driver Name"),
+        ),
+        "number": (
+            ("invoice", "Invoice Number"), ("purchase order", "Purchase Order Number"),
+            ("vehicle", "Vehicle Registration Number"), ("challan", "Delivery Challan Number"),
+            ("grn", "Goods Receipt Note Number"),
+        ),
+        "date": (
+            ("invoice", "Invoice Date"), ("delivery", "Delivery Date"),
+            ("purchase order", "Purchase Order Date"), ("due", "Due Date"),
+        ),
+        "amount": (
+            ("grand total", "Invoice Total Amount"), ("total", "Invoice Total Amount"),
+            ("taxable", "Taxable Amount"), ("balance", "Outstanding Balance"),
+            ("tax amount", "Tax Amount"),
+        ),
+        "weight": (
+            ("gross", "Gross Weight"), ("tare", "Tare Weight"), ("net", "Net Weight"),
+        ),
+        "quantity": (
+            ("ordered", "Ordered Quantity"), ("received", "Received Quantity"),
+            ("delivered", "Delivered Quantity"),
+        ),
+        "address": (
+            ("supplier", "Supplier Address"), ("delivery", "Delivery Address"),
+            ("billing", "Billing Address"),
+        ),
+    }
+    for token, specific in replacements.get(generic, ()):
+        if token in context:
+            return specific
+    return original
+
+
+def calibrated_confidence(
+    requested: Any,
+    value: str,
+    evidence: str,
+    page_text: Optional[str],
+    label: str,
+) -> int:
+    """Use model certainty as a signal, adjusted by independently observable evidence."""
+    base = clamp_confidence(requested, 50)
+    evidence_len = len(evidence.strip())
+    value_len = len(value.strip())
+    if page_text is None:
+        return max(1, min(100, round(base * 0.78 + min(18, evidence_len / 20))))
+    source = normalise(page_text)
+    evidence_match = bool(evidence.strip()) and normalise(evidence) in source
+    value_match = bool(value.strip()) and normalise(value) in source
+    adjustment = 0
+    if evidence_match:
+        adjustment += min(12, 4 + evidence_len // 35)
+    elif value_match:
+        adjustment -= 8
+    else:
+        adjustment -= 24
+    if value_len <= 1:
+        adjustment -= 10
+    if re.search(r"[?*_]{2,}|…", value):
+        adjustment -= 12
+    if label and _normalised_phrase(label) in {"name", "number", "date", "amount", "weight", "quantity"}:
+        adjustment -= 3
+    return max(1, min(100, base + adjustment))
+
+
 def assess(value: str, evidence: str, page_text: Optional[str]) -> Dict[str, Any]:
     """Confidence reflects evidence quality. page_text is None when the page has no text
     layer, so the value cannot be checked against the source."""
@@ -752,7 +857,7 @@ def _fact(
     }
 
 
-def local_extract(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def local_extract(pages: List[Dict[str, Any]], document_type: str = "") -> List[Dict[str, Any]]:
     facts: List[Dict[str, Any]] = []
     for page in pages:
         number = page["page_number"]
@@ -767,6 +872,9 @@ def local_extract(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             match = KV_RE.match(line)
             if match:
                 label, value = match.group(1).strip(), match.group(2).strip()
+                if is_document_title_fact(label, value, document_type, page["text"]):
+                    continue
+                label = contextual_label(label, value, document_type, page["text"])
                 facts.append(_fact(number, label, to_concept(label), value, line))
                 structured += 1
                 continue
@@ -778,7 +886,8 @@ def local_extract(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     if key in line_facts:
                         continue
                     line_facts.add(key)
-                    facts.append(_fact(number, label, concept, value, line))
+                    specific_label = contextual_label(label, value, document_type, page["text"])
+                    facts.append(_fact(number, specific_label, to_concept(specific_label), value, line))
                     structured += 1
         if structured == 0:
             first_line = next((ln.strip() for ln in page["text"].splitlines() if ln.strip()), "")
@@ -1017,10 +1126,15 @@ def parse_batch_payload(text: str, labels: List[str]) -> Tuple[Dict[str, Dict[st
             if not isinstance(item, dict):
                 continue
             name = str(item.get("label") or "Unlabelled field").strip()
+            value = str(item.get("value") or "").strip()
+            document_type = str(doc.get("document_type") or "")
             page_number, page_valid = page_of(item)
+            if is_document_title_fact(name, value, document_type):
+                continue
+            name = contextual_label(name, value, document_type)
             fact = _fact(
-                page_number, name, to_concept(str(item.get("concept") or name)),
-                str(item.get("value") or "").strip(),
+                page_number, name, to_concept(name),
+                value,
                 str(item.get("evidence") or "").strip()[:500],
                 item.get("confidence_score"),
             )
@@ -1117,8 +1231,8 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
 
 
 def unit_fallback(unit: Dict[str, Any], message: str) -> None:
-    unit["items"] = local_extract(unit["pages_slice"])
     unit["doc_type"] = classify_local(unit["pages_slice"])
+    unit["items"] = local_extract(unit["pages_slice"], unit["doc_type"])
     unit["status"] = "fallback"
     unit["message"] = f"Local rules used: {message}"
 
@@ -1244,7 +1358,10 @@ def finalize_document(docket_id: str, doc: Dict[str, Any], status: str,
             evidence = clean_text(item["evidence"])
             assessment = assess(value, evidence, doc["page_text"].get(page_number))
             if item.get("confidence_score") is not None:
-                assessment["score"] = clamp_confidence(item["confidence_score"], assessment["score"])
+                assessment["score"] = calibrated_confidence(
+                    item["confidence_score"], value, evidence,
+                    doc["page_text"].get(page_number), item["label"],
+                )
                 assessment["band"] = band_for(assessment["score"])
                 assessment["reasons"] = list(dict.fromkeys(
                     assessment["reasons"] + ["MODEL_CONFIDENCE"]
@@ -1423,13 +1540,14 @@ def process_uploads(docket_id: str, uploads: List[Any]) -> None:
         run.write(f"{doc['filename']}: Reading {doc['page_count']} page(s)/sheet(s).")
         if mode == "Local":
             set_document_status(doc["id"], "extracting")
-            items = local_extract(doc["pages"])
+            document_type = classify_local(doc["pages"])
+            items = local_extract(doc["pages"], document_type)
             set_document_status(doc["id"], "validating")
             complete = all(page["readable"] for page in doc["pages"])
             return save(
                 doc,
                 "completed" if complete else "partial",
-                classify_local(doc["pages"]),
+                document_type,
                 items,
                 "Extracted with local rules."
                 if complete
