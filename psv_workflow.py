@@ -13,12 +13,14 @@ from openpyxl.styles import PatternFill
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 
-OUTPUT_COLUMNS = ["Field Name", "Extracted Value", "Source Document", "Confidence Level"]
-CONFIDENCE_ORDER = ["Low", "Medium", "High"]
+OUTPUT_COLUMNS = ["Document Name", "Label", "Value", "Confidence Score"]
 ALIASES = {
-    "field": ("field name", "field_name", "label", "attribute", "concept"),
+    "field": ("field", "field name", "field_name", "label", "attribute", "concept"),
     "value": ("extracted value", "extracted_value", "value", "text"),
-    "source": ("source document", "source_document", "filename", "file name", "document"),
+    "source": (
+        "document name", "source", "source document", "source_document",
+        "filename", "file name", "document",
+    ),
     "score": ("confidence score", "confidence_score", "score", "confidence"),
     "level": ("confidence level", "confidence_level", "confidence band", "confidence_band"),
 }
@@ -47,20 +49,16 @@ def _score(value: object) -> float | None:
     return number * 100 if 0 <= number <= 1 else number
 
 
-def confidence_level(score: object = None, level: object = None) -> str:
+def confidence_score(score: object = None, level: object = None) -> int:
     numeric = _score(score)
     if numeric is not None:
-        if numeric > 80:
-            return "High"
-        if numeric >= 50:
-            return "Medium"
-        return "Low"
+        return max(1, min(100, round(numeric)))
     text = str(level or "").strip().lower()
     if text in {"high", "green"}:
-        return "High"
+        return 90
     if text in {"medium", "yellow", "moderate"}:
-        return "Medium"
-    return "Low"
+        return 70
+    return 40
 
 
 def _normalise_fact(value: object) -> str:
@@ -89,10 +87,10 @@ def label_value_mismatch(label: object, value: object) -> bool:
 def auto_verified_indices(frame: pd.DataFrame) -> set[int]:
     """Rows duplicated by field/value are trusted for the review queue."""
     keys = frame.apply(
-        lambda row: (_normalise_fact(row["Field Name"]), _normalise_fact(row["Extracted Value"])),
+        lambda row: (_normalise_fact(row["Label"]), _normalise_fact(row["Value"])),
         axis=1,
     )
-    label_values = frame.groupby(frame["Field Name"].map(_normalise_fact))["Extracted Value"].agg(
+    label_values = frame.groupby(frame["Label"].map(_normalise_fact))["Value"].agg(
         lambda values: {_normalise_fact(value) for value in values if _normalise_fact(value)}
     )
     conflicting_labels = {label for label, values in label_values.items() if len(values) > 1}
@@ -106,6 +104,16 @@ def auto_verified_indices(frame: pd.DataFrame) -> set[int]:
 def clean_psv(data: bytes) -> pd.DataFrame:
     """Read a PSV payload and return the required four-column review dataset."""
     text = data.decode("utf-8-sig")
+    try:
+        header = next(csv.reader(io.StringIO(text), delimiter="|"))
+    except StopIteration:
+        raise ValueError("The PSV is empty; it needs a header row.") from None
+    header_names = [_normalise_column(column) for column in header]
+    duplicates = sorted({
+        column for column in header_names if header_names.count(column) > 1 and column
+    })
+    if duplicates:
+        raise ValueError(f"Duplicate PSV column name(s): {', '.join(duplicates)}.")
     frame = pd.read_csv(io.StringIO(text), sep="|", dtype=str, keep_default_na=False)
     field_column = _find_column(frame.columns, ALIASES["field"])
     value_column = _find_column(frame.columns, ALIASES["value"])
@@ -125,11 +133,11 @@ def clean_psv(data: bytes) -> pd.DataFrame:
         raise ValueError("The PSV must include a confidence score or confidence level column.")
 
     result = pd.DataFrame({
-        "Field Name": frame[field_column].astype(str),
-        "Extracted Value": frame[value_column].astype(str),
-        "Source Document": frame[source_column].astype(str),
-        "Confidence Level": [
-            confidence_level(
+        "Document Name": frame[source_column].astype(str),
+        "Label": frame[field_column].astype(str),
+        "Value": frame[value_column].astype(str),
+        "Confidence Score": [
+            confidence_score(
                 frame.iloc[index][score_column] if score_column else None,
                 frame.iloc[index][level_column] if level_column else None,
             )
@@ -137,17 +145,17 @@ def clean_psv(data: bytes) -> pd.DataFrame:
         ],
     })
     mismatches = [
-        label_value_mismatch(result.iloc[index]["Field Name"], result.iloc[index]["Extracted Value"])
+        label_value_mismatch(result.iloc[index]["Label"], result.iloc[index]["Value"])
         for index in range(len(result))
     ]
-    result.loc[mismatches, "Confidence Level"] = "Low"
-    label_values = result.groupby(result["Field Name"].map(_normalise_fact))["Extracted Value"].agg(
+    result.loc[mismatches, "Confidence Score"] = result.loc[mismatches, "Confidence Score"].clip(upper=64)
+    label_values = result.groupby(result["Label"].map(_normalise_fact))["Value"].agg(
         lambda values: {_normalise_fact(value) for value in values if _normalise_fact(value)}
     )
     conflicting_labels = {label for label, values in label_values.items() if len(values) > 1}
-    conflict_rows = result["Field Name"].map(_normalise_fact).isin(conflicting_labels)
-    result.loc[conflict_rows, "Confidence Level"] = "Low"
-    result["_sort"] = result["Confidence Level"].map({name: index for index, name in enumerate(CONFIDENCE_ORDER)})
+    conflict_rows = result["Label"].map(_normalise_fact).isin(conflicting_labels)
+    result.loc[conflict_rows, "Confidence Score"] = result.loc[conflict_rows, "Confidence Score"].clip(upper=64)
+    result["_sort"] = result["Confidence Score"]
     result["_review_index"] = range(len(result))
     result = result.sort_values(["_sort", "_review_index"], kind="stable")
     return result[OUTPUT_COLUMNS].reset_index(drop=True)
@@ -169,16 +177,23 @@ def build_excel(frame: pd.DataFrame) -> bytes:
                                           showColumnStripes=False)
     sheet.add_table(table)
     fills = {
-        "High": PatternFill("solid", fgColor="C6EFCE"),
-        "Medium": PatternFill("solid", fgColor="FFEB9C"),
-        "Low": PatternFill("solid", fgColor="FFC7CE"),
+        "green": PatternFill("solid", fgColor="C6EFCE"),
+        "yellow": PatternFill("solid", fgColor="FFEB9C"),
+        "red": PatternFill("solid", fgColor="FFC7CE"),
     }
     confidence_column = "D"
-    for level, fill in fills.items():
-        sheet.conditional_formatting.add(
-            f"{confidence_column}2:{confidence_column}{max(sheet.max_row, 2)}",
-            FormulaRule(formula=[f'${confidence_column}2="{level}"'], fill=fill),
-        )
+    sheet.conditional_formatting.add(
+        f"{confidence_column}2:{confidence_column}{max(sheet.max_row, 2)}",
+        FormulaRule(formula=[f"${confidence_column}2<65"], fill=fills["red"]),
+    )
+    sheet.conditional_formatting.add(
+        f"{confidence_column}2:{confidence_column}{max(sheet.max_row, 2)}",
+        FormulaRule(formula=[f"AND(${confidence_column}2>65,${confidence_column}2<80)"], fill=fills["yellow"]),
+    )
+    sheet.conditional_formatting.add(
+        f"{confidence_column}2:{confidence_column}{max(sheet.max_row, 2)}",
+        FormulaRule(formula=[f"${confidence_column}2>80"], fill=fills["green"]),
+    )
     widths = {"A": 28, "B": 42, "C": 34, "D": 20}
     for column, width in widths.items():
         sheet.column_dimensions[column].width = width
@@ -193,7 +208,7 @@ def next_pending_index(
     verified = verified or set()
     pending = [
         index for index in frame.index
-        if index not in verified and frame.at[index, "Confidence Level"] in {"Low", "Medium"}
+        if index not in verified and frame.at[index, "Confidence Score"] < 81
     ]
     if not pending:
         return None
