@@ -197,7 +197,8 @@ Return ONLY a JSON object of this exact shape:
    {"document": "<label exactly as given>", "document_type": "short type name",
     "facts": [{"page_number": 1, "label": "Human readable field name",
                "concept": "snake_case_name", "value": "value as written",
-               "evidence": "text copied verbatim from that page (max 200 chars)"}]}
+               "evidence": "text copied verbatim from that page (max 500 chars)",
+               "confidence_score": 87}]}
  ],
  "cross_references": [
    {"from_document": "<label>", "to_document": "<label>", "page_number": 1,
@@ -229,6 +230,9 @@ Rules:
   a fact with an empty value only when its label or location is identifiable; never guess.
 - Every fact must have evidence copied verbatim from the same page or sheet, limited to
   500 characters. Evidence is not a substitute for the extracted value.
+- Assign every fact an individual integer confidence_score from 1 through 100. Use the
+  full range when warranted by legibility, evidence quality, completeness and ambiguity;
+  do not default all values to a few fixed scores such as 0, 65 or 100. Never use 0.
 - Use the exact page or sheet number where the fact appears. Do not assign a fact to a
   different page or sheet. Report cross-document links only when the source explicitly
   shows the relationship; never use links to fill missing facts.
@@ -694,35 +698,58 @@ def classify_local(pages: List[Dict[str, Any]]) -> str:
 
 # ---------------------------------------------------------------- confidence
 def band_for(score: int) -> str:
-    return "Green" if score >= 90 else "Yellow" if score >= 60 else "Red"
+    return "Green" if score > 80 else "Yellow" if score > 65 else "Red"
+
+
+def clamp_confidence(score: Any, default: int = 50) -> int:
+    try:
+        return max(1, min(100, round(float(score))))
+    except (TypeError, ValueError):
+        return default
 
 
 def assess(value: str, evidence: str, page_text: Optional[str]) -> Dict[str, Any]:
     """Confidence reflects evidence quality. page_text is None when the page has no text
     layer, so the value cannot be checked against the source."""
     if not value.strip():
-        return {"band": "Red", "score": 0, "reasons": ["MISSING"]}
+        return {"band": "Red", "score": 1, "reasons": ["MISSING"]}
     if not evidence.strip():
-        return {"band": "Red", "score": 20, "reasons": ["NO_EVIDENCE"]}
+        score = min(45, 18 + len(value.strip()) * 2)
+        return {"band": band_for(score), "score": score, "reasons": ["NO_EVIDENCE"]}
     if page_text is None:
-        return {"band": "Yellow", "score": 65, "reasons": ["NOT_TEXT_VERIFIABLE"]}
+        score = min(75, 46 + len(evidence.strip()) // 20)
+        return {"band": band_for(score), "score": score, "reasons": ["NOT_TEXT_VERIFIABLE"]}
     text_n = normalise(page_text)
     if normalise(evidence) in text_n:
-        score, reasons = 95, ["GROUNDED"]
+        score, reasons = min(100, 82 + len(evidence.strip()) // 25), ["GROUNDED"]
     elif normalise(value) and normalise(value) in text_n:
-        score, reasons = 80, ["VALUE_FOUND_EVIDENCE_MISMATCH"]
+        score, reasons = min(79, 58 + len(value.strip()) // 10), ["VALUE_FOUND_EVIDENCE_MISMATCH"]
     else:
-        return {"band": "Red", "score": 30, "reasons": ["UNSUPPORTED"]}
+        score = min(55, 15 + len(value.strip()) * 2)
+        return {"band": band_for(score), "score": score, "reasons": ["UNSUPPORTED"]}
     if len(value.strip()) < 2:
-        score = min(score, 75)
+        score = min(score, 74)
         reasons.append("VERY_SHORT_VALUE")
     return {"band": band_for(score), "score": score, "reasons": reasons}
 
 
 # ---------------------------------------------------------------- local extraction
-def _fact(page: int, label: str, concept: str, value: str, evidence: str) -> Dict[str, Any]:
-    return {"page_number": page, "label": label[:120], "concept": concept,
-            "value": value, "evidence": evidence}
+def _fact(
+    page: int,
+    label: str,
+    concept: str,
+    value: str,
+    evidence: str,
+    confidence_score: Any = None,
+) -> Dict[str, Any]:
+    return {
+        "page_number": page,
+        "label": label[:120],
+        "concept": concept,
+        "value": value,
+        "evidence": evidence,
+        "confidence_score": clamp_confidence(confidence_score) if confidence_score is not None else None,
+    }
 
 
 def local_extract(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -993,7 +1020,9 @@ def parse_batch_payload(text: str, labels: List[str]) -> Tuple[Dict[str, Dict[st
             page_number, page_valid = page_of(item)
             fact = _fact(
                 page_number, name, to_concept(str(item.get("concept") or name)),
-                str(item.get("value") or "").strip(), str(item.get("evidence") or "").strip()[:500],
+                str(item.get("value") or "").strip(),
+                str(item.get("evidence") or "").strip()[:500],
+                item.get("confidence_score"),
             )
             fact["_page_number_valid"] = page_valid
             bucket["facts"].append(fact)
@@ -1214,9 +1243,15 @@ def finalize_document(docket_id: str, doc: Dict[str, Any], status: str,
             value = clean_text(item["value"])
             evidence = clean_text(item["evidence"])
             assessment = assess(value, evidence, doc["page_text"].get(page_number))
+            if item.get("confidence_score") is not None:
+                assessment["score"] = clamp_confidence(item["confidence_score"], assessment["score"])
+                assessment["band"] = band_for(assessment["score"])
+                assessment["reasons"] = list(dict.fromkeys(
+                    assessment["reasons"] + ["MODEL_CONFIDENCE"]
+                ))
             if not item.get("_page_number_valid", True):
                 assessment["band"] = "Red"
-                assessment["score"] = 0
+                assessment["score"] = 1
                 assessment["reasons"].append("INVALID_PAGE_REFERENCE")
             connection.execute(
                 """INSERT INTO facts (id, docket_id, document_id, page_number, label, concept,
@@ -1278,7 +1313,7 @@ def apply_extraction_integrity(docket_id: str) -> None:
                         continue
                     reasons = _append_reason(row["confidence_reasons"], "LABEL_VALUE_CONFLICT")
                     connection.execute(
-                        """UPDATE facts SET confidence_band = 'Red', confidence_score = 0,
+                        """UPDATE facts SET confidence_band = 'Red', confidence_score = 1,
                            confidence_reasons = ?, updated_at = ? WHERE id = ?""",
                         (reasons, now, row["id"]),
                     )
@@ -1323,7 +1358,7 @@ def apply_extraction_integrity(docket_id: str) -> None:
                 continue
             reasons = _append_reason(row["confidence_reasons"], "LABEL_VALUE_MISMATCH")
             connection.execute(
-                """UPDATE facts SET confidence_band = 'Red', confidence_score = 0,
+                """UPDATE facts SET confidence_band = 'Red', confidence_score = 1,
                    confidence_reasons = ?, updated_at = ? WHERE id = ?""",
                 (reasons, now, row["id"]),
             )
@@ -1536,7 +1571,7 @@ def update_fact(fact_id: str, value: str, status: str, reason: str) -> None:
         if status == "approved":
             band, score, reasons = "Green", 100, ["HUMAN_APPROVED"]
         elif status == "rejected":
-            band, score, reasons = "Red", 0, ["HUMAN_REJECTED"]
+            band, score, reasons = "Red", 1, ["HUMAN_REJECTED"]
         else:
             page_text = row["page_text"] if row["page_readable"] else None
             assessment = assess(value, row["source_evidence"], page_text)
@@ -1663,16 +1698,16 @@ class ExportError(Exception):
 
 
 def build_psv(docket_id: str) -> Tuple[bytes, int]:
-    """Pipe-separated values: UTF-8 with BOM, CRLF rows, fields quoted when they contain
-    '|', '"', or a line break. The output is parsed back and must equal the source rows."""
+    """Build the four-column Main Metadata PSV export with an integrity check."""
     facts = fetch_facts(docket_id)
-    expected: List[List[str]] = [list(PSV_FIELDS)]
+    expected: List[List[Any]] = [VIEW_HEADERS]
     for row in facts:
-        record = dict(row)
-        record["fact_id"] = row["id"]
-        record["confidence_reasons"] = ", ".join(json.loads(row["confidence_reasons"]))
-        record["corrected"] = "true" if row["corrected"] else "false"
-        expected.append([safe_cell(record[field]) for field in PSV_FIELDS])
+        expected.append([
+            safe_cell(row["filename"]),
+            safe_cell(row["label"]),
+            safe_cell(row["value"]),
+            clamp_confidence(row["confidence_score"], 50),
+        ])
 
     buffer = io.StringIO(newline="")
     csv.writer(buffer, delimiter="|", quotechar='"', quoting=csv.QUOTE_MINIMAL,
@@ -1684,7 +1719,7 @@ def build_psv(docket_id: str) -> Tuple[bytes, int]:
                                  doublequote=True, strict=True))
     except csv.Error as exc:
         raise ExportError(f"PSV could not be read back: {exc}") from exc
-    if any(len(r) != len(PSV_FIELDS) for r in parsed):
+    if any(len(r) != len(VIEW_HEADERS) for r in parsed):
         raise ExportError("PSV integrity check failed: a row has the wrong number of columns.")
     if parsed != expected:
         raise ExportError("PSV integrity check failed: re-reading the file did not reproduce the data.")
@@ -1702,14 +1737,10 @@ def build_json(docket: sqlite3.Row) -> Tuple[bytes, int]:
     facts = []
     for row in fetch_facts(docket_id):
         facts.append({
-            "id": row["id"], "document_id": row["document_id"], "filename": row["filename"],
-            "page_number": row["page_number"], "label": row["label"], "concept": row["concept"],
-            "value": row["value"], "original_value": row["original_value"],
-            "source_evidence": row["source_evidence"],
-            "confidence": {"band": row["confidence_band"], "score": row["confidence_score"],
-                           "reasons": json.loads(row["confidence_reasons"])},
-            "review_status": row["review_status"], "corrected": bool(row["corrected"]),
-            "created_at": row["created_at"], "updated_at": row["updated_at"],
+            "Document Name": row["filename"],
+            "Label": row["label"],
+            "Value": row["value"],
+            "Confidence Score": clamp_confidence(row["confidence_score"], 50),
         })
     with connect() as connection:
         documents = [dict(r) for r in connection.execute(
@@ -1743,15 +1774,19 @@ def build_json(docket: sqlite3.Row) -> Tuple[bytes, int]:
     if len(reloaded["facts"]) != len(facts) or len(reloaded["documents"]) != len(documents):
         raise ExportError("JSON integrity check failed: record counts do not match.")
     return data, len(facts)
-VIEW_HEADERS = ["filename", "label", "value", "confidence_level"]
-XLSX_HEADERS = ["Filename", "Label", "Value", "Confidence Level"]
+VIEW_HEADERS = ["Document Name", "Label", "Value", "Confidence Score"]
+XLSX_HEADERS = VIEW_HEADERS
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-BAND_FILLS = {"Green": "C6EFCE", "Yellow": "FFEB9C", "Red": "FFC7CE"}
 
 
 def build_view_rows(docket_id: str) -> List[List[str]]:
     return [
-        [clean_text(f["filename"]), clean_text(f["label"]), clean_text(f["value"]), f["confidence_band"]]
+        [
+            clean_text(f["filename"]),
+            clean_text(f["label"]),
+            clean_text(f["value"]),
+            int(clamp_confidence(f["confidence_score"], 50)),
+        ]
         for f in fetch_facts(docket_id)
     ]
 
@@ -1788,7 +1823,8 @@ def build_view_xlsx(docket_id: str) -> Tuple[bytes, int]:
             cell.value = value
             if isinstance(value, str) and value[:1] in ("=", "+", "-", "@"):
                 cell.data_type = "s"  # keep as text, never a formula
-        colour = BAND_FILLS.get(row[3], "FFFFFF")
+        score = row[3]
+        colour = "FFC7CE" if score < 65 else "FFEB9C" if 65 < score < 80 else "C6EFCE" if score > 80 else "FFFFFF"
         sheet.cell(row=row_number, column=4).fill = PatternFill(
             fill_type="solid", start_color=colour, end_color=colour
         )
@@ -2438,19 +2474,19 @@ def page_psv_verify(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -
 
     frame = st.session_state.get("psv_frame")
     if frame is None:
-        st.info("Upload a PSV containing field, value, source document, and confidence data.")
+        st.info("Upload a PSV containing Document Name, Label, Value, and Confidence Score.")
         return
 
     verified = st.session_state.setdefault("psv_verified", set())
     current = int(st.session_state.get("psv_current", -1))
     pending_count = sum(
-        index not in verified and frame.at[index, "Confidence Level"] in {"Low", "Medium"}
+        index not in verified and frame.at[index, "Confidence Score"] < 81
         for index in frame.index
     )
     metrics = st.columns(4)
     metrics[0].metric("Rows", len(frame))
-    metrics[1].metric("Low", int((frame["Confidence Level"] == "Low").sum()))
-    metrics[2].metric("Medium", int((frame["Confidence Level"] == "Medium").sum()))
+    metrics[1].metric("Red", int((frame["Confidence Score"] < 65).sum()))
+    metrics[2].metric("Yellow", int(((frame["Confidence Score"] > 65) & (frame["Confidence Score"] < 80)).sum()))
     metrics[3].metric("Pending review", pending_count)
 
     action_col, export_col = st.columns([1, 1])
@@ -2476,11 +2512,11 @@ def page_psv_verify(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -
     st.session_state["psv_current"] = current
     row = frame.iloc[current]
     with st.container(border=True):
-        st.markdown(f"**Review item {current + 1} of {len(frame)}** · {row['Confidence Level']}")
-        st.markdown(f"**{row['Field Name']}**")
-        st.write(row["Extracted Value"] or "(empty)")
-        st.caption(f"Source document: {row['Source Document']}")
-        is_high = row["Confidence Level"] == "High"
+        st.markdown(f"**Review item {current + 1} of {len(frame)}** · score {row['Confidence Score']}")
+        st.markdown(f"**{row['Label']}**")
+        st.write(row["Value"] or "(empty)")
+        st.caption(f"Source document: {row['Document Name']}")
+        is_high = row["Confidence Score"] > 80
         is_verified = current in verified
         if not is_high and not is_verified:
             if st.button("Mark verified", type="primary", key=f"psv_verify_{current}", **stretch()):
@@ -2493,14 +2529,18 @@ def page_psv_verify(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -
         else:
             st.success("Pre-verified" if is_high else "Verified", icon="✅")
 
-    color_map = {
-        "High": "background-color: #1f7a4d; color: #f0fff7; font-weight: 700",
-        "Medium": "background-color: #8a6d1d; color: #fff8d6; font-weight: 700",
-        "Low": "background-color: #8c3540; color: #fff1f2; font-weight: 700",
-    }
+    def score_style(value: object) -> str:
+        score = clamp_confidence(value, 50)
+        if score < 65:
+            return "background-color: #8c3540; color: #fff1f2; font-weight: 700"
+        if 65 < score < 80:
+            return "background-color: #8a6d1d; color: #fff8d6; font-weight: 700"
+        if score > 80:
+            return "background-color: #1f7a4d; color: #f0fff7; font-weight: 700"
+        return ""
     styled_frame = frame.style.map(
-        lambda value: color_map.get(str(value), ""),
-        subset=["Confidence Level"],
+        score_style,
+        subset=["Confidence Score"],
     )
     st.dataframe(styled_frame, hide_index=True, width="stretch")
 
@@ -2541,12 +2581,12 @@ def page_export(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
     # (title, caption, builder, filename, mime, show_text_preview)
     specs = [
         ("PSV (review view)",
-         "Four columns: filename, label, value, confidence_level. Pipe-delimited, UTF-8 with BOM. "
+         "Four columns: Document Name, Label, Value, Confidence Score. Pipe-delimited, UTF-8 with BOM. "
          "Can be uploaded straight into PSV Verify.",
          lambda: build_view_psv(active["id"]), f"parchai-{slug}-{stamp}.psv",
          "text/plain; charset=utf-8", True),
         ("Excel (review view)",
-         "The same four columns in a spreadsheet. Confidence Level cells are green, yellow or red.",
+         "The same four columns in a spreadsheet. Confidence Score cells are colored by score.",
          lambda: build_view_xlsx(active["id"]), f"parchai-{slug}-{stamp}.xlsx", XLSX_MIME, False),
         ("JSON (full)",
          "Docket, documents, facts with confidence, review state and full change history.",
