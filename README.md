@@ -279,6 +279,7 @@ Example:
 ]
 ```
 
+<<<<<<< HEAD
 This is illustrative. The actual extracted labels and values must come
 from the documents.
 
@@ -945,3 +946,6 @@ client wants a different output.
 exhaustive, duplicate-preserving, confidence-scored metadata dataset
 that can be selectively mapped and exported into different client
 templates.**
+=======
+Set `GEMINI_API_KEY` or add API keys in the application settings to enable Gemini extraction. Uploads are processed one document at a time; PDFs are chunked by page, and XLSX workbooks include hidden worksheets when they are readable. Local runtime databases and uploaded documents are intentionally ignored by Git.
+>>>>>>> refs/remotes/origin/main

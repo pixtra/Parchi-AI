@@ -55,6 +55,11 @@ except ImportError:
         )
 
 try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
+try:
     import fitz  # PyMuPDF
 except ImportError:
     fitz = None
@@ -100,7 +105,11 @@ MAX_PARTS_PER_BATCH = int(os.getenv("PARCHAI_MAX_PARTS_PER_BATCH", "12"))
 MAX_UPLOAD_BYTES = int(os.getenv("PARCHAI_MAX_UPLOAD_MB", "50")) * 1024 * 1024
 KEY_COOLDOWN_SECONDS = 60
 AUTH_COOLDOWN_SECONDS = 3600
+<<<<<<< HEAD
 SUPPORTED_TYPES = ["pdf", "png", "jpg", "jpeg", "txt", "xlsx", "csv"]
+=======
+SUPPORTED_TYPES = ["pdf", "png", "jpg", "jpeg", "txt", "xlsx"]
+>>>>>>> refs/remotes/origin/main
 MIME_TYPES = {
     "pdf": "application/pdf",
     "png": "image/png",
@@ -108,7 +117,10 @@ MIME_TYPES = {
     "jpeg": "image/jpeg",
     "txt": "text/plain",
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+<<<<<<< HEAD
     "csv": "text/csv",
+=======
+>>>>>>> refs/remotes/origin/main
 }
 BANDS = ("Green", "Yellow", "Red")
 REVIEW_STATUSES = ("pending", "approved", "rejected")
@@ -259,17 +271,28 @@ PATTERNS = [
     ("weight", "Weight", re.compile(r"\b\d+(?:\.\d+)?\s?(?:kgs?|MT|tons?|tonnes?)\b", re.IGNORECASE)),
 ]
 
+<<<<<<< HEAD
 BATCH_PROMPT = """You extract data from SEVERAL supplier documents in one request.
 Each document part is preceded by a line "=== DOCUMENT: <label> ===". Use that label EXACTLY
 as the "document" value. Page numbers restart at 1 for every labelled part. Spreadsheet
 parts contain every worksheet, including hidden worksheets, represented as a page with a
 sheet name. Account for every supplied page or worksheet in the response.
+=======
+BATCH_PROMPT = """You are an exhaustive document transcription and extraction engine.
+The document part is preceded by a line "=== DOCUMENT: <label> ===". Use that label EXACTLY
+as the "document" value. Page or sheet numbers restart at 1 for this document part.
+>>>>>>> refs/remotes/origin/main
 Return ONLY a JSON object of this exact shape:
 {"documents": [
    {"document": "<label exactly as given>", "document_type": "short type name",
     "facts": [{"page_number": 1, "label": "Human readable field name",
                "concept": "snake_case_name", "value": "value as written",
+<<<<<<< HEAD
                "evidence": "text copied verbatim from that page or sheet (max 200 chars)"}]}
+=======
+               "evidence": "text copied verbatim from that page (max 500 chars)",
+               "confidence_score": 87}]}
+>>>>>>> refs/remotes/origin/main
  ],
  "cross_references": [
    {"from_document": "<label>", "to_document": "<label>", "page_number": 1,
@@ -277,6 +300,7 @@ Return ONLY a JSON object of this exact shape:
     "evidence": "verbatim text showing the link"}
  ]}
 Rules:
+<<<<<<< HEAD
 - Extract every identifiable field: identifiers, parties, dates, references, quantities,
   weights, rates, taxes, totals and each line item (item_1_description, item_1_quantity, ...).
 - Include document-specific fields that do not fit a standard schema.
@@ -287,6 +311,41 @@ Rules:
   "Page processing status" fact with an empty value and explain the limitation in evidence.
 - Report links between documents (invoice to PO, challan to GRN, weighment slip to challan)
   in cross_references only when the text shows the link."""
+=======
+- Read and inspect EVERY page or sheet in this document part before responding. Do not stop
+  after finding common fields or identifying the document type.
+- Extract EVERY distinct visible or accessible information occurrence as one fact. One label
+  occurrence equals one fact, including repeated labels with repeated values, repeated labels
+  with different values, and conflicting values. Never deduplicate, merge, overwrite, group,
+  summarize, or discard repeated facts.
+- Capture all printed text and all legible handwriting, including headers, footers, stamps,
+  seals, signatures, nearby annotations, marginal notes, tables, table headers, every line
+  item, subtotals, totals, tax breakdowns, small print, footnotes, checkboxes, marks and
+  supplier-specific labels. Preserve the document's wording and order where possible.
+- Extract identifiers, parties, addresses, contact details, dates, references, quantities,
+  units, descriptions, rates, discounts, taxes, amounts, terms, bank details, shipment
+  details, and any other information actually present. Include fields outside any predefined
+  business schema.
+- For tables and line items, emit separate facts for each cell or meaningful labelled value;
+  do not collapse a row into a summary. Use clear labels such as "Item 1 Description",
+  "Item 1 Quantity", and "Item 1 Rate" when the source has no explicit label.
+- Copy each value exactly as written. Preserve punctuation, symbols, casing, units and
+  leading zeros. Do not normalize, calculate, correct, translate, or infer values. Do not
+  fill missing values from another page or document.
+- If text is partially legible, return the legible portion. If a value is unreadable, emit
+  a fact with an empty value only when its label or location is identifiable; never guess.
+- Every fact must have evidence copied verbatim from the same page or sheet, limited to
+  500 characters. Evidence is not a substitute for the extracted value.
+- Assign every fact an individual integer confidence_score from 1 through 100. Use the
+  full range when warranted by legibility, evidence quality, completeness and ambiguity;
+  do not default all values to a few fixed scores such as 0, 65 or 100. Never use 0.
+- Use the exact page or sheet number where the fact appears. Do not assign a fact to a
+  different page or sheet. Report cross-document links only when the source explicitly
+  shows the relationship; never use links to fill missing facts.
+- Return every extracted fact in the response. Do not omit facts to save tokens. If the
+  response would be too large, the application will split the document into smaller parts.
+- Keep each uploaded document independent. Never use facts from another document part."""
+>>>>>>> refs/remotes/origin/main
 
 
 # ---------------------------------------------------------------- utilities
@@ -345,6 +404,14 @@ def esc(value: Any) -> str:
 
 def fmt_size(num_bytes: int) -> str:
     return f"{num_bytes / 1024:,.0f} KB" if num_bytes < 1024 * 1024 else f"{num_bytes / 1048576:,.1f} MB"
+
+
+def upload_name(upload: Any) -> str:
+    return str(upload["name"] if isinstance(upload, dict) else upload.name)
+
+
+def upload_data(upload: Any) -> bytes:
+    return bytes(upload["data"] if isinstance(upload, dict) else upload.getvalue())
 
 
 def mask(key: str) -> str:
@@ -492,7 +559,11 @@ def validate_upload(filename: str, data: bytes) -> Optional[str]:
     """Return a human-readable problem, or None when the upload looks sound."""
     extension = extension_of(filename)
     if extension not in SUPPORTED_TYPES:
+<<<<<<< HEAD
         return f"Unsupported file type “.{extension or '?'}”. Use PDF, PNG, JPG, TXT, CSV or XLSX."
+=======
+        return f"Unsupported file type “.{extension or '?'}”. Use PDF, PNG, JPEG, TXT or XLSX."
+>>>>>>> refs/remotes/origin/main
     if not data:
         return "The file is empty (0 bytes)."
     if len(data) > MAX_UPLOAD_BYTES:
@@ -502,6 +573,12 @@ def validate_upload(filename: str, data: bytes) -> Optional[str]:
         return "The content is not a PDF. The file may be corrupt or renamed."
     if extension in signatures and not data.startswith(signatures[extension]):
         return f"The content is not a valid .{extension} image. The file may be corrupt or renamed."
+    if extension in {"png", "jpg", "jpeg"} and Image is not None:
+        try:
+            with Image.open(io.BytesIO(data)) as image:
+                image.verify()
+        except Exception as exc:  # noqa: BLE001
+            return f"The image could not be opened and may be corrupt ({exc.__class__.__name__})."
     if extension == "txt" and b"\x00" in data:
         return "The file contains binary data and is not plain text."
     if extension == "csv" and b"\x00" in data:
@@ -647,6 +724,14 @@ def list_documents(docket_id: str) -> List[sqlite3.Row]:
                FROM documents WHERE docket_id = ? ORDER BY created_at""",
             (docket_id,),
         ).fetchall()
+
+
+def set_document_status(document_id: str, status: str) -> None:
+    with connect() as connection:
+        connection.execute(
+            "UPDATE documents SET status = ? WHERE id = ?",
+            (status, document_id),
+        )
 
 
 def fetch_facts(docket_id: str) -> List[sqlite3.Row]:
@@ -820,6 +905,7 @@ def read_pages(filename: str, data: bytes) -> List[Dict[str, Any]]:
         return pages
     if extension == "txt":
         text = clean_text(decode_text(data)).strip()
+<<<<<<< HEAD
         return [{"page_number": 1, "sheet_name": "", "text": text, "readable": bool(text)}]
     if extension == "xlsx":
         import openpyxl
@@ -829,6 +915,37 @@ def read_pages(filename: str, data: bytes) -> List[Dict[str, Any]]:
         text = clean_text(decode_text(data)).strip()
         return [{"page_number": 1, "sheet_name": "CSV", "text": text, "readable": bool(text)}]
     return [{"page_number": 1, "sheet_name": "", "text": "", "readable": False}]  # images: vision-only
+=======
+        return [{"page_number": 1, "text": text, "readable": bool(text)}]
+    if extension == "xlsx":
+        try:
+            workbook = load_workbook(io.BytesIO(data), read_only=True, data_only=False)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"The spreadsheet could not be opened ({exc.__class__.__name__}).") from exc
+        pages = []
+        try:
+            for number, sheet in enumerate(workbook.worksheets, start=1):
+                lines = []
+                for row in sheet.iter_rows(values_only=True):
+                    values = [clean_text(value) for value in row]
+                    while values and not values[-1]:
+                        values.pop()
+                    if values:
+                        lines.append(" | ".join(values))
+                text = "\n".join(lines).strip()
+                pages.append({
+                    "page_number": number,
+                    "sheet_name": sheet.title,
+                    "text": text,
+                    "readable": bool(text),
+                })
+        finally:
+            workbook.close()
+        if not pages:
+            raise RuntimeError("The spreadsheet contains no worksheets.")
+        return pages
+    return [{"page_number": 1, "text": "", "readable": False}]  # images: no text layer
+>>>>>>> refs/remotes/origin/main
 
 
 def split_pdf(data: bytes, pages_per_part: int) -> List[Tuple[int, int, bytes]]:
@@ -855,35 +972,58 @@ def classify_local(pages: List[Dict[str, Any]]) -> str:
 
 # ---------------------------------------------------------------- confidence
 def band_for(score: int) -> str:
-    return "Green" if score >= 90 else "Yellow" if score >= 60 else "Red"
+    return "Green" if score > 80 else "Yellow" if score > 65 else "Red"
+
+
+def clamp_confidence(score: Any, default: int = 50) -> int:
+    try:
+        return max(1, min(100, round(float(score))))
+    except (TypeError, ValueError):
+        return default
 
 
 def assess(value: str, evidence: str, page_text: Optional[str]) -> Dict[str, Any]:
     """Confidence reflects evidence quality. page_text is None when the page has no text
     layer, so the value cannot be checked against the source."""
     if not value.strip():
-        return {"band": "Red", "score": 0, "reasons": ["MISSING"]}
+        return {"band": "Red", "score": 1, "reasons": ["MISSING"]}
     if not evidence.strip():
-        return {"band": "Red", "score": 20, "reasons": ["NO_EVIDENCE"]}
+        score = min(45, 18 + len(value.strip()) * 2)
+        return {"band": band_for(score), "score": score, "reasons": ["NO_EVIDENCE"]}
     if page_text is None:
-        return {"band": "Yellow", "score": 65, "reasons": ["NOT_TEXT_VERIFIABLE"]}
+        score = min(75, 46 + len(evidence.strip()) // 20)
+        return {"band": band_for(score), "score": score, "reasons": ["NOT_TEXT_VERIFIABLE"]}
     text_n = normalise(page_text)
     if normalise(evidence) in text_n:
-        score, reasons = 95, ["GROUNDED"]
+        score, reasons = min(100, 82 + len(evidence.strip()) // 25), ["GROUNDED"]
     elif normalise(value) and normalise(value) in text_n:
-        score, reasons = 80, ["VALUE_FOUND_EVIDENCE_MISMATCH"]
+        score, reasons = min(79, 58 + len(value.strip()) // 10), ["VALUE_FOUND_EVIDENCE_MISMATCH"]
     else:
-        return {"band": "Red", "score": 30, "reasons": ["UNSUPPORTED"]}
+        score = min(55, 15 + len(value.strip()) * 2)
+        return {"band": band_for(score), "score": score, "reasons": ["UNSUPPORTED"]}
     if len(value.strip()) < 2:
-        score = min(score, 75)
+        score = min(score, 74)
         reasons.append("VERY_SHORT_VALUE")
     return {"band": band_for(score), "score": score, "reasons": reasons}
 
 
 # ---------------------------------------------------------------- local extraction
-def _fact(page: int, label: str, concept: str, value: str, evidence: str) -> Dict[str, Any]:
-    return {"page_number": page, "label": label[:120], "concept": concept,
-            "value": value, "evidence": evidence}
+def _fact(
+    page: int,
+    label: str,
+    concept: str,
+    value: str,
+    evidence: str,
+    confidence_score: Any = None,
+) -> Dict[str, Any]:
+    return {
+        "page_number": page,
+        "label": label[:120],
+        "concept": concept,
+        "value": value,
+        "evidence": evidence,
+        "confidence_score": clamp_confidence(confidence_score) if confidence_score is not None else None,
+    }
 
 
 def local_extract(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -910,12 +1050,24 @@ def local_extract(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 label, value = match.group(1).strip(), match.group(2).strip()
                 facts.append(_fact(number, label, to_concept(label), value, line))
                 structured += 1
+<<<<<<< HEAD
                 line_value_already_captured = value.lower()
             for concept, label, pattern in PATTERNS:
                 for hit in pattern.finditer(line):
                     value = hit.group(0).strip()
                     if value.lower() == line_value_already_captured:
                         continue
+=======
+                continue
+            line_facts: set[tuple[str, str]] = set()
+            for concept, label, pattern in PATTERNS:
+                for hit in pattern.finditer(line):
+                    value = hit.group(0).strip()
+                    key = (concept, value.lower())
+                    if key in line_facts:
+                        continue
+                    line_facts.add(key)
+>>>>>>> refs/remotes/origin/main
                     facts.append(_fact(number, label, concept, value, line))
                     structured += 1
         if structured == 0:
@@ -1117,19 +1269,36 @@ class OversizedBatch(Exception):
     """Output was truncated or input was too large; the batch must be split."""
 
 
-def make_units(doc: Dict[str, Any]) -> List[Dict[str, Any]]:
+def make_units(doc: Dict[str, Any], label: Optional[str] = None) -> List[Dict[str, Any]]:
     if extension_of(doc["filename"]) == "pdf" and fitz is not None:
         parts = split_pdf(doc["data"], CHUNK_PAGES)
+        part_meta = [(start, count, blob, doc["mime"], "." + extension_of(doc["filename"]),
+                      None) for start, count, blob in parts]
+    elif extension_of(doc["filename"]) == "xlsx":
+        part_meta = [
+            (
+                page["page_number"] - 1,
+                1,
+                page["text"].encode("utf-8"),
+                "text/plain",
+                ".txt",
+                page.get("sheet_name"),
+            )
+            for page in doc["pages"]
+        ]
     else:
-        parts = [(0, doc["page_count"], doc["data"])]
+        part_meta = [(0, doc["page_count"], doc["data"], doc["mime"],
+                      "." + extension_of(doc["filename"]), None)]
     units = []
-    for start, count, blob in parts:
-        label = doc["filename"]
-        if len(parts) > 1:
-            label = f"{doc['filename']} [pages {start + 1}-{start + count}]"
+    for start, count, blob, mime, suffix, sheet_name in part_meta:
+        unit_label = label or doc["filename"]
+        if extension_of(doc["filename"]) == "xlsx":
+            unit_label = f"{unit_label} [sheet: {sheet_name}]"
+        elif len(part_meta) > 1:
+            unit_label = f"{unit_label} [pages {start + 1}-{start + count}]"
         unit = {
-            "label": label, "doc": doc, "offset": start, "pages": count, "data": blob,
-            "mime": doc["mime"], "suffix": "." + extension_of(doc["filename"]),
+            "label": unit_label, "doc": doc, "offset": start, "pages": count, "data": blob,
+            "mime": mime, "suffix": suffix,
             "pages_slice": doc["pages"][start:start + count],
             "items": None, "status": None, "message": "", "doc_type": None,
         }
@@ -1190,11 +1359,12 @@ def parse_batch_payload(text: str, labels: List[str]) -> Tuple[Dict[str, Dict[st
     def match(name: str) -> Optional[str]:
         return name if name in labels else by_label_lower.get(name.strip().lower())
 
-    def page_of(item: Dict[str, Any]) -> int:
+    def page_of(item: Dict[str, Any]) -> Tuple[int, bool]:
         try:
-            return max(1, int(item.get("page_number") or 1))
+            number = int(item.get("page_number") or 1)
+            return max(1, number), number >= 1
         except (TypeError, ValueError):
-            return 1
+            return 1, False
 
     by_label: Dict[str, Dict[str, Any]] = {}
     for doc in payload["documents"]:
@@ -1208,10 +1378,15 @@ def parse_batch_payload(text: str, labels: List[str]) -> Tuple[Dict[str, Dict[st
             if not isinstance(item, dict):
                 continue
             name = str(item.get("label") or "Unlabelled field").strip()
-            bucket["facts"].append(_fact(
-                page_of(item), name, to_concept(str(item.get("concept") or name)),
-                str(item.get("value") or "").strip(), str(item.get("evidence") or "").strip()[:500],
-            ))
+            page_number, page_valid = page_of(item)
+            fact = _fact(
+                page_number, name, to_concept(str(item.get("concept") or name)),
+                str(item.get("value") or "").strip(),
+                str(item.get("evidence") or "").strip()[:500],
+                item.get("confidence_score"),
+            )
+            fact["_page_number_valid"] = page_valid
+            bucket["facts"].append(fact)
 
     references = []
     for ref in payload.get("cross_references") or []:
@@ -1221,9 +1396,11 @@ def parse_batch_payload(text: str, labels: List[str]) -> Tuple[Dict[str, Dict[st
         target = str(ref.get("to_document", "")).strip()
         if source is None or not target:
             continue
+        page_number, page_valid = page_of(ref)
         references.append({
             "from_label": source,
-            "page_number": page_of(ref),
+            "page_number": page_number,
+            "_page_number_valid": page_valid,
             "label": f"Reference to {target}",
             "concept": f"cross_reference_{to_concept(str(ref.get('concept') or 'reference'))}",
             "value": str(ref.get("value") or "").strip(),
@@ -1319,7 +1496,12 @@ def apply_batch_result(batch: List[Dict[str, Any]], parsed: Any, used: str) -> N
             unit_fallback(unit, "model returned no entry for this part")
             continue
         unit["items"] = [
-            dict(raw, page_number=unit["offset"] + min(max(1, raw["page_number"]), unit["pages"]))
+            dict(
+                raw,
+                page_number=unit["offset"] + min(max(1, raw["page_number"]), unit["pages"]),
+                _page_number_valid=raw.get("_page_number_valid", True)
+                and raw["page_number"] <= unit["pages"],
+            )
             for raw in payload["facts"]
         ]
         unit["doc_type"] = payload["document_type"] or unit["doc_type"]
@@ -1330,7 +1512,11 @@ def apply_batch_result(batch: List[Dict[str, Any]], parsed: Any, used: str) -> N
         if source is None or source["items"] is None:
             continue
         local_page = min(max(1, ref["page_number"]), source["pages"])
-        source["items"].append(dict(ref, page_number=source["offset"] + local_page))
+        source["items"].append(dict(
+            ref,
+            page_number=source["offset"] + local_page,
+            _page_number_valid=ref.get("_page_number_valid", True) and ref["page_number"] <= source["pages"],
+        ))
 
 
 def process_units(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -> None:
@@ -1356,16 +1542,31 @@ def prepare_document(docket_id: str, filename: str, data: bytes, mode: str) -> T
     digest = hashlib.sha256(data).hexdigest()
     with connect() as connection:
         duplicate = connection.execute(
-            "SELECT filename FROM documents WHERE docket_id = ? AND sha256 = ?", (docket_id, digest)
+            "SELECT id, filename, status FROM documents WHERE docket_id = ? AND sha256 = ?",
+            (docket_id, digest),
         ).fetchone()
     if duplicate:
-        return None, {"filename": filename, "status": "skipped", "facts": 0,
-                      "message": f"Identical to “{duplicate['filename']}” already in this docket."}
+        if duplicate["status"] in {"completed", "local", "gemini"}:
+            return None, {
+                "filename": filename,
+                "status": "skipped",
+                "fact_count": 0,
+                "extracted_count": 0,
+                "appended_count": 0,
+                "message": f"Identical to “{duplicate['filename']}” already completed in this docket.",
+            }
+        delete_document(docket_id, duplicate["id"])
     try:
         pages = read_pages(filename, data)
     except Exception as exc:  # noqa: BLE001
-        return None, {"filename": filename, "status": "failed", "facts": 0,
-                      "message": clean_text(exc)[:300]}
+        return None, {
+            "filename": filename,
+            "status": "failed",
+            "fact_count": 0,
+            "extracted_count": 0,
+            "appended_count": 0,
+            "message": clean_text(exc)[:300],
+        }
 
     doc_id = str(uuid.uuid4())
     now = utc_now()
@@ -1399,8 +1600,8 @@ def prepare_document(docket_id: str, filename: str, data: bytes, mode: str) -> T
 
 
 def finalize_document(docket_id: str, doc: Dict[str, Any], status: str,
-                      document_type: str, items: List[Dict[str, Any]]) -> None:
-    """Save all facts for a document in one transaction: all of them are stored, or none."""
+                      document_type: str, items: List[Dict[str, Any]]) -> int:
+    """Save all facts and return the number persisted for this document."""
     now = utc_now()
     # Pages/sheets the extractor actually returned at least one fact for. A page with no
     # text layer (e.g. an image, vision-only) can still land here once Gemini reads it -
@@ -1429,6 +1630,16 @@ def finalize_document(docket_id: str, doc: Dict[str, Any], status: str,
             value = clean_text(item["value"])
             evidence = clean_text(item["evidence"])
             assessment = assess(value, evidence, doc["page_text"].get(page_number))
+            if item.get("confidence_score") is not None:
+                assessment["score"] = clamp_confidence(item["confidence_score"], assessment["score"])
+                assessment["band"] = band_for(assessment["score"])
+                assessment["reasons"] = list(dict.fromkeys(
+                    assessment["reasons"] + ["MODEL_CONFIDENCE"]
+                ))
+            if not item.get("_page_number_valid", True):
+                assessment["band"] = "Red"
+                assessment["score"] = 1
+                assessment["reasons"].append("INVALID_PAGE_REFERENCE")
             connection.execute(
                 """INSERT INTO facts (id, docket_id, document_id, page_number, label, concept,
                    value, original_value, source_evidence, confidence_band, confidence_score,
@@ -1449,6 +1660,10 @@ def finalize_document(docket_id: str, doc: Dict[str, Any], status: str,
         )
         connection.execute("UPDATE dockets SET updated_at = ? WHERE id = ?", (now, docket_id))
     apply_extraction_integrity(docket_id)
+    with connect() as connection:
+        return int(connection.execute(
+            "SELECT COUNT(*) FROM facts WHERE document_id = ?", (doc["id"],)
+        ).fetchone()[0])
 
 
 def _fact_group_key(label: str, concept: str) -> str:
@@ -1491,7 +1706,7 @@ def apply_extraction_integrity(docket_id: str) -> None:
                         continue
                     reasons = _append_reason(row["confidence_reasons"], "LABEL_VALUE_CONFLICT")
                     connection.execute(
-                        """UPDATE facts SET confidence_band = 'Red', confidence_score = 0,
+                        """UPDATE facts SET confidence_band = 'Red', confidence_score = 1,
                            confidence_reasons = ?, updated_at = ? WHERE id = ?""",
                         (reasons, now, row["id"]),
                     )
@@ -1536,7 +1751,7 @@ def apply_extraction_integrity(docket_id: str) -> None:
                 continue
             reasons = _append_reason(row["confidence_reasons"], "LABEL_VALUE_MISMATCH")
             connection.execute(
-                """UPDATE facts SET confidence_band = 'Red', confidence_score = 0,
+                """UPDATE facts SET confidence_band = 'Red', confidence_score = 1,
                    confidence_reasons = ?, updated_at = ? WHERE id = ?""",
                 (reasons, now, row["id"]),
             )
@@ -1548,9 +1763,7 @@ def apply_extraction_integrity(docket_id: str) -> None:
 def gemini_document_status(doc: Dict[str, Any]) -> str:
     statuses = {unit["status"] for unit in doc["units"]}
     if statuses == {"gemini"}:
-        return "gemini"
-    if statuses == {"fallback"}:
-        return "fallback"
+        return "completed"
     return "partial"
 
 
@@ -1572,20 +1785,42 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
     WORKER_STATE.job_id = job_id
     WORKER_STATE.state = {"key_cooldowns": {}}
     results: List[Dict[str, Any]] = []
-    documents: List[Dict[str, Any]] = []
-    finalized: set = set()
+    total = len(uploads)
 
-    def save(doc: Dict[str, Any], status: str, doc_type: str, items: List[Dict[str, Any]], message: str) -> None:
+    def save(
+        doc: Dict[str, Any],
+        status: str,
+        doc_type: str,
+        items: List[Dict[str, Any]],
+        message: str,
+    ) -> Dict[str, Any]:
+        set_document_status(doc["id"], "saving")
         try:
-            finalize_document(docket_id, doc, status, doc_type, items)
-            finalized.add(doc["id"])
-            results.append({"filename": doc["filename"], "status": status, "facts": len(items), "message": message})
+            fact_count = finalize_document(docket_id, doc, status, doc_type, items)
+            return {
+                "filename": doc["filename"],
+                "status": status,
+                "fact_count": fact_count,
+                "extracted_count": len(items),
+                "appended_count": fact_count,
+                "message": message,
+            }
         except Exception as exc:  # noqa: BLE001
             LOG.exception("could not save %s", doc["filename"])
-            delete_document(docket_id, doc["id"])  # leave nothing half-saved, so a retry is possible
-            results.append({"filename": doc["filename"], "status": "failed", "facts": 0,
-                            "message": f"Could not save results ({clean_text(exc)[:150]}). Nothing was kept; try again."})
+            try:
+                set_document_status(doc["id"], "failed")
+            except Exception:  # noqa: BLE001
+                LOG.exception("could not mark %s as failed", doc["filename"])
+            return {
+                "filename": doc["filename"],
+                "status": "failed",
+                "fact_count": 0,
+                "extracted_count": 0,
+                "appended_count": 0,
+                "message": f"Could not save results ({clean_text(exc)[:150]}). Retry this document.",
+            }
 
+<<<<<<< HEAD
     def progress(message: str) -> None:
         with PROCESSING_LOCK:
             PROCESSING_JOBS[job_id].update(message=message, phase="processing", gemini_active=False)
@@ -1773,6 +2008,134 @@ def process_uploads(docket_id: str, uploads: List[Any]) -> None:
         }
     PROCESSING_EXECUTOR.submit(_run_processing_job, job_id, docket_id, payload, keys)
     queue_flash("success", "Processing started in the background. You can switch tabs safely.")
+=======
+    def process_document(doc: Dict[str, Any], run: Any) -> Dict[str, Any]:
+        set_document_status(doc["id"], "reading")
+        run.write(f"{doc['filename']}: Reading {doc['page_count']} page(s)/sheet(s).")
+        if mode == "Local":
+            set_document_status(doc["id"], "extracting")
+            items = local_extract(doc["pages"])
+            set_document_status(doc["id"], "validating")
+            complete = all(page["readable"] for page in doc["pages"])
+            return save(
+                doc,
+                "completed" if complete else "partial",
+                classify_local(doc["pages"]),
+                items,
+                "Extracted with local rules."
+                if complete
+                else "Partial: one or more pages/sheets have no readable text layer.",
+            )
+
+        set_document_status(doc["id"], "extracting")
+        units = make_units(doc)
+        batches = pack_batches(units)
+        run.write(f"{doc['filename']}: Extracting {len(units)} part(s) in {len(batches)} request(s).")
+        for index, batch in enumerate(batches, start=1):
+            run.write(f"{doc['filename']}: Request {index}/{len(batches)} ({len(batch)} part(s)).")
+            process_units(batch, keys)
+        items = [item for unit in units for item in (unit["items"] or [])]
+        doc_type = next((u["doc_type"] for u in units if u["doc_type"]), "")
+        messages = sorted({u["message"] for u in units if u["message"]})
+        status = gemini_document_status({"units": units})
+        set_document_status(doc["id"], "validating")
+        run.write(f"{doc['filename']}: Validating {len(items)} extracted fact(s).")
+        return save(
+            doc,
+            status,
+            doc_type or classify_local(doc["pages"]),
+            items,
+            " | ".join(messages) or "All document parts extracted.",
+        )
+
+    with st.status(f"Processing {total} document(s) sequentially…", expanded=True) as run:
+        for upload in uploads:
+            data = upload_data(upload)
+            filename = upload_name(upload)
+            problem = validate_upload(filename, data)
+            if problem:
+                results.append({
+                    "filename": filename,
+                    "status": "failed",
+                    "fact_count": 0,
+                    "extracted_count": 0,
+                    "appended_count": 0,
+                    "message": problem,
+                })
+                run.write(f"{filename}: Failed validation.")
+                continue
+            try:
+                doc, skipped = prepare_document(docket_id, filename, data, mode)
+            except Exception as exc:  # noqa: BLE001
+                LOG.exception("prepare failed for %s", filename)
+                results.append({
+                    "filename": filename,
+                    "status": "failed",
+                    "fact_count": 0,
+                    "extracted_count": 0,
+                    "appended_count": 0,
+                    "message": f"Could not store the file ({clean_text(exc)[:200]}).",
+                })
+                run.write(f"{filename}: Failed while being stored.")
+                continue
+            if doc is None:
+                results.append(skipped)
+                run.write(f"{filename}: {skipped['status'].capitalize()}.")
+                continue
+            try:
+                result = process_document(doc, run)
+            except Exception as exc:  # noqa: BLE001
+                LOG.exception("processing failed for %s", doc["filename"])
+                try:
+                    set_document_status(doc["id"], "failed")
+                except Exception:  # noqa: BLE001
+                    LOG.exception("could not mark %s as failed", doc["filename"])
+                result = {
+                    "filename": doc["filename"],
+                    "status": "failed",
+                    "fact_count": 0,
+                    "extracted_count": 0,
+                    "appended_count": 0,
+                    "message": f"Processing failed ({clean_text(exc)[:200]}). Retry this document.",
+                }
+                run.write(f"{doc['filename']}: Failed; later documents remain queued.")
+            results.append(result)
+            run.write(
+                f"{doc['filename']}: {result['status'].capitalize()} — "
+                f"{result['fact_count']} fact(s) appended."
+            )
+        completed = sum(r["status"] == "completed" for r in results)
+        failed = sum(r["status"] == "failed" for r in results)
+        partial = sum(r["status"] == "partial" for r in results)
+        extracted = sum(r["extracted_count"] for r in results)
+        appended = sum(r["appended_count"] for r in results)
+        st.session_state["last_run_summary"] = {
+            "total": total,
+            "completed": completed,
+            "failed": failed,
+            "partial": partial,
+            "pending": 0,
+            "extracted": extracted,
+            "appended": appended,
+        }
+        run.write(
+            f"Summary: {completed}/{total} completed, {failed} failed, {partial} partial, "
+            f"{extracted} extracted, {appended} fact(s) appended."
+        )
+        run.update(
+            label="Processing complete" if not failed and not partial else "Processing completed with issues",
+            state="complete" if not failed and not partial else "error",
+            expanded=bool(failed or partial),
+        )
+
+    st.session_state["last_results"] = results
+    st.session_state["upload_nonce"] = st.session_state.get("upload_nonce", 0) + 1  # clears the queue
+    completed = sum(r["status"] == "completed" for r in results)
+    queue_flash(
+        "success" if completed == total else "warning",
+        f"{completed} of {total} document(s) completed. See “Latest processing run” for details.",
+    )
+>>>>>>> refs/remotes/origin/main
 
 
 # ---------------------------------------------------------------- review operations
@@ -1800,7 +2163,7 @@ def update_fact(fact_id: str, value: str, status: str, reason: str) -> None:
         if status == "approved":
             band, score, reasons = "Green", 100, ["HUMAN_APPROVED"]
         elif status == "rejected":
-            band, score, reasons = "Red", 0, ["HUMAN_REJECTED"]
+            band, score, reasons = "Red", 1, ["HUMAN_REJECTED"]
         else:
             page_text = row["page_text"] if row["page_readable"] else None
             assessment = assess(value, row["source_evidence"], page_text)
@@ -1864,6 +2227,7 @@ def validation_report(docket_id: str) -> List[Dict[str, str]]:
         if problem:
             add("Red", "Storage", f"{document['filename']}: {problem}")
         if document["status"] in ("fallback", "partial"):
+<<<<<<< HEAD
             add("Yellow", "Extraction", f"{document['filename']}: some parts used local rules after Gemini failed.")
         if document["processed_units"] != document["page_count"]:
             add("Red", "Completeness",
@@ -1872,6 +2236,11 @@ def validation_report(docket_id: str) -> List[Dict[str, str]]:
         elif document["completeness_status"] != "complete":
             add("Yellow", "Completeness",
                 f"{document['filename']}: {document['completeness_message']}")
+=======
+            add("Yellow", "Extraction", f"{document['filename']}: extraction is partial and needs attention.")
+        elif document["status"] == "failed":
+            add("Red", "Extraction", f"{document['filename']}: processing failed and must be retried.")
+>>>>>>> refs/remotes/origin/main
     for page in unreadable:
         add("Yellow", "Completeness",
             f"{page['filename']} p.{page['page_number']}: no text layer; Gemini mode or OCR required.")
@@ -1939,16 +2308,16 @@ class ExportError(Exception):
 
 
 def build_psv(docket_id: str) -> Tuple[bytes, int]:
-    """Pipe-separated values: UTF-8 with BOM, CRLF rows, fields quoted when they contain
-    '|', '"', or a line break. The output is parsed back and must equal the source rows."""
+    """Build the four-column Main Metadata PSV export with an integrity check."""
     facts = fetch_facts(docket_id)
-    expected: List[List[str]] = [list(PSV_FIELDS)]
+    expected: List[List[Any]] = [VIEW_HEADERS]
     for row in facts:
-        record = dict(row)
-        record["fact_id"] = row["id"]
-        record["confidence_reasons"] = ", ".join(json.loads(row["confidence_reasons"]))
-        record["corrected"] = "true" if row["corrected"] else "false"
-        expected.append([safe_cell(record[field]) for field in PSV_FIELDS])
+        expected.append([
+            safe_cell(row["filename"]),
+            safe_cell(row["label"]),
+            safe_cell(row["value"]),
+            clamp_confidence(row["confidence_score"], 50),
+        ])
 
     buffer = io.StringIO(newline="")
     csv.writer(buffer, delimiter="|", quotechar='"', quoting=csv.QUOTE_MINIMAL,
@@ -1960,7 +2329,7 @@ def build_psv(docket_id: str) -> Tuple[bytes, int]:
                                  doublequote=True, strict=True))
     except csv.Error as exc:
         raise ExportError(f"PSV could not be read back: {exc}") from exc
-    if any(len(r) != len(PSV_FIELDS) for r in parsed):
+    if any(len(r) != len(VIEW_HEADERS) for r in parsed):
         raise ExportError("PSV integrity check failed: a row has the wrong number of columns.")
     if parsed != expected:
         raise ExportError("PSV integrity check failed: re-reading the file did not reproduce the data.")
@@ -1978,14 +2347,10 @@ def build_json(docket: sqlite3.Row) -> Tuple[bytes, int]:
     facts = []
     for row in fetch_facts(docket_id):
         facts.append({
-            "id": row["id"], "document_id": row["document_id"], "filename": row["filename"],
-            "page_number": row["page_number"], "label": row["label"], "concept": row["concept"],
-            "value": row["value"], "original_value": row["original_value"],
-            "source_evidence": row["source_evidence"],
-            "confidence": {"band": row["confidence_band"], "score": row["confidence_score"],
-                           "reasons": json.loads(row["confidence_reasons"])},
-            "review_status": row["review_status"], "corrected": bool(row["corrected"]),
-            "created_at": row["created_at"], "updated_at": row["updated_at"],
+            "Document Name": row["filename"],
+            "Label": row["label"],
+            "Value": row["value"],
+            "Confidence Score": clamp_confidence(row["confidence_score"], 50),
         })
     with connect() as connection:
         documents = [dict(r) for r in connection.execute(
@@ -2019,6 +2384,12 @@ def build_json(docket: sqlite3.Row) -> Tuple[bytes, int]:
     if len(reloaded["facts"]) != len(facts) or len(reloaded["documents"]) != len(documents):
         raise ExportError("JSON integrity check failed: record counts do not match.")
     return data, len(facts)
+<<<<<<< HEAD
+=======
+VIEW_HEADERS = ["Document Name", "Label", "Value", "Confidence Score"]
+XLSX_HEADERS = VIEW_HEADERS
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+>>>>>>> refs/remotes/origin/main
 
 
 def build_metadata_json(docket_id: str) -> Tuple[bytes, int]:
@@ -2030,6 +2401,7 @@ METADATA_HEADERS = ["document_name", "label", "value", "confidence_score"]
 
 def metadata_records(docket_id: str) -> List[dict]:
     return [
+<<<<<<< HEAD
         {
             "document_name": row["document_name"],
             "label": row["label"],
@@ -2037,6 +2409,15 @@ def metadata_records(docket_id: str) -> List[dict]:
             "confidence_score": int(row["confidence_score"]),
         }
         for row in fetch_metadata(docket_id)
+=======
+        [
+            clean_text(f["filename"]),
+            clean_text(f["label"]),
+            clean_text(f["value"]),
+            int(clamp_confidence(f["confidence_score"], 50)),
+        ]
+        for f in fetch_facts(docket_id)
+>>>>>>> refs/remotes/origin/main
     ]
 
 
@@ -2091,7 +2472,17 @@ def build_metadata_xlsx(records: List[dict], description: str) -> Tuple[bytes, i
             value = record[field]
             cell = sheet.cell(row=row_number, column=column_number, value=value)
             if isinstance(value, str) and value[:1] in ("=", "+", "-", "@"):
+<<<<<<< HEAD
                 cell.data_type = "s"
+=======
+                cell.data_type = "s"  # keep as text, never a formula
+        score = row[3]
+        colour = "FFC7CE" if score < 65 else "FFEB9C" if 65 < score < 80 else "C6EFCE" if score > 80 else "FFFFFF"
+        sheet.cell(row=row_number, column=4).fill = PatternFill(
+            fill_type="solid", start_color=colour, end_color=colour
+        )
+
+>>>>>>> refs/remotes/origin/main
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = f"A1:D{max(sheet.max_row, 1)}"
     for letter, width in zip("ABCD", (34, 34, 60, 18)):
@@ -2494,6 +2885,7 @@ def page_workspace(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) ->
     metrics[2].metric("Pending review", sum(f["review_status"] == "pending" for f in facts))
     metrics[3].metric("Red confidence", sum(f["confidence_band"] == "Red" for f in facts))
 
+<<<<<<< HEAD
     render_processing_controls(docket_id)
     job = processing_job(docket_id)
     if job and job["status"] in {"queued", "running"}:
@@ -2502,12 +2894,69 @@ def page_workspace(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) ->
           and st.session_state.get("last_surfaced_job_id") != job["id"]):
         st.session_state["last_results"] = job["results"]
         st.session_state["last_surfaced_job_id"] = job["id"]
+=======
+    with st.container(border=True):
+        st.markdown("**Add documents**")
+        st.radio("Extraction mode", ["Local", "Gemini"], horizontal=True, key="extraction_mode",
+                 help="Local uses text-layer rules and works offline. Gemini sends each batch of "
+                      "documents in one request and also reads scans and images.")
+        if st.session_state.get("upload_queue_docket") != docket_id:
+            st.session_state["upload_queue"] = {}
+            st.session_state["upload_queue_docket"] = docket_id
+        incoming_uploads = st.file_uploader(
+            f"Drop PDF, PNG, JPG, TXT or XLSX files (up to {fmt_size(MAX_UPLOAD_BYTES)} each)",
+            type=SUPPORTED_TYPES,
+            accept_multiple_files=True,
+            key=f"uploads_{st.session_state.get('upload_nonce', 0)}",
+        )
+        upload_queue = st.session_state.setdefault("upload_queue", {})
+        for upload in incoming_uploads:
+            data = upload.getvalue()
+            queue_key = f"{upload.name}\0{hashlib.sha256(data).hexdigest()}"
+            upload_queue.setdefault(
+                queue_key,
+                {"name": upload.name, "data": data, "type": upload.type},
+            )
+        uploads = list(upload_queue.values())
+        if uploads:
+            st.caption(f"{len(uploads)} document(s) queued and ready to process.")
+            st.dataframe(
+                [{"Document": upload["name"], "Size": fmt_size(len(upload["data"]))} for upload in uploads],
+                hide_index=True,
+                **stretch(),
+            )
+        else:
+            st.caption("Choose one or more files to enable processing.")
+        run = st.button(
+            f"Process {len(uploads)} document(s)" if uploads else "Process documents",
+            type="primary",
+            disabled=not uploads,
+            **stretch(),
+        )
+        if run and uploads:
+            process_uploads(docket_id, uploads)
+            st.session_state.pop("upload_queue", None)
+            st.rerun()
+>>>>>>> refs/remotes/origin/main
 
     results = st.session_state.get("last_results")
     if results:
+        summary = st.session_state.get("last_run_summary", {})
+        if summary:
+            st.markdown("#### Latest processing summary")
+            summary_cols = st.columns(7)
+            summary_cols[0].metric("Uploaded", summary.get("total", 0))
+            summary_cols[1].metric("Completed", summary.get("completed", 0))
+            summary_cols[2].metric("Processing", 0)
+            summary_cols[3].metric("Failed", summary.get("failed", 0))
+            summary_cols[4].metric("Partial", summary.get("partial", 0))
+            summary_cols[5].metric("Pending", summary.get("pending", 0))
+            summary_cols[6].metric("Facts appended", summary.get("appended", 0))
         with st.expander("Latest processing run", expanded=True):
             for result in results:
-                text = (f"**{result['filename']}** · {result['status']} · {result['facts']} record(s)"
+                text = (
+                    f"**{result['filename']}** · {result['status']} · "
+                    f"{result['extracted_count']} extracted · {result['appended_count']} appended"
                         + (f" · {result['message']}" if result["message"] else ""))
                 if result["status"] == "failed":
                     st.error(text, icon="🚫")
@@ -2935,19 +3384,19 @@ def page_psv_verify(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -
 
     frame = st.session_state.get("psv_frame")
     if frame is None:
-        st.info("Upload a PSV containing field, value, source document, and confidence data.")
+        st.info("Upload a PSV containing Document Name, Label, Value, and Confidence Score.")
         return
 
     verified = st.session_state.setdefault("psv_verified", set())
     current = int(st.session_state.get("psv_current", -1))
     pending_count = sum(
-        index not in verified and frame.at[index, "Confidence Level"] in {"Low", "Medium"}
+        index not in verified and frame.at[index, "Confidence Score"] < 81
         for index in frame.index
     )
     metrics = st.columns(4)
     metrics[0].metric("Rows", len(frame))
-    metrics[1].metric("Low", int((frame["Confidence Level"] == "Low").sum()))
-    metrics[2].metric("Medium", int((frame["Confidence Level"] == "Medium").sum()))
+    metrics[1].metric("Red", int((frame["Confidence Score"] < 65).sum()))
+    metrics[2].metric("Yellow", int(((frame["Confidence Score"] > 65) & (frame["Confidence Score"] < 80)).sum()))
     metrics[3].metric("Pending review", pending_count)
 
     action_col, export_col = st.columns([1, 1])
@@ -2973,11 +3422,11 @@ def page_psv_verify(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -
     st.session_state["psv_current"] = current
     row = frame.iloc[current]
     with st.container(border=True):
-        st.markdown(f"**Review item {current + 1} of {len(frame)}** · {row['Confidence Level']}")
-        st.markdown(f"**{row['Field Name']}**")
-        st.write(row["Extracted Value"] or "(empty)")
-        st.caption(f"Source document: {row['Source Document']}")
-        is_high = row["Confidence Level"] == "High"
+        st.markdown(f"**Review item {current + 1} of {len(frame)}** · score {row['Confidence Score']}")
+        st.markdown(f"**{row['Label']}**")
+        st.write(row["Value"] or "(empty)")
+        st.caption(f"Source document: {row['Document Name']}")
+        is_high = row["Confidence Score"] > 80
         is_verified = current in verified
         if not is_high and not is_verified:
             if st.button("Mark verified", type="primary", key=f"psv_verify_{current}", **stretch()):
@@ -2990,14 +3439,18 @@ def page_psv_verify(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -
         else:
             st.success("Pre-verified" if is_high else "Verified", icon="✅")
 
-    color_map = {
-        "High": "background-color: #1f7a4d; color: #f0fff7; font-weight: 700",
-        "Medium": "background-color: #8a6d1d; color: #fff8d6; font-weight: 700",
-        "Low": "background-color: #8c3540; color: #fff1f2; font-weight: 700",
-    }
+    def score_style(value: object) -> str:
+        score = clamp_confidence(value, 50)
+        if score < 65:
+            return "background-color: #8c3540; color: #fff1f2; font-weight: 700"
+        if 65 < score < 80:
+            return "background-color: #8a6d1d; color: #fff8d6; font-weight: 700"
+        if score > 80:
+            return "background-color: #1f7a4d; color: #f0fff7; font-weight: 700"
+        return ""
     styled_frame = frame.style.map(
-        lambda value: color_map.get(str(value), ""),
-        subset=["Confidence Level"],
+        score_style,
+        subset=["Confidence Score"],
     )
     st.dataframe(styled_frame, hide_index=True, width="stretch")
 
@@ -3035,6 +3488,7 @@ def page_export(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
     slug = to_concept(active["name"]) or "docket"
 
+<<<<<<< HEAD
     formats = ["JSON", "PSV", "XLSX"]
     mime_by_format = {"JSON": "application/json", "PSV": "text/plain; charset=utf-8", "XLSX": XLSX_MIME}
 
@@ -3047,6 +3501,26 @@ def page_export(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
         selected_format = st.selectbox("Format", formats, key=f"{prefix}_format")
         cache_key = f"{prefix}_export_cache"
         if st.button("Build export", type="primary", key=f"{prefix}_build", **stretch()):
+=======
+    # (title, caption, builder, filename, mime, show_text_preview)
+    specs = [
+        ("PSV (review view)",
+         "Four columns: Document Name, Label, Value, Confidence Score. Pipe-delimited, UTF-8 with BOM. "
+         "Can be uploaded straight into PSV Verify.",
+         lambda: build_view_psv(active["id"]), f"parchai-{slug}-{stamp}.psv",
+         "text/plain; charset=utf-8", True),
+        ("Excel (review view)",
+         "The same four columns in a spreadsheet. Confidence Score cells are colored by score.",
+         lambda: build_view_xlsx(active["id"]), f"parchai-{slug}-{stamp}.xlsx", XLSX_MIME, False),
+        ("JSON (full)",
+         "Docket, documents, facts with confidence, review state and full change history.",
+         lambda: build_json(active), f"parchai-{slug}-{stamp}.json", "application/json", True),
+    ]
+    for column, (title, caption, builder, filename, mime, show_preview) in zip(st.columns(3), specs):
+        with column, st.container(border=True):
+            st.markdown(f"**{title}**")
+            st.caption(caption)
+>>>>>>> refs/remotes/origin/main
             try:
                 if selected_format == "JSON":
                     data, count = build_metadata_export(records, title)
