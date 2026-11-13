@@ -49,16 +49,22 @@ def _score(value: object) -> float | None:
     return number * 100 if 0 <= number <= 1 else number
 
 
-def confidence_score(score: object = None, level: object = None) -> int:
+def confidence_score(score: object = None, level: object = None) -> float:
+    """Always return a number so sorting, clipping and Excel formatting work on one type."""
     numeric = _score(score)
     if numeric is not None:
-        return max(1, min(100, round(numeric)))
+        return numeric
     text = str(level or "").strip().lower()
     if text in {"high", "green"}:
         return 90
     if text in {"medium", "yellow", "moderate"}:
         return 70
     return 40
+
+
+def confidence_band(score: float) -> str:
+    # Must match app.band_for: Green > 80, Yellow > 65, otherwise Red.
+    return "Green" if score > 80 else "Yellow" if score > 65 else "Red"
 
 
 def _normalise_fact(value: object) -> str:
@@ -169,6 +175,12 @@ def build_excel(frame: pd.DataFrame) -> bytes:
         export.to_excel(writer, index=False, sheet_name="PSV Verification")
     workbook = load_workbook(output)
     sheet = workbook["PSV Verification"]
+    # Neutralise formula/CSV injection: a value such as =HYPERLINK(...) or +CMD(...) coming
+    # from an uploaded PSV must never become a live formula in the generated workbook.
+    for row in sheet.iter_rows(min_row=2):
+        for cell in row:
+            if isinstance(cell.value, str) and cell.value[:1] in ("=", "+", "-", "@"):
+                cell.data_type = "s"
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = sheet.dimensions
     table = Table(displayName="PSVVerificationTable", ref=sheet.dimensions)
@@ -184,11 +196,11 @@ def build_excel(frame: pd.DataFrame) -> bytes:
     confidence_column = "D"
     sheet.conditional_formatting.add(
         f"{confidence_column}2:{confidence_column}{max(sheet.max_row, 2)}",
-        FormulaRule(formula=[f"${confidence_column}2<65"], fill=fills["red"]),
+        FormulaRule(formula=[f"${confidence_column}2<=65"], fill=fills["red"]),
     )
     sheet.conditional_formatting.add(
         f"{confidence_column}2:{confidence_column}{max(sheet.max_row, 2)}",
-        FormulaRule(formula=[f"AND(${confidence_column}2>65,${confidence_column}2<80)"], fill=fills["yellow"]),
+        FormulaRule(formula=[f"AND(${confidence_column}2>65,${confidence_column}2<=80)"], fill=fills["yellow"]),
     )
     sheet.conditional_formatting.add(
         f"{confidence_column}2:{confidence_column}{max(sheet.max_row, 2)}",
