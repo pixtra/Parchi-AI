@@ -74,13 +74,14 @@ MAX_PARTS_PER_BATCH = int(os.getenv("PARCHAI_MAX_PARTS_PER_BATCH", "12"))
 MAX_UPLOAD_BYTES = int(os.getenv("PARCHAI_MAX_UPLOAD_MB", "50")) * 1024 * 1024
 KEY_COOLDOWN_SECONDS = 60
 AUTH_COOLDOWN_SECONDS = 3600
-SUPPORTED_TYPES = ["pdf", "png", "jpg", "jpeg", "txt"]
+SUPPORTED_TYPES = ["pdf", "png", "jpg", "jpeg", "txt", "xlsx"]
 MIME_TYPES = {
     "pdf": "application/pdf",
     "png": "image/png",
     "jpg": "image/jpeg",
     "jpeg": "image/jpeg",
     "txt": "text/plain",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }
 BANDS = ("Green", "Yellow", "Red")
 REVIEW_STATUSES = ("pending", "approved", "rejected")
@@ -188,9 +189,9 @@ PATTERNS = [
     ("weight", "Weight", re.compile(r"\b\d+(?:\.\d+)?\s?(?:kgs?|MT|tons?|tonnes?)\b", re.IGNORECASE)),
 ]
 
-BATCH_PROMPT = """You extract data from SEVERAL supplier documents in one request.
-Each document part is preceded by a line "=== DOCUMENT: <label> ===". Use that label EXACTLY
-as the "document" value. Page numbers restart at 1 for every labelled part.
+BATCH_PROMPT = """You extract data from supplier document content.
+The document part is preceded by a line "=== DOCUMENT: <label> ===". Use that label EXACTLY
+as the "document" value. Page or sheet numbers restart at 1 for this document part.
 Return ONLY a JSON object of this exact shape:
 {"documents": [
    {"document": "<label exactly as given>", "document_type": "short type name",
@@ -204,8 +205,10 @@ Return ONLY a JSON object of this exact shape:
     "evidence": "verbatim text showing the link"}
  ]}
 Rules:
+- Read every page or sheet in the supplied document part before responding.
 - Extract every identifiable field: identifiers, parties, dates, references, quantities,
-  weights, rates, taxes, totals and each line item (item_1_description, item_1_quantity, ...).
+  weights, rates, taxes, totals, headers, footers, notes and each line item
+  (item_1_description, item_1_quantity, ...).
 - Include document-specific fields that do not fit a standard schema.
 - Copy values exactly as written, including handwritten entries when legible.
 - Never invent or infer values that are not on the page. Use an empty value for illegible fields.
@@ -417,7 +420,7 @@ def validate_upload(filename: str, data: bytes) -> Optional[str]:
     """Return a human-readable problem, or None when the upload looks sound."""
     extension = extension_of(filename)
     if extension not in SUPPORTED_TYPES:
-        return f"Unsupported file type “.{extension or '?'}”. Use PDF, PNG, JPEG or TXT."
+        return f"Unsupported file type “.{extension or '?'}”. Use PDF, PNG, JPEG, TXT or XLSX."
     if not data:
         return "The file is empty (0 bytes)."
     if len(data) > MAX_UPLOAD_BYTES:
@@ -557,6 +560,14 @@ def list_documents(docket_id: str) -> List[sqlite3.Row]:
         ).fetchall()
 
 
+def set_document_status(document_id: str, status: str) -> None:
+    with connect() as connection:
+        connection.execute(
+            "UPDATE documents SET status = ? WHERE id = ?",
+            (status, document_id),
+        )
+
+
 def fetch_facts(docket_id: str) -> List[sqlite3.Row]:
     with connect() as connection:
         return connection.execute(
@@ -601,6 +612,33 @@ def read_pages(filename: str, data: bytes) -> List[Dict[str, Any]]:
     if extension == "txt":
         text = clean_text(decode_text(data)).strip()
         return [{"page_number": 1, "text": text, "readable": bool(text)}]
+    if extension == "xlsx":
+        try:
+            workbook = load_workbook(io.BytesIO(data), read_only=True, data_only=False)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"The spreadsheet could not be opened ({exc.__class__.__name__}).") from exc
+        pages = []
+        try:
+            for number, sheet in enumerate(workbook.worksheets, start=1):
+                lines = []
+                for row in sheet.iter_rows(values_only=True):
+                    values = [clean_text(value) for value in row]
+                    while values and not values[-1]:
+                        values.pop()
+                    if values:
+                        lines.append(" | ".join(values))
+                text = "\n".join(lines).strip()
+                pages.append({
+                    "page_number": number,
+                    "sheet_name": sheet.title,
+                    "text": text,
+                    "readable": bool(text),
+                })
+        finally:
+            workbook.close()
+        if not pages:
+            raise RuntimeError("The spreadsheet contains no worksheets.")
+        return pages
     return [{"page_number": 1, "text": "", "readable": False}]  # images: no text layer
 
 
@@ -818,16 +856,33 @@ class OversizedBatch(Exception):
 def make_units(doc: Dict[str, Any], label: Optional[str] = None) -> List[Dict[str, Any]]:
     if extension_of(doc["filename"]) == "pdf" and fitz is not None:
         parts = split_pdf(doc["data"], CHUNK_PAGES)
+        part_meta = [(start, count, blob, doc["mime"], "." + extension_of(doc["filename"]),
+                      None) for start, count, blob in parts]
+    elif extension_of(doc["filename"]) == "xlsx":
+        part_meta = [
+            (
+                page["page_number"] - 1,
+                1,
+                page["text"].encode("utf-8"),
+                "text/plain",
+                ".txt",
+                page.get("sheet_name"),
+            )
+            for page in doc["pages"]
+        ]
     else:
-        parts = [(0, doc["page_count"], doc["data"])]
+        part_meta = [(0, doc["page_count"], doc["data"], doc["mime"],
+                      "." + extension_of(doc["filename"]), None)]
     units = []
-    for start, count, blob in parts:
+    for start, count, blob, mime, suffix, sheet_name in part_meta:
         unit_label = label or doc["filename"]
-        if len(parts) > 1:
+        if extension_of(doc["filename"]) == "xlsx":
+            unit_label = f"{unit_label} [sheet: {sheet_name}]"
+        elif len(part_meta) > 1:
             unit_label = f"{unit_label} [pages {start + 1}-{start + count}]"
         unit = {
             "label": unit_label, "doc": doc, "offset": start, "pages": count, "data": blob,
-            "mime": doc["mime"], "suffix": "." + extension_of(doc["filename"]),
+            "mime": mime, "suffix": suffix,
             "pages_slice": doc["pages"][start:start + count],
             "items": None, "status": None, "message": "", "doc_type": None,
         }
@@ -1066,16 +1121,31 @@ def prepare_document(docket_id: str, filename: str, data: bytes, mode: str) -> T
     digest = hashlib.sha256(data).hexdigest()
     with connect() as connection:
         duplicate = connection.execute(
-            "SELECT filename FROM documents WHERE docket_id = ? AND sha256 = ?", (docket_id, digest)
+            "SELECT id, filename, status FROM documents WHERE docket_id = ? AND sha256 = ?",
+            (docket_id, digest),
         ).fetchone()
     if duplicate:
-        return None, {"filename": filename, "status": "skipped", "fact_count": 0,
-                      "message": f"Identical to “{duplicate['filename']}” already in this docket."}
+        if duplicate["status"] in {"completed", "local", "gemini"}:
+            return None, {
+                "filename": filename,
+                "status": "skipped",
+                "fact_count": 0,
+                "extracted_count": 0,
+                "appended_count": 0,
+                "message": f"Identical to “{duplicate['filename']}” already completed in this docket.",
+            }
+        delete_document(docket_id, duplicate["id"])
     try:
         pages = read_pages(filename, data)
     except Exception as exc:  # noqa: BLE001
-        return None, {"filename": filename, "status": "failed", "fact_count": 0,
-                      "message": clean_text(exc)[:300]}
+        return None, {
+            "filename": filename,
+            "status": "failed",
+            "fact_count": 0,
+            "extracted_count": 0,
+            "appended_count": 0,
+            "message": clean_text(exc)[:300],
+        }
 
     doc_id = str(uuid.uuid4())
     now = utc_now()
@@ -1237,9 +1307,7 @@ def apply_extraction_integrity(docket_id: str) -> None:
 def gemini_document_status(doc: Dict[str, Any]) -> str:
     statuses = {unit["status"] for unit in doc["units"]}
     if statuses == {"gemini"}:
-        return "gemini"
-    if statuses == {"fallback"}:
-        return "fallback"
+        return "completed"
     return "partial"
 
 
@@ -1252,95 +1320,166 @@ def process_uploads(docket_id: str, uploads: List[Any]) -> None:
         return
 
     results: List[Dict[str, Any]] = []
-    documents: List[Dict[str, Any]] = []
-    finalized: set = set()
+    total = len(uploads)
 
-    def save(doc: Dict[str, Any], status: str, doc_type: str, items: List[Dict[str, Any]], message: str) -> None:
+    def save(
+        doc: Dict[str, Any],
+        status: str,
+        doc_type: str,
+        items: List[Dict[str, Any]],
+        message: str,
+    ) -> Dict[str, Any]:
+        set_document_status(doc["id"], "saving")
         try:
             fact_count = finalize_document(docket_id, doc, status, doc_type, items)
-            finalized.add(doc["id"])
-            results.append({"filename": doc["filename"], "status": status,
-                            "fact_count": fact_count, "message": message})
+            return {
+                "filename": doc["filename"],
+                "status": status,
+                "fact_count": fact_count,
+                "extracted_count": len(items),
+                "appended_count": fact_count,
+                "message": message,
+            }
         except Exception as exc:  # noqa: BLE001
             LOG.exception("could not save %s", doc["filename"])
-            delete_document(docket_id, doc["id"])  # leave nothing half-saved, so a retry is possible
-            results.append({"filename": doc["filename"], "status": "failed", "fact_count": 0,
-                            "message": f"Could not save results ({clean_text(exc)[:150]}). Nothing was kept; try again."})
+            try:
+                set_document_status(doc["id"], "failed")
+            except Exception:  # noqa: BLE001
+                LOG.exception("could not mark %s as failed", doc["filename"])
+            return {
+                "filename": doc["filename"],
+                "status": "failed",
+                "fact_count": 0,
+                "extracted_count": 0,
+                "appended_count": 0,
+                "message": f"Could not save results ({clean_text(exc)[:150]}). Retry this document.",
+            }
 
-    with st.status("Processing docket…", expanded=True) as run:
-        try:
-            for upload in uploads:
-                data = upload.getvalue()
-                problem = validate_upload(upload.name, data)
-                if problem:
-                    results.append({"filename": upload.name, "status": "failed", "fact_count": 0,
-                                    "message": problem})
-                    continue
+    def process_document(doc: Dict[str, Any], run: Any) -> Dict[str, Any]:
+        set_document_status(doc["id"], "reading")
+        run.write(f"{doc['filename']}: Reading {doc['page_count']} page(s)/sheet(s).")
+        if mode == "Local":
+            set_document_status(doc["id"], "extracting")
+            items = local_extract(doc["pages"])
+            set_document_status(doc["id"], "validating")
+            complete = all(page["readable"] for page in doc["pages"])
+            return save(
+                doc,
+                "completed" if complete else "partial",
+                classify_local(doc["pages"]),
+                items,
+                "Extracted with local rules."
+                if complete
+                else "Partial: one or more pages/sheets have no readable text layer.",
+            )
+
+        set_document_status(doc["id"], "extracting")
+        units = make_units(doc)
+        batches = pack_batches(units)
+        run.write(f"{doc['filename']}: Extracting {len(units)} part(s) in {len(batches)} request(s).")
+        for index, batch in enumerate(batches, start=1):
+            run.write(f"{doc['filename']}: Request {index}/{len(batches)} ({len(batch)} part(s)).")
+            process_units(batch, keys)
+        items = [item for unit in units for item in (unit["items"] or [])]
+        doc_type = next((u["doc_type"] for u in units if u["doc_type"]), "")
+        messages = sorted({u["message"] for u in units if u["message"]})
+        status = gemini_document_status({"units": units})
+        set_document_status(doc["id"], "validating")
+        run.write(f"{doc['filename']}: Validating {len(items)} extracted fact(s).")
+        return save(
+            doc,
+            status,
+            doc_type or classify_local(doc["pages"]),
+            items,
+            " | ".join(messages) or "All document parts extracted.",
+        )
+
+    with st.status(f"Processing {total} document(s) sequentially…", expanded=True) as run:
+        for upload in uploads:
+            data = upload.getvalue()
+            problem = validate_upload(upload.name, data)
+            if problem:
+                results.append({
+                    "filename": upload.name,
+                    "status": "failed",
+                    "fact_count": 0,
+                    "extracted_count": 0,
+                    "appended_count": 0,
+                    "message": problem,
+                })
+                run.write(f"{upload.name}: Failed validation.")
+                continue
+            try:
+                doc, skipped = prepare_document(docket_id, upload.name, data, mode)
+            except Exception as exc:  # noqa: BLE001
+                LOG.exception("prepare failed for %s", upload.name)
+                results.append({
+                    "filename": upload.name,
+                    "status": "failed",
+                    "fact_count": 0,
+                    "extracted_count": 0,
+                    "appended_count": 0,
+                    "message": f"Could not store the file ({clean_text(exc)[:200]}).",
+                })
+                run.write(f"{upload.name}: Failed while being stored.")
+                continue
+            if doc is None:
+                results.append(skipped)
+                run.write(f"{upload.name}: {skipped['status'].capitalize()}.")
+                continue
+            try:
+                result = process_document(doc, run)
+            except Exception as exc:  # noqa: BLE001
+                LOG.exception("processing failed for %s", doc["filename"])
                 try:
-                    doc, skipped = prepare_document(docket_id, upload.name, data, mode)
-                except Exception as exc:  # noqa: BLE001
-                    LOG.exception("prepare failed for %s", upload.name)
-                    results.append({"filename": upload.name, "status": "failed", "fact_count": 0,
-                                    "message": f"Could not store the file ({clean_text(exc)[:200]})."})
-                    continue
-                if doc:
-                    documents.append(doc)
-                else:
-                    results.append(skipped)
-
-            if mode == "Local":
-                for doc in documents:
-                    run.write(f"Local rules: {doc['filename']}")
-                    items = local_extract(doc["pages"])
-                    save(doc, "local", classify_local(doc["pages"]), items, "Extracted with local rules.")
-            else:
-                units: List[Dict[str, Any]] = []
-                labels_by_filename: Dict[str, int] = {}
-                for doc in documents:
-                    labels_by_filename[doc["filename"]] = labels_by_filename.get(doc["filename"], 0) + 1
-                seen_filenames: Dict[str, int] = {}
-                for doc in documents:
-                    try:
-                        seen_filenames[doc["filename"]] = seen_filenames.get(doc["filename"], 0) + 1
-                        label = doc["filename"]
-                        if labels_by_filename[doc["filename"]] > 1:
-                            label = f"{doc['filename']} [document {seen_filenames[doc['filename']]}]"
-                        units.extend(make_units(doc, label))
-                    except Exception as exc:  # noqa: BLE001
-                        doc["units"] = [{
-                            "label": doc["filename"], "doc": doc, "offset": 0, "pages": doc["page_count"],
-                            "data": doc["data"], "mime": doc["mime"], "suffix": "",
-                            "pages_slice": doc["pages"], "items": None, "status": None,
-                            "message": "", "doc_type": None,
-                        }]
-                        unit_fallback(doc["units"][0], f"could not split document ({str(exc)[:120]})")
-                batches = pack_batches([u for u in units if u["status"] is None])
-                run.write(f"{len(units)} part(s) packed into {len(batches)} request(s).")
-                for index, batch in enumerate(batches, start=1):
-                    run.write(f"Request {index}/{len(batches)}: {len(batch)} part(s)")
-                    process_units(batch, keys)
-                for doc in documents:
-                    items = [item for unit in doc["units"] for item in (unit["items"] or [])]
-                    doc_type = next((u["doc_type"] for u in doc["units"] if u["doc_type"]), "")
-                    messages = sorted({u["message"] for u in doc["units"] if u["message"]})
-                    save(doc, gemini_document_status(doc), doc_type or classify_local(doc["pages"]),
-                         items, " | ".join(messages))
-            run.update(label="Processing complete", state="complete", expanded=False)
-        except Exception as exc:  # noqa: BLE001
-            LOG.exception("processing run failed")
-            for doc in documents:
-                if doc["id"] not in finalized:
-                    delete_document(docket_id, doc["id"])
-                    results.append({"filename": doc["filename"], "status": "failed", "fact_count": 0,
-                                    "message": f"Processing was interrupted ({clean_text(exc)[:150]}). "
-                                               "The file was removed so you can retry."})
-            run.update(label="Processing stopped with an error", state="error", expanded=True)
+                    set_document_status(doc["id"], "failed")
+                except Exception:  # noqa: BLE001
+                    LOG.exception("could not mark %s as failed", doc["filename"])
+                result = {
+                    "filename": doc["filename"],
+                    "status": "failed",
+                    "fact_count": 0,
+                    "extracted_count": 0,
+                    "appended_count": 0,
+                    "message": f"Processing failed ({clean_text(exc)[:200]}). Retry this document.",
+                }
+                run.write(f"{doc['filename']}: Failed; later documents remain queued.")
+            results.append(result)
+            run.write(
+                f"{doc['filename']}: {result['status'].capitalize()} — "
+                f"{result['fact_count']} fact(s) appended."
+            )
+        completed = sum(r["status"] == "completed" for r in results)
+        failed = sum(r["status"] == "failed" for r in results)
+        partial = sum(r["status"] == "partial" for r in results)
+        extracted = sum(r["extracted_count"] for r in results)
+        appended = sum(r["appended_count"] for r in results)
+        st.session_state["last_run_summary"] = {
+            "total": total,
+            "completed": completed,
+            "failed": failed,
+            "partial": partial,
+            "pending": 0,
+            "extracted": extracted,
+            "appended": appended,
+        }
+        run.write(
+            f"Summary: {completed}/{total} completed, {failed} failed, {partial} partial, "
+            f"{extracted} extracted, {appended} fact(s) appended."
+        )
+        run.update(
+            label="Processing complete" if not failed and not partial else "Processing completed with issues",
+            state="complete" if not failed and not partial else "error",
+            expanded=bool(failed or partial),
+        )
 
     st.session_state["last_results"] = results
     st.session_state["upload_nonce"] = st.session_state.get("upload_nonce", 0) + 1  # clears the queue
-    good = sum(r["status"] not in ("failed", "skipped") for r in results)
-    queue_flash("success" if good else "warning",
-                f"{good} of {len(results)} file(s) processed. See “Latest processing run” for details.")
+    completed = sum(r["status"] == "completed" for r in results)
+    queue_flash(
+        "success" if completed == total else "warning",
+        f"{completed} of {total} document(s) completed. See “Latest processing run” for details.",
+    )
 
 
 # ---------------------------------------------------------------- review operations
@@ -1425,7 +1564,9 @@ def validation_report(docket_id: str) -> List[Dict[str, str]]:
         if problem:
             add("Red", "Storage", f"{document['filename']}: {problem}")
         if document["status"] in ("fallback", "partial"):
-            add("Yellow", "Extraction", f"{document['filename']}: some parts used local rules after Gemini failed.")
+            add("Yellow", "Extraction", f"{document['filename']}: extraction is partial and needs attention.")
+        elif document["status"] == "failed":
+            add("Red", "Extraction", f"{document['filename']}: processing failed and must be retried.")
     for page in unreadable:
         add("Yellow", "Completeness",
             f"{page['filename']} p.{page['page_number']}: no text layer; Gemini mode or OCR required.")
@@ -2007,7 +2148,7 @@ def page_workspace(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) ->
                  help="Local uses text-layer rules and works offline. Gemini sends each batch of "
                       "documents in one request and also reads scans and images.")
         uploads = st.file_uploader(
-            f"Drop PDF, PNG, JPG or TXT files (up to {fmt_size(MAX_UPLOAD_BYTES)} each)",
+            f"Drop PDF, PNG, JPG, TXT or XLSX files (up to {fmt_size(MAX_UPLOAD_BYTES)} each)",
             type=SUPPORTED_TYPES,
             accept_multiple_files=True,
             key=f"uploads_{st.session_state.get('upload_nonce', 0)}",
@@ -2022,9 +2163,22 @@ def page_workspace(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) ->
 
     results = st.session_state.get("last_results")
     if results:
+        summary = st.session_state.get("last_run_summary", {})
+        if summary:
+            st.markdown("#### Latest processing summary")
+            summary_cols = st.columns(7)
+            summary_cols[0].metric("Uploaded", summary.get("total", 0))
+            summary_cols[1].metric("Completed", summary.get("completed", 0))
+            summary_cols[2].metric("Processing", 0)
+            summary_cols[3].metric("Failed", summary.get("failed", 0))
+            summary_cols[4].metric("Partial", summary.get("partial", 0))
+            summary_cols[5].metric("Pending", summary.get("pending", 0))
+            summary_cols[6].metric("Facts appended", summary.get("appended", 0))
         with st.expander("Latest processing run", expanded=True):
             for result in results:
-                text = (f"**{result['filename']}** · {result['status']} · {result['fact_count']} fact(s)"
+                text = (
+                    f"**{result['filename']}** · {result['status']} · "
+                    f"{result['extracted_count']} extracted · {result['appended_count']} appended"
                         + (f" · {result['message']}" if result["message"] else ""))
                 if result["status"] == "failed":
                     st.error(text, icon="🚫")
