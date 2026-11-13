@@ -48,7 +48,6 @@ def _score(value: object) -> float | None:
     return number * 100 if 0 <= number <= 1 else number
 
 
-<<<<<<< HEAD
 def confidence_level(score: object = None, level: object = None) -> str:
     # Thresholds mirror app.band_for (Green >= 90, Yellow >= 60, else Red) exactly, so the
     # same confidence score is never shown as a different band on different screens.
@@ -59,12 +58,6 @@ def confidence_level(score: object = None, level: object = None) -> str:
         if numeric >= 60:
             return "Medium"
         return "Low"
-=======
-def confidence_score(score: object = None, level: object = None) -> int:
-    numeric = _score(score)
-    if numeric is not None:
-        return max(1, min(100, round(numeric)))
->>>>>>> refs/remotes/origin/main
     text = str(level or "").strip().lower()
     if text in {"high", "green"}:
         return 90
