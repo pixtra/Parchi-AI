@@ -1,7 +1,7 @@
 """Parchi AI: supplier document extraction, review and verification (Streamlit)."""
 from __future__ import annotations
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font
+from openpyxl.styles import Font, PatternFill
 import csv
 import functools
 import hashlib
@@ -248,7 +248,7 @@ CREATE INDEX IF NOT EXISTS idx_documents_docket ON documents(docket_id);
 CREATE INDEX IF NOT EXISTS idx_metadata_docket ON metadata(docket_id);
 """
 
-BATCH_PROMPT = """You extract data from SEVERAL supplier documents in one request.
+BATCH_PROMPT = """You are an exhaustive document transcription and extraction engine.
 Each document part is preceded by a line "=== DOCUMENT: <id> | <label> ===". Use that <id>
 (for example P2) EXACTLY as the "document" value. Page numbers restart at 1 for every labelled part. Spreadsheet
 parts contain every worksheet, including hidden worksheets, represented as a page with a
@@ -258,7 +258,8 @@ Return ONLY a JSON object of this exact shape:
    {"document": "<label exactly as given>", "document_type": "short type name",
     "facts": [{"page_number": 1, "label": "Human readable field name",
                "concept": "snake_case_name", "value": "value as written",
-               "evidence": "text copied verbatim from that page or sheet (max 200 chars)"}]}
+               "evidence": "text copied verbatim from that page or sheet (max 500 chars)",
+               "confidence_score": 87}]}
  ],
  "cross_references": [
    {"from_document": "<label>", "to_document": "<label>", "page_number": 1,
@@ -266,12 +267,21 @@ Return ONLY a JSON object of this exact shape:
     "evidence": "verbatim text showing the link"}
  ]}
 Rules:
-- Extract every identifiable field: identifiers, parties, dates, references, quantities,
-  weights, rates, taxes, totals and each line item (item_1_description, item_1_quantity, ...).
-- Include document-specific fields that do not fit a standard schema.
-- Copy values exactly as written, including handwritten entries when legible.
-- Never invent or infer values that are not on the page. Use an empty value for illegible fields.
-- Evidence must be copied verbatim from the named document and page.
+- Read every supplied page and worksheet completely before responding.
+- Extract every distinct visible occurrence as a separate fact, including repeated or
+  conflicting labels and values. Never deduplicate, merge, overwrite, summarize, or discard.
+- Capture printed text, legible handwriting, headers, footers, stamps, seals, signatures,
+  notes, tables, every line item, small print and supplier-specific labels.
+- Distinguish the document title or heading from actual metadata fields. Never emit a fact
+  where a title such as TAX INVOICE or PURCHASE ORDER is both the label and the value.
+- Use specific contextual labels such as Supplier Name, Invoice Number, Invoice Date,
+  Gross Weight or Taxable Amount when the document establishes that meaning. Do not invent
+  context when it is genuinely ambiguous.
+- Copy values exactly as written. Do not normalize, calculate, correct, translate, or infer.
+- Never fill a missing value from another document. Evidence must be verbatim from the same
+  page or worksheet.
+- Assign every fact an individual integer confidence_score from 1 through 100. Make it
+  granular and evidence-based; do not reuse a small set of default scores and never use 0.
 - Do not omit a page or worksheet. If it contains no identifiable value, return a
   "Page processing status" fact with an empty value and explain the limitation in evidence.
 - Report links between documents (invoice to PO, challan to GRN, weighment slip to challan)
@@ -868,6 +878,109 @@ def clamp_confidence(score: Any, default: int = 50) -> int:
         return default
 
 
+DOCUMENT_TITLE_WORDS = {
+    "tax invoice", "invoice", "purchase order", "delivery challan",
+    "goods receipt note", "grn", "weighment slip", "credit note",
+    "debit note", "quotation", "receipt", "transport receipt",
+}
+
+
+def _normalised_phrase(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def is_document_title_fact(
+    label: str, value: str, document_type: str = "", page_text: str = ""
+) -> bool:
+    label_text = _normalised_phrase(label)
+    value_text = _normalised_phrase(value)
+    if not value_text or label_text != value_text:
+        return False
+    title = value_text
+    known_type = _normalised_phrase(document_type)
+    if title in DOCUMENT_TITLE_WORDS or title == known_type:
+        return True
+    first_lines = {
+        _normalised_phrase(line)
+        for line in page_text.splitlines()[:5]
+        if line.strip()
+    }
+    return title in first_lines and len(title.split()) <= 6
+
+
+def contextual_label(label: str, document_type: str = "", page_text: str = "") -> str:
+    original = clean_text(label).strip()
+    generic = _normalised_phrase(original)
+    context = f"{_normalised_phrase(document_type)} {_normalised_phrase(page_text[:2500])}"
+    replacements = {
+        "name": (
+            ("supplier", "Supplier Name"), ("vendor", "Supplier Name"),
+            ("buyer", "Buyer Name"), ("consignee", "Consignee Name"),
+            ("transporter", "Transporter Name"), ("driver", "Driver Name"),
+        ),
+        "number": (
+            ("invoice", "Invoice Number"), ("purchase order", "Purchase Order Number"),
+            ("vehicle", "Vehicle Registration Number"), ("challan", "Delivery Challan Number"),
+            ("grn", "Goods Receipt Note Number"),
+        ),
+        "date": (
+            ("invoice", "Invoice Date"), ("delivery", "Delivery Date"),
+            ("purchase order", "Purchase Order Date"), ("due", "Due Date"),
+        ),
+        "amount": (
+            ("grand total", "Invoice Total Amount"), ("total", "Invoice Total Amount"),
+            ("taxable", "Taxable Amount"), ("balance", "Outstanding Balance"),
+            ("tax amount", "Tax Amount"),
+        ),
+        "weight": (
+            ("gross", "Gross Weight"), ("tare", "Tare Weight"), ("net", "Net Weight"),
+        ),
+        "quantity": (
+            ("ordered", "Ordered Quantity"), ("received", "Received Quantity"),
+            ("delivered", "Delivered Quantity"),
+        ),
+        "address": (
+            ("supplier", "Supplier Address"), ("delivery", "Delivery Address"),
+            ("billing", "Billing Address"),
+        ),
+    }
+    for token, specific in replacements.get(generic, ()):
+        if token in context:
+            return specific
+    return original
+
+
+def calibrated_confidence(
+    requested: Any,
+    value: str,
+    evidence: str,
+    page_text: Optional[str],
+    label: str,
+) -> int:
+    base = clamp_confidence(requested, 50)
+    evidence_len = len(evidence.strip())
+    value_len = len(value.strip())
+    if page_text is None:
+        return max(1, min(100, round(base * 0.78 + min(18, evidence_len / 20))))
+    source = normalise(page_text)
+    evidence_match = bool(evidence.strip()) and normalise(evidence) in source
+    value_match = bool(value.strip()) and normalise(value) in source
+    adjustment = 0
+    if evidence_match:
+        adjustment += min(12, 4 + evidence_len // 35)
+    elif value_match:
+        adjustment -= 8
+    else:
+        adjustment -= 24
+    if value_len <= 1:
+        adjustment -= 10
+    if re.search(r"[?*_]{2,}|…", value):
+        adjustment -= 12
+    if _normalised_phrase(label) in {"name", "number", "date", "amount", "weight", "quantity"}:
+        adjustment -= 3
+    return max(1, min(100, base + adjustment))
+
+
 def assess(value: str, evidence: str, page_text: Optional[str]) -> Dict[str, Any]:
     """Confidence reflects evidence quality. page_text is None when the page has no text
     layer, so the value cannot be checked against the source."""
@@ -1218,7 +1331,7 @@ def parse_batch_payload(text: str, labels: List[str]) -> Tuple[Dict[str, Dict[st
         by_base.setdefault(base.strip().lower(), []).append(label)
 
     def match(name: str) -> Optional[str]:
-        name = re.sub(r"^\s*P\d+\s*\|\s*", "", name or "").strip()  # tolerate "P2 | label"
+        name = re.sub(r"^\s*P\d+\s*\|\s*", "", name or "", flags=re.IGNORECASE).strip()
         if name in labels:
             return name
         key = name.lower()
@@ -1244,14 +1357,19 @@ def parse_batch_payload(text: str, labels: List[str]) -> Tuple[Dict[str, Dict[st
         if label is None:
             continue
         bucket = by_label.setdefault(label, {"document_type": str(doc.get("document_type") or ""), "facts": []})
+        document_type = bucket["document_type"]
         for item in doc.get("facts") or []:
             if not isinstance(item, dict):
                 continue
             name = str(item.get("label") or "Unlabelled field").strip()
+            value = str(item.get("value") or "").strip()
+            if is_document_title_fact(name, value, document_type):
+                continue
+            name = contextual_label(name, document_type)
             page_number, page_valid = page_of(item)
             fact = _fact(
-                page_number, name, to_concept(str(item.get("concept") or name)),
-                str(item.get("value") or "").strip(),
+                page_number, name, to_concept(name),
+                value,
                 str(item.get("evidence") or "").strip()[:500],
                 item.get("confidence_score"),
             )
@@ -1504,7 +1622,10 @@ def finalize_document(docket_id: str, doc: Dict[str, Any], status: str,
             evidence = clean_text(item["evidence"])
             assessment = assess(value, evidence, doc["page_text"].get(page_number))
             if item.get("confidence_score") is not None:
-                assessment["score"] = clamp_confidence(item["confidence_score"], assessment["score"])
+                assessment["score"] = calibrated_confidence(
+                    item["confidence_score"], value, evidence,
+                    doc["page_text"].get(page_number), item["label"],
+                )
                 assessment["band"] = band_for(assessment["score"])
                 assessment["reasons"] = list(dict.fromkeys(
                     assessment["reasons"] + ["MODEL_CONFIDENCE"]
@@ -2155,7 +2276,8 @@ def build_metadata_json(docket_id: str) -> Tuple[bytes, int]:
     return build_metadata_export(metadata_records(docket_id), "Main Metadata File")
 
 
-METADATA_HEADERS = ["document_name", "label", "value", "confidence_score"]
+METADATA_HEADERS = ["Document Name", "Label", "Value", "Confidence Score"]
+METADATA_FIELDS = ["document_name", "label", "value", "confidence_score"]
 
 
 def metadata_records(docket_id: str) -> List[dict]:
@@ -2185,15 +2307,30 @@ def client_template_records(docket_id: str, template: sqlite3.Row) -> Tuple[List
 
 
 def build_metadata_export(records: List[dict], description: str) -> Tuple[bytes, int]:
-    data = json_bytes(records)
-    if json.loads(data.decode("utf-8")) != records:
+    exported = [
+        {
+            "Document Name": record["document_name"],
+            "Label": record["label"],
+            "Value": record["value"],
+            "Confidence Score": int(record["confidence_score"]),
+        }
+        for record in records
+    ]
+    data = json_bytes(exported)
+    if json.loads(data.decode("utf-8")) != exported:
         raise ExportError(f"{description} integrity check failed after re-reading.")
     return data, len(records)
 
 
 def build_metadata_psv(records: List[dict], description: str) -> Tuple[bytes, int]:
     expected = [METADATA_HEADERS] + [
-        [safe_cell(record[field]) for field in METADATA_HEADERS] for record in records
+        [
+            safe_cell(record["document_name"]),
+            safe_cell(record["label"]),
+            safe_cell(record["value"]),
+            str(int(record["confidence_score"])),
+        ]
+        for record in records
     ]
     buffer = io.StringIO(newline="")
     csv.writer(buffer, delimiter="|", quotechar='"', quoting=csv.QUOTE_MINIMAL,
@@ -2217,11 +2354,16 @@ def build_metadata_xlsx(records: List[dict], description: str) -> Tuple[bytes, i
     for cell in sheet[1]:
         cell.font = Font(bold=True)
     for row_number, record in enumerate(records, start=2):
-        for column_number, field in enumerate(METADATA_HEADERS, start=1):
+        for column_number, field in enumerate(METADATA_FIELDS, start=1):
             value = record[field]
             cell = sheet.cell(row=row_number, column=column_number, value=value)
             if isinstance(value, str) and value[:1] in ("=", "+", "-", "@"):
                 cell.data_type = "s"
+        score = int(record["confidence_score"])
+        color = "FFC7CE" if score < 65 else "FFEB9C" if 65 < score < 80 else "C6EFCE" if score > 80 else "FFFFFF"
+        sheet.cell(row=row_number, column=4).fill = PatternFill(
+            fill_type="solid", start_color=color, end_color=color
+        )
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = f"A1:D{max(sheet.max_row, 1)}"
     for letter, width in zip("ABCD", (34, 34, 60, 18)):
@@ -2910,6 +3052,9 @@ def page_organize(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> 
             except ValueError as exc:
                 st.error(str(exc), icon="🚫")
 
+    if selected == "New template":
+        st.info("Save the new template to enable matching against Main Metadata.")
+        return
     if not templates:
         return
     template = existing or templates[0]
