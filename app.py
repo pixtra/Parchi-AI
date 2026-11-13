@@ -127,14 +127,6 @@ IDENTITY_CONCEPTS = {
     "delivery_challan_number", "grn_number", "gstin", "vehicle_number",
     "supplier_name", "buyer_name", "invoice_date", "total_amount", "grand_total",
 }
-DOCUMENT_KEYWORDS = [
-    ("Weighment slip", ("weighment", "gross weight", "tare weight", "net weight")),
-    ("Goods receipt note", ("goods receipt", "grn")),
-    ("Delivery challan", ("challan",)),
-    ("Purchase order", ("purchase order",)),
-    ("Transport receipt", ("lorry receipt", "transport", "consignment")),
-    ("Invoice", ("invoice", "tax invoice")),
-]
 DOCKET_TYPES = (
     "Purchase",
     "Inventory Transfer In",
@@ -256,17 +248,9 @@ CREATE INDEX IF NOT EXISTS idx_documents_docket ON documents(docket_id);
 CREATE INDEX IF NOT EXISTS idx_metadata_docket ON metadata(docket_id);
 """
 
-KV_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9 /().#&'-]{1,48}?)\s*:\s*(\S.*?)\s*$")
-PATTERNS = [
-    ("gstin", "GSTIN", re.compile(r"\b\d{2}[A-Z]{5}\d{4}[A-Z][A-Z\d]Z[A-Z\d]\b")),
-    ("date", "Date", re.compile(r"\b\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}\b")),
-    ("amount", "Amount", re.compile(r"(?:₹|Rs\.?|INR)\s?\d[\d,]*(?:\.\d{1,2})?")),
-    ("weight", "Weight", re.compile(r"\b\d+(?:\.\d+)?\s?(?:kgs?|MT|tons?|tonnes?)\b", re.IGNORECASE)),
-]
-
 BATCH_PROMPT = """You extract data from SEVERAL supplier documents in one request.
-Each document part is preceded by a line "=== DOCUMENT: <label> ===". Use that label EXACTLY
-as the "document" value. Page numbers restart at 1 for every labelled part. Spreadsheet
+Each document part is preceded by a line "=== DOCUMENT: <id> | <label> ===". Use that <id>
+(for example P2) EXACTLY as the "document" value. Page numbers restart at 1 for every labelled part. Spreadsheet
 parts contain every worksheet, including hidden worksheets, represented as a page with a
 sheet name. Account for every supplied page or worksheet in the response.
 Return ONLY a JSON object of this exact shape:
@@ -872,14 +856,6 @@ def split_pdf(data: bytes, pages_per_part: int) -> List[Tuple[int, int, bytes]]:
         return parts
 
 
-def classify_local(pages: List[Dict[str, Any]]) -> str:
-    text = normalise(" ".join(p["text"] for p in pages))
-    for label, keywords in DOCUMENT_KEYWORDS:
-        if any(keyword in text for keyword in keywords):
-            return label
-    return "Unclassified"
-
-
 # ---------------------------------------------------------------- confidence
 def band_for(score: int) -> str:
     return "Green" if score > 80 else "Yellow" if score > 65 else "Red"
@@ -934,45 +910,6 @@ def _fact(
         "evidence": evidence,
         "confidence_score": clamp_confidence(confidence_score) if confidence_score is not None else None,
     }
-
-
-def local_extract(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    facts: List[Dict[str, Any]] = []
-    for page in pages:
-        number = page["page_number"]
-        if not page["readable"]:
-            facts.append(_fact(number, "Page readability", "page_status", "", ""))
-            continue
-        structured = 0
-        for raw_line in page["text"].splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            # Every occurrence of a value is a separate, meaningful fact (e.g. two line
-            # items that happen to share a rate or an amount must both be kept), so nothing
-            # is deduplicated across lines. The only thing we avoid is counting the SAME
-            # token twice from THIS SAME line when both the key:value pattern and a generic
-            # regex pattern match it (e.g. "Total: Rs. 500" matching both KV_RE and the
-            # amount regex) - that is one value, not two.
-            match = KV_RE.match(line)
-            line_value_already_captured = None
-            if match:
-                label, value = match.group(1).strip(), match.group(2).strip()
-                facts.append(_fact(number, label, to_concept(label), value, line))
-                structured += 1
-                line_value_already_captured = value.lower()
-            for concept, label, pattern in PATTERNS:
-                for hit in pattern.finditer(line):
-                    value = hit.group(0).strip()
-                    if value.lower() == line_value_already_captured:
-                        continue
-                    facts.append(_fact(number, label, concept, value, line))
-                    structured += 1
-        if structured == 0:
-            first_line = next((ln.strip() for ln in page["text"].splitlines() if ln.strip()), "")
-            facts.append(_fact(number, f"Page {number} text (unstructured)", "raw_text",
-                               page["text"][:4000], first_line[:200]))
-    return facts
 
 
 # ---------------------------------------------------------------- API keys and errors
@@ -1273,10 +1210,24 @@ def parse_batch_payload(text: str, labels: List[str]) -> Tuple[Dict[str, Dict[st
     payload = json.loads(cleaned)
     if not isinstance(payload, dict) or not isinstance(payload.get("documents"), list):
         raise ValueError("response is missing the documents list")
+    ids = {f"p{number}": label for number, label in enumerate(labels, start=1)}
     by_label_lower = {label.lower(): label for label in labels}
+    by_base: Dict[str, List[str]] = {}
+    for label in labels:
+        base = re.sub(r"\s*\[(?:pages|sheet)[^\]]*\]\s*$", "", label, flags=re.IGNORECASE)
+        by_base.setdefault(base.strip().lower(), []).append(label)
 
     def match(name: str) -> Optional[str]:
-        return name if name in labels else by_label_lower.get(name.strip().lower())
+        name = re.sub(r"^\s*P\d+\s*\|\s*", "", name or "").strip()  # tolerate "P2 | label"
+        if name in labels:
+            return name
+        key = name.lower()
+        if key in ids:
+            return ids[key]
+        if key in by_label_lower:
+            return by_label_lower[key]
+        candidates = by_base.get(key, [])
+        return candidates[0] if len(candidates) == 1 else None  # never guess between chunks
 
     def page_of(item: Dict[str, Any]) -> Tuple[int, bool]:
         try:
@@ -1359,8 +1310,8 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
                 client, handles = uploads[entry["id"]]
 
                 contents: List[Any] = []
-                for unit, handle in zip(batch, handles):
-                    contents.append(f"=== DOCUMENT: {unit['label']} ===")
+                for number, (unit, handle) in enumerate(zip(batch, handles), start=1):
+                    contents.append(f"=== DOCUMENT: P{number} | {unit['label']} ===")
                     contents.append(handle)
                 contents.append(BATCH_PROMPT)
                 set_gemini_activity(True, f"Gemini request in progress · {model}")
@@ -1399,11 +1350,12 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
             delete_handles(client, handles)
 
 
-def unit_fallback(unit: Dict[str, Any], message: str) -> None:
-    unit["items"] = local_extract(unit["pages_slice"])
-    unit["doc_type"] = classify_local(unit["pages_slice"])
-    unit["status"] = "fallback"
-    unit["message"] = f"Local rules used: {message}"
+def unit_failed(unit: Dict[str, Any], message: str) -> None:
+    """Record that a part was not extracted. No substitute values are created."""
+    unit["items"] = None
+    unit["doc_type"] = None
+    unit["status"] = "failed"
+    unit["message"] = f"Not extracted: {message}"
 
 
 def apply_batch_result(batch: List[Dict[str, Any]], parsed: Any, used: str) -> None:
@@ -1412,7 +1364,7 @@ def apply_batch_result(batch: List[Dict[str, Any]], parsed: Any, used: str) -> N
     for unit in batch:
         payload = by_label.get(unit["label"])
         if payload is None:
-            unit_fallback(unit, "model returned no entry for this part")
+            unit_failed(unit, "model returned no entry for this part")
             continue
         unit["items"] = [
             dict(
@@ -1447,11 +1399,11 @@ def process_units(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -> No
             process_units(batch[:middle], keys)
             process_units(batch[middle:], keys)
             return
-        unit_fallback(batch[0], f"part too large to process even alone ({str(exc)[:150]})")
+        unit_failed(batch[0], f"part too large to process even alone ({str(exc)[:150]})")
         return
     except Exception as exc:  # noqa: BLE001
         for unit in batch:
-            unit_fallback(unit, clean_text(exc)[:300])
+            unit_failed(unit, clean_text(exc)[:300])
         return
     apply_batch_result(batch, parsed, used)
 
@@ -1465,7 +1417,7 @@ def prepare_document(docket_id: str, filename: str, data: bytes, mode: str) -> T
             (docket_id, digest),
         ).fetchone()
     if duplicate:
-        if duplicate["status"] in {"completed", "local", "gemini"}:
+        if duplicate["status"] == "completed":
             return None, {
                 "filename": filename,
                 "status": "skipped",
@@ -1499,7 +1451,7 @@ def prepare_document(docket_id: str, filename: str, data: bytes, mode: str) -> T
                    processed_units, failed_units, completeness_status, completeness_message, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (doc_id, docket_id, clean_text(filename), mime, digest, len(data), storage_path, len(pages),
-                 classify_local(pages), "pending", mode, 0, 0, "pending", "", now),
+                 "Unclassified", "pending", mode, 0, 0, "pending", "", now),
             )
             connection.executemany(
                 "INSERT INTO pages (document_id, page_number, sheet_name, text, readable) VALUES (?, ?, ?, ?, ?)",
@@ -1536,13 +1488,15 @@ def finalize_document(docket_id: str, doc: Dict[str, Any], status: str,
             "",
         ))
     failed_units = len(failed_pages)
-    completeness_status = "complete" if not failed_units and status == "gemini" else "complete_with_warnings"
+    completeness_status = "complete" if not failed_units and status == "completed" else "complete_with_warnings"
     if completeness_status == "complete":
         completeness_message = "Every page/sheet produced at least one extracted value via Gemini."
+    elif status == "failed":
+        completeness_message = "Gemini did not return usable values for this document; retry it."
     elif failed_units:
         completeness_message = f"{failed_units} page/sheet(s) returned no extracted value at all."
     else:
-        completeness_message = "Local fallback extraction was used instead of Gemini; results may be less complete."
+        completeness_message = "Some parts were not extracted by Gemini; see the processing message."
     with connect() as connection:
         for item in items:
             page_number = min(max(1, item["page_number"]), doc["page_count"])
@@ -1683,6 +1637,8 @@ def gemini_document_status(doc: Dict[str, Any]) -> str:
     statuses = {unit["status"] for unit in doc["units"]}
     if statuses == {"gemini"}:
         return "completed"
+    if "gemini" not in statuses:
+        return "failed"
     return "partial"
 
 
@@ -1793,7 +1749,8 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
                     "pages_slice": doc["pages"], "items": None, "status": None,
                     "message": "", "doc_type": None,
                 }]
-                unit_fallback(doc["units"][0], f"could not split document ({str(exc)[:120]})")
+                units.append(doc["units"][0])  # send the whole document to Gemini as one part
+                LOG.warning("could not split %s into parts; sending it whole: %s", doc["filename"], exc)
         batches = pack_batches([u for u in units if u["status"] is None])
         for index, batch in enumerate(batches, start=1):
             progress(f"Gemini request {index}/{len(batches)}…")
@@ -1803,7 +1760,7 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
             doc_type = next((u["doc_type"] for u in doc["units"] if u["doc_type"]), "")
             messages = sorted({u["message"] for u in doc["units"] if u["message"]})
             results.append(save(doc, gemini_document_status(doc),
-                                doc_type or classify_local(doc["pages"]),
+                                doc_type or "Unclassified",
                                 items, " | ".join(messages)))
         with PROCESSING_LOCK:
             PROCESSING_JOBS[job_id].update(
@@ -2035,8 +1992,10 @@ def validation_report(docket_id: str) -> List[Dict[str, str]]:
         _, problem = read_verified(document["storage_path"], document["sha256"])
         if problem:
             add("Red", "Storage", f"{document['filename']}: {problem}")
-        if document["status"] in ("fallback", "partial"):
-            add("Yellow", "Extraction", f"{document['filename']}: some parts used local rules after Gemini failed.")
+        if document["status"] == "partial":
+            add("Yellow", "Extraction", f"{document['filename']}: some parts were not extracted by Gemini.")
+        if document["status"] == "failed":
+            add("Red", "Extraction", f"{document['filename']}: Gemini did not extract this document; retry it.")
         if document["processed_units"] != document["page_count"]:
             add("Red", "Completeness",
                 f"{document['filename']}: only {document['processed_units']} of "
@@ -2695,7 +2654,7 @@ def page_workspace(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) ->
                         + (f" · {result['message']}" if result["message"] else ""))
                 if result["status"] == "failed":
                     st.error(text, icon="🚫")
-                elif result["status"] in ("skipped", "fallback", "partial"):
+                elif result["status"] in ("skipped", "partial"):
                     st.warning(text, icon="⚠️")
                 else:
                     st.success(text, icon="✅")
