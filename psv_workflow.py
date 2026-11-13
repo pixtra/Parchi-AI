@@ -1,6 +1,7 @@
 """PSV cleaning, Excel formatting, and manual verification workflow helpers."""
 from __future__ import annotations
 
+import csv
 import io
 import re
 from typing import Iterable
@@ -48,22 +49,22 @@ def _score(value: object) -> float | None:
     return number * 100 if 0 <= number <= 1 else number
 
 
-def confidence_level(score: object = None, level: object = None) -> str:
-    # Thresholds mirror app.band_for (Green >= 90, Yellow >= 60, else Red) exactly, so the
-    # same confidence score is never shown as a different band on different screens.
+def confidence_score(score: object = None, level: object = None) -> float:
+    """Always return a number so sorting, clipping and Excel formatting work on one type."""
     numeric = _score(score)
     if numeric is not None:
-        if numeric >= 90:
-            return "High"
-        if numeric >= 60:
-            return "Medium"
-        return "Low"
+        return numeric
     text = str(level or "").strip().lower()
     if text in {"high", "green"}:
         return 90
     if text in {"medium", "yellow", "moderate"}:
         return 70
     return 40
+
+
+def confidence_band(score: float) -> str:
+    # Must match app.band_for: Green > 80, Yellow > 65, otherwise Red.
+    return "Green" if score > 80 else "Yellow" if score > 65 else "Red"
 
 
 def _normalise_fact(value: object) -> str:
@@ -195,11 +196,11 @@ def build_excel(frame: pd.DataFrame) -> bytes:
     confidence_column = "D"
     sheet.conditional_formatting.add(
         f"{confidence_column}2:{confidence_column}{max(sheet.max_row, 2)}",
-        FormulaRule(formula=[f"${confidence_column}2<65"], fill=fills["red"]),
+        FormulaRule(formula=[f"${confidence_column}2<=65"], fill=fills["red"]),
     )
     sheet.conditional_formatting.add(
         f"{confidence_column}2:{confidence_column}{max(sheet.max_row, 2)}",
-        FormulaRule(formula=[f"AND(${confidence_column}2>65,${confidence_column}2<80)"], fill=fills["yellow"]),
+        FormulaRule(formula=[f"AND(${confidence_column}2>65,${confidence_column}2<=80)"], fill=fills["yellow"]),
     )
     sheet.conditional_formatting.add(
         f"{confidence_column}2:{confidence_column}{max(sheet.max_row, 2)}",

@@ -1229,6 +1229,25 @@ def delete_handles(client: Any, handles: List[Any]) -> None:
             pass
 
 
+def wait_until_active(client: Any, uploaded: Any, timeout: float = 120.0) -> Any:
+    """Gemini processes uploads asynchronously; a file must reach ACTIVE before it is used."""
+    deadline = time.time() + timeout
+    current = uploaded
+    while True:
+        state_obj = getattr(current, "state", None)
+        if state_obj is None:
+            return current  # SDK did not report a state; nothing to wait for
+        state = str(getattr(state_obj, "name", state_obj)).upper()
+        if state == "ACTIVE":
+            return current
+        if state == "FAILED":
+            raise RuntimeError(f"Gemini could not process the uploaded file {current.name}.")
+        if time.time() > deadline:
+            raise RuntimeError("Gemini took too long to prepare the uploaded file.")
+        time.sleep(2)
+        current = client.files.get(name=current.name)
+
+
 def upload_parts(entry: Dict[str, str], batch: List[Dict[str, Any]]) -> Tuple[Any, List[Any]]:
     client = make_client(entry["key"])
     handles: List[Any] = []
@@ -1238,7 +1257,9 @@ def upload_parts(entry: Dict[str, str], batch: List[Dict[str, Any]]) -> Tuple[An
                 handle.write(unit["data"])
                 temporary = Path(handle.name)
             try:
-                handles.append(client.files.upload(file=str(temporary), config={"mime_type": unit["mime"]}))
+                uploaded = client.files.upload(file=str(temporary), config={"mime_type": unit["mime"]})
+                handles.append(uploaded)  # tracked first so cleanup still deletes it on failure
+                handles[-1] = wait_until_active(client, uploaded)
             finally:
                 temporary.unlink(missing_ok=True)
     except Exception:
@@ -1678,11 +1699,20 @@ def set_gemini_activity(active: bool, message: str = "") -> None:
                 job["message"] = message
 
 
+def job_result(filename: str, status: str, message: str,
+               extracted: int = 0, appended: int = 0) -> Dict[str, Any]:
+    """One result record shape for every outcome, matching what the results panel reads."""
+    return {"filename": filename, "status": status, "fact_count": appended,
+            "extracted_count": extracted, "appended_count": appended, "message": message}
+
+
 def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any]],
                         keys: List[Dict[str, str]]) -> None:
     WORKER_STATE.job_id = job_id
     WORKER_STATE.state = {"key_cooldowns": {}}
     results: List[Dict[str, Any]] = []
+    documents: List[Dict[str, Any]] = []   # documents successfully stored, awaiting extraction
+    finalized: set = set()                 # ids of documents whose facts were saved
     total = len(uploads)
 
     def save(
@@ -1695,6 +1725,7 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
         set_document_status(doc["id"], "saving")
         try:
             fact_count = finalize_document(docket_id, doc, status, doc_type, items)
+            finalized.add(doc["id"])
             return {
                 "filename": doc["filename"],
                 "status": status,
@@ -1726,21 +1757,28 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
         with PROCESSING_LOCK:
             PROCESSING_JOBS[job_id].update(status="running", phase="processing", gemini_active=False)
         progress("Validating and storing uploaded documents…")
+        batch_digests: Dict[str, str] = {}  # sha256 -> filename, for duplicates inside this upload
         for upload in uploads:
             data = upload["data"]
             problem = validate_upload(upload["filename"], data)
+            digest = hashlib.sha256(data).hexdigest()
+            if not problem and digest in batch_digests:
+                results.append(job_result(upload["filename"], "skipped",
+                                          f"Identical to “{batch_digests[digest]}” in this upload."))
+                continue
             if problem:
-                results.append({"filename": upload["filename"], "status": "failed", "facts": 0, "message": problem})
+                results.append(job_result(upload["filename"], "failed", problem))
                 continue
             try:
                 doc, skipped = prepare_document(docket_id, upload["filename"], data, "Gemini")
             except Exception as exc:  # noqa: BLE001
                 LOG.exception("prepare failed for %s", upload["filename"])
-                results.append({"filename": upload["filename"], "status": "failed", "facts": 0,
-                                "message": f"Could not store the file ({clean_text(exc)[:200]})."})
+                results.append(job_result(upload["filename"], "failed",
+                                          f"Could not store the file ({clean_text(exc)[:200]})."))
                 continue
             if doc:
                 documents.append(doc)
+                batch_digests[digest] = upload["filename"]
             else:
                 results.append(skipped)
 
@@ -1764,8 +1802,9 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
             items = [item for unit in doc["units"] for item in (unit["items"] or [])]
             doc_type = next((u["doc_type"] for u in doc["units"] if u["doc_type"]), "")
             messages = sorted({u["message"] for u in doc["units"] if u["message"]})
-            save(doc, gemini_document_status(doc), doc_type or classify_local(doc["pages"]),
-                 items, " | ".join(messages))
+            results.append(save(doc, gemini_document_status(doc),
+                                doc_type or classify_local(doc["pages"]),
+                                items, " | ".join(messages)))
         with PROCESSING_LOCK:
             PROCESSING_JOBS[job_id].update(
                 status="complete", phase="complete", gemini_active=False,
@@ -1776,9 +1815,10 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
         for doc in documents:
             if doc["id"] not in finalized:
                 delete_document(docket_id, doc["id"])
-                results.append({"filename": doc["filename"], "status": "failed", "facts": 0,
-                                "message": f"Processing was interrupted ({clean_text(exc)[:150]}). "
-                                           "The file was removed so you can retry."})
+                results.append(job_result(
+                    doc["filename"], "failed",
+                    f"Processing was interrupted ({clean_text(exc)[:150]}). "
+                    "The file was removed so you can retry."))
         with PROCESSING_LOCK:
             PROCESSING_JOBS[job_id].update(
                 status="error", phase="error", gemini_active=False,
