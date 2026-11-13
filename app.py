@@ -189,7 +189,7 @@ PATTERNS = [
     ("weight", "Weight", re.compile(r"\b\d+(?:\.\d+)?\s?(?:kgs?|MT|tons?|tonnes?)\b", re.IGNORECASE)),
 ]
 
-BATCH_PROMPT = """You extract data from supplier document content.
+BATCH_PROMPT = """You are an exhaustive document transcription and extraction engine.
 The document part is preceded by a line "=== DOCUMENT: <label> ===". Use that label EXACTLY
 as the "document" value. Page or sheet numbers restart at 1 for this document part.
 Return ONLY a JSON object of this exact shape:
@@ -205,16 +205,36 @@ Return ONLY a JSON object of this exact shape:
     "evidence": "verbatim text showing the link"}
  ]}
 Rules:
-- Read every page or sheet in the supplied document part before responding.
-- Extract every identifiable field: identifiers, parties, dates, references, quantities,
-  weights, rates, taxes, totals, headers, footers, notes and each line item
-  (item_1_description, item_1_quantity, ...).
-- Include document-specific fields that do not fit a standard schema.
-- Copy values exactly as written, including handwritten entries when legible.
-- Never invent or infer values that are not on the page. Use an empty value for illegible fields.
-- Evidence must be copied verbatim from the named document and page.
-- Report links between documents (invoice to PO, challan to GRN, weighment slip to challan)
-  in cross_references only when the text shows the link."""
+- Read and inspect EVERY page or sheet in this document part before responding. Do not stop
+  after finding common fields or identifying the document type.
+- Extract EVERY distinct visible or accessible information occurrence as one fact. One label
+  occurrence equals one fact, including repeated labels with repeated values, repeated labels
+  with different values, and conflicting values. Never deduplicate, merge, overwrite, group,
+  summarize, or discard repeated facts.
+- Capture all printed text and all legible handwriting, including headers, footers, stamps,
+  seals, signatures, nearby annotations, marginal notes, tables, table headers, every line
+  item, subtotals, totals, tax breakdowns, small print, footnotes, checkboxes, marks and
+  supplier-specific labels. Preserve the document's wording and order where possible.
+- Extract identifiers, parties, addresses, contact details, dates, references, quantities,
+  units, descriptions, rates, discounts, taxes, amounts, terms, bank details, shipment
+  details, and any other information actually present. Include fields outside any predefined
+  business schema.
+- For tables and line items, emit separate facts for each cell or meaningful labelled value;
+  do not collapse a row into a summary. Use clear labels such as "Item 1 Description",
+  "Item 1 Quantity", and "Item 1 Rate" when the source has no explicit label.
+- Copy each value exactly as written. Preserve punctuation, symbols, casing, units and
+  leading zeros. Do not normalize, calculate, correct, translate, or infer values. Do not
+  fill missing values from another page or document.
+- If text is partially legible, return the legible portion. If a value is unreadable, emit
+  a fact with an empty value only when its label or location is identifiable; never guess.
+- Every fact must have evidence copied verbatim from the same page or sheet, limited to
+  500 characters. Evidence is not a substitute for the extracted value.
+- Use the exact page or sheet number where the fact appears. Do not assign a fact to a
+  different page or sheet. Report cross-document links only when the source explicitly
+  shows the relationship; never use links to fill missing facts.
+- Return every extracted fact in the response. Do not omit facts to save tokens. If the
+  response would be too large, the application will split the document into smaller parts.
+- Keep each uploaded document independent. Never use facts from another document part."""
 
 
 # ---------------------------------------------------------------- utilities
