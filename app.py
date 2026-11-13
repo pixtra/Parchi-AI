@@ -34,6 +34,11 @@ from psv_workflow import (
 )
 
 try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
+try:
     import fitz  # PyMuPDF
 except ImportError:
     fitz = None
@@ -412,7 +417,7 @@ def validate_upload(filename: str, data: bytes) -> Optional[str]:
     """Return a human-readable problem, or None when the upload looks sound."""
     extension = extension_of(filename)
     if extension not in SUPPORTED_TYPES:
-        return f"Unsupported file type “.{extension or '?'}”. Use PDF, PNG, JPG or TXT."
+        return f"Unsupported file type “.{extension or '?'}”. Use PDF, PNG, JPEG or TXT."
     if not data:
         return "The file is empty (0 bytes)."
     if len(data) > MAX_UPLOAD_BYTES:
@@ -422,6 +427,12 @@ def validate_upload(filename: str, data: bytes) -> Optional[str]:
         return "The content is not a PDF. The file may be corrupt or renamed."
     if extension in signatures and not data.startswith(signatures[extension]):
         return f"The content is not a valid .{extension} image. The file may be corrupt or renamed."
+    if extension in {"png", "jpg", "jpeg"} and Image is not None:
+        try:
+            with Image.open(io.BytesIO(data)) as image:
+                image.verify()
+        except Exception as exc:  # noqa: BLE001
+            return f"The image could not be opened and may be corrupt ({exc.__class__.__name__})."
     if extension == "txt" and b"\x00" in data:
         return "The file contains binary data and is not plain text."
     if extension == "pdf" and fitz is not None:
@@ -655,8 +666,6 @@ def local_extract(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not page["readable"]:
             facts.append(_fact(number, "Page readability", "page_status", "", ""))
             continue
-        seen_pairs: set = set()
-        seen_values: set = set()
         structured = 0
         for raw_line in page["text"].splitlines():
             line = raw_line.strip()
@@ -665,18 +674,17 @@ def local_extract(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             match = KV_RE.match(line)
             if match:
                 label, value = match.group(1).strip(), match.group(2).strip()
-                pair = (to_concept(label), value.lower())
-                if pair not in seen_pairs:
-                    seen_pairs.add(pair)
-                    seen_values.add(value.lower())
-                    facts.append(_fact(number, label, to_concept(label), value, line))
-                    structured += 1
+                facts.append(_fact(number, label, to_concept(label), value, line))
+                structured += 1
+                continue
+            line_facts: set[tuple[str, str]] = set()
             for concept, label, pattern in PATTERNS:
                 for hit in pattern.finditer(line):
                     value = hit.group(0).strip()
-                    if value.lower() in seen_values:
+                    key = (concept, value.lower())
+                    if key in line_facts:
                         continue
-                    seen_values.add(value.lower())
+                    line_facts.add(key)
                     facts.append(_fact(number, label, concept, value, line))
                     structured += 1
         if structured == 0:
@@ -807,18 +815,18 @@ class OversizedBatch(Exception):
     """Output was truncated or input was too large; the batch must be split."""
 
 
-def make_units(doc: Dict[str, Any]) -> List[Dict[str, Any]]:
+def make_units(doc: Dict[str, Any], label: Optional[str] = None) -> List[Dict[str, Any]]:
     if extension_of(doc["filename"]) == "pdf" and fitz is not None:
         parts = split_pdf(doc["data"], CHUNK_PAGES)
     else:
         parts = [(0, doc["page_count"], doc["data"])]
     units = []
     for start, count, blob in parts:
-        label = doc["filename"]
+        unit_label = label or doc["filename"]
         if len(parts) > 1:
-            label = f"{doc['filename']} [pages {start + 1}-{start + count}]"
+            unit_label = f"{unit_label} [pages {start + 1}-{start + count}]"
         unit = {
-            "label": label, "doc": doc, "offset": start, "pages": count, "data": blob,
+            "label": unit_label, "doc": doc, "offset": start, "pages": count, "data": blob,
             "mime": doc["mime"], "suffix": "." + extension_of(doc["filename"]),
             "pages_slice": doc["pages"][start:start + count],
             "items": None, "status": None, "message": "", "doc_type": None,
@@ -880,11 +888,12 @@ def parse_batch_payload(text: str, labels: List[str]) -> Tuple[Dict[str, Dict[st
     def match(name: str) -> Optional[str]:
         return name if name in labels else by_label_lower.get(name.strip().lower())
 
-    def page_of(item: Dict[str, Any]) -> int:
+    def page_of(item: Dict[str, Any]) -> Tuple[int, bool]:
         try:
-            return max(1, int(item.get("page_number") or 1))
+            number = int(item.get("page_number") or 1)
+            return max(1, number), number >= 1
         except (TypeError, ValueError):
-            return 1
+            return 1, False
 
     by_label: Dict[str, Dict[str, Any]] = {}
     for doc in payload["documents"]:
@@ -898,10 +907,13 @@ def parse_batch_payload(text: str, labels: List[str]) -> Tuple[Dict[str, Dict[st
             if not isinstance(item, dict):
                 continue
             name = str(item.get("label") or "Unlabelled field").strip()
-            bucket["facts"].append(_fact(
-                page_of(item), name, to_concept(str(item.get("concept") or name)),
+            page_number, page_valid = page_of(item)
+            fact = _fact(
+                page_number, name, to_concept(str(item.get("concept") or name)),
                 str(item.get("value") or "").strip(), str(item.get("evidence") or "").strip()[:500],
-            ))
+            )
+            fact["_page_number_valid"] = page_valid
+            bucket["facts"].append(fact)
 
     references = []
     for ref in payload.get("cross_references") or []:
@@ -911,9 +923,11 @@ def parse_batch_payload(text: str, labels: List[str]) -> Tuple[Dict[str, Dict[st
         target = str(ref.get("to_document", "")).strip()
         if source is None or not target:
             continue
+        page_number, page_valid = page_of(ref)
         references.append({
             "from_label": source,
-            "page_number": page_of(ref),
+            "page_number": page_number,
+            "_page_number_valid": page_valid,
             "label": f"Reference to {target}",
             "concept": f"cross_reference_{to_concept(str(ref.get('concept') or 'reference'))}",
             "value": str(ref.get("value") or "").strip(),
@@ -1006,7 +1020,12 @@ def apply_batch_result(batch: List[Dict[str, Any]], parsed: Any, used: str) -> N
             unit_fallback(unit, "model returned no entry for this part")
             continue
         unit["items"] = [
-            dict(raw, page_number=unit["offset"] + min(max(1, raw["page_number"]), unit["pages"]))
+            dict(
+                raw,
+                page_number=unit["offset"] + min(max(1, raw["page_number"]), unit["pages"]),
+                _page_number_valid=raw.get("_page_number_valid", True)
+                and raw["page_number"] <= unit["pages"],
+            )
             for raw in payload["facts"]
         ]
         unit["doc_type"] = payload["document_type"] or unit["doc_type"]
@@ -1017,7 +1036,11 @@ def apply_batch_result(batch: List[Dict[str, Any]], parsed: Any, used: str) -> N
         if source is None or source["items"] is None:
             continue
         local_page = min(max(1, ref["page_number"]), source["pages"])
-        source["items"].append(dict(ref, page_number=source["offset"] + local_page))
+        source["items"].append(dict(
+            ref,
+            page_number=source["offset"] + local_page,
+            _page_number_valid=ref.get("_page_number_valid", True) and ref["page_number"] <= source["pages"],
+        ))
 
 
 def process_units(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -> None:
@@ -1046,12 +1069,12 @@ def prepare_document(docket_id: str, filename: str, data: bytes, mode: str) -> T
             "SELECT filename FROM documents WHERE docket_id = ? AND sha256 = ?", (docket_id, digest)
         ).fetchone()
     if duplicate:
-        return None, {"filename": filename, "status": "skipped", "facts": 0,
+        return None, {"filename": filename, "status": "skipped", "fact_count": 0,
                       "message": f"Identical to “{duplicate['filename']}” already in this docket."}
     try:
         pages = read_pages(filename, data)
     except Exception as exc:  # noqa: BLE001
-        return None, {"filename": filename, "status": "failed", "facts": 0,
+        return None, {"filename": filename, "status": "failed", "fact_count": 0,
                       "message": clean_text(exc)[:300]}
 
     doc_id = str(uuid.uuid4())
@@ -1084,8 +1107,8 @@ def prepare_document(docket_id: str, filename: str, data: bytes, mode: str) -> T
 
 
 def finalize_document(docket_id: str, doc: Dict[str, Any], status: str,
-                      document_type: str, items: List[Dict[str, Any]]) -> None:
-    """Save all facts for a document in one transaction: all of them are stored, or none."""
+                      document_type: str, items: List[Dict[str, Any]]) -> int:
+    """Save all facts and return the number persisted for this document."""
     now = utc_now()
     with connect() as connection:
         for item in items:
@@ -1093,6 +1116,10 @@ def finalize_document(docket_id: str, doc: Dict[str, Any], status: str,
             value = clean_text(item["value"])
             evidence = clean_text(item["evidence"])
             assessment = assess(value, evidence, doc["page_text"].get(page_number))
+            if not item.get("_page_number_valid", True):
+                assessment["band"] = "Red"
+                assessment["score"] = 0
+                assessment["reasons"].append("INVALID_PAGE_REFERENCE")
             connection.execute(
                 """INSERT INTO facts (id, docket_id, document_id, page_number, label, concept,
                    value, original_value, source_evidence, confidence_band, confidence_score,
@@ -1107,6 +1134,10 @@ def finalize_document(docket_id: str, doc: Dict[str, Any], status: str,
                            (status, clean_text(document_type or "Unclassified")[:80], doc["id"]))
         connection.execute("UPDATE dockets SET updated_at = ? WHERE id = ?", (now, docket_id))
     apply_extraction_integrity(docket_id)
+    with connect() as connection:
+        return int(connection.execute(
+            "SELECT COUNT(*) FROM facts WHERE document_id = ?", (doc["id"],)
+        ).fetchone()[0])
 
 
 def _fact_group_key(label: str, concept: str) -> str:
@@ -1226,13 +1257,14 @@ def process_uploads(docket_id: str, uploads: List[Any]) -> None:
 
     def save(doc: Dict[str, Any], status: str, doc_type: str, items: List[Dict[str, Any]], message: str) -> None:
         try:
-            finalize_document(docket_id, doc, status, doc_type, items)
+            fact_count = finalize_document(docket_id, doc, status, doc_type, items)
             finalized.add(doc["id"])
-            results.append({"filename": doc["filename"], "status": status, "facts": len(items), "message": message})
+            results.append({"filename": doc["filename"], "status": status,
+                            "fact_count": fact_count, "message": message})
         except Exception as exc:  # noqa: BLE001
             LOG.exception("could not save %s", doc["filename"])
             delete_document(docket_id, doc["id"])  # leave nothing half-saved, so a retry is possible
-            results.append({"filename": doc["filename"], "status": "failed", "facts": 0,
+            results.append({"filename": doc["filename"], "status": "failed", "fact_count": 0,
                             "message": f"Could not save results ({clean_text(exc)[:150]}). Nothing was kept; try again."})
 
     with st.status("Processing docket…", expanded=True) as run:
@@ -1241,13 +1273,14 @@ def process_uploads(docket_id: str, uploads: List[Any]) -> None:
                 data = upload.getvalue()
                 problem = validate_upload(upload.name, data)
                 if problem:
-                    results.append({"filename": upload.name, "status": "failed", "facts": 0, "message": problem})
+                    results.append({"filename": upload.name, "status": "failed", "fact_count": 0,
+                                    "message": problem})
                     continue
                 try:
                     doc, skipped = prepare_document(docket_id, upload.name, data, mode)
                 except Exception as exc:  # noqa: BLE001
                     LOG.exception("prepare failed for %s", upload.name)
-                    results.append({"filename": upload.name, "status": "failed", "facts": 0,
+                    results.append({"filename": upload.name, "status": "failed", "fact_count": 0,
                                     "message": f"Could not store the file ({clean_text(exc)[:200]})."})
                     continue
                 if doc:
@@ -1262,9 +1295,17 @@ def process_uploads(docket_id: str, uploads: List[Any]) -> None:
                     save(doc, "local", classify_local(doc["pages"]), items, "Extracted with local rules.")
             else:
                 units: List[Dict[str, Any]] = []
+                labels_by_filename: Dict[str, int] = {}
+                for doc in documents:
+                    labels_by_filename[doc["filename"]] = labels_by_filename.get(doc["filename"], 0) + 1
+                seen_filenames: Dict[str, int] = {}
                 for doc in documents:
                     try:
-                        units.extend(make_units(doc))
+                        seen_filenames[doc["filename"]] = seen_filenames.get(doc["filename"], 0) + 1
+                        label = doc["filename"]
+                        if labels_by_filename[doc["filename"]] > 1:
+                            label = f"{doc['filename']} [document {seen_filenames[doc['filename']]}]"
+                        units.extend(make_units(doc, label))
                     except Exception as exc:  # noqa: BLE001
                         doc["units"] = [{
                             "label": doc["filename"], "doc": doc, "offset": 0, "pages": doc["page_count"],
@@ -1290,7 +1331,7 @@ def process_uploads(docket_id: str, uploads: List[Any]) -> None:
             for doc in documents:
                 if doc["id"] not in finalized:
                     delete_document(docket_id, doc["id"])
-                    results.append({"filename": doc["filename"], "status": "failed", "facts": 0,
+                    results.append({"filename": doc["filename"], "status": "failed", "fact_count": 0,
                                     "message": f"Processing was interrupted ({clean_text(exc)[:150]}). "
                                                "The file was removed so you can retry."})
             run.update(label="Processing stopped with an error", state="error", expanded=True)
@@ -1983,7 +2024,7 @@ def page_workspace(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) ->
     if results:
         with st.expander("Latest processing run", expanded=True):
             for result in results:
-                text = (f"**{result['filename']}** · {result['status']} · {result['facts']} record(s)"
+                text = (f"**{result['filename']}** · {result['status']} · {result['fact_count']} fact(s)"
                         + (f" · {result['message']}" if result["message"] else ""))
                 if result["status"] == "failed":
                     st.error(text, icon="🚫")

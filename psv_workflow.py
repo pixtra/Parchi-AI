@@ -16,9 +16,9 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 OUTPUT_COLUMNS = ["Field Name", "Extracted Value", "Source Document", "Confidence Level"]
 CONFIDENCE_ORDER = ["Low", "Medium", "High"]
 ALIASES = {
-    "field": ("field name", "field_name", "label", "attribute", "concept"),
+    "field": ("field", "field name", "field_name", "label", "attribute", "concept"),
     "value": ("extracted value", "extracted_value", "value", "text"),
-    "source": ("source document", "source_document", "filename", "file name", "document"),
+    "source": ("source", "source document", "source_document", "filename", "file name", "document"),
     "score": ("confidence score", "confidence_score", "score", "confidence"),
     "level": ("confidence level", "confidence_level", "confidence band", "confidence_band"),
 }
@@ -106,6 +106,16 @@ def auto_verified_indices(frame: pd.DataFrame) -> set[int]:
 def clean_psv(data: bytes) -> pd.DataFrame:
     """Read a PSV payload and return the required four-column review dataset."""
     text = data.decode("utf-8-sig")
+    try:
+        header = next(csv.reader(io.StringIO(text), delimiter="|"))
+    except StopIteration:
+        raise ValueError("The PSV is empty; it needs a header row.") from None
+    header_names = [_normalise_column(column) for column in header]
+    duplicates = sorted({
+        column for column in header_names if header_names.count(column) > 1 and column
+    })
+    if duplicates:
+        raise ValueError(f"Duplicate PSV column name(s): {', '.join(duplicates)}.")
     frame = pd.read_csv(io.StringIO(text), sep="|", dtype=str, keep_default_na=False)
     field_column = _find_column(frame.columns, ALIASES["field"])
     value_column = _find_column(frame.columns, ALIASES["value"])
