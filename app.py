@@ -275,6 +275,14 @@ def fmt_size(num_bytes: int) -> str:
     return f"{num_bytes / 1024:,.0f} KB" if num_bytes < 1024 * 1024 else f"{num_bytes / 1048576:,.1f} MB"
 
 
+def upload_name(upload: Any) -> str:
+    return str(upload["name"] if isinstance(upload, dict) else upload.name)
+
+
+def upload_data(upload: Any) -> bytes:
+    return bytes(upload["data"] if isinstance(upload, dict) else upload.getvalue())
+
+
 def mask(key: str) -> str:
     return f"••••{key[-4:]}" if len(key) >= 8 else "••••"
 
@@ -1396,36 +1404,37 @@ def process_uploads(docket_id: str, uploads: List[Any]) -> None:
 
     with st.status(f"Processing {total} document(s) sequentially…", expanded=True) as run:
         for upload in uploads:
-            data = upload.getvalue()
-            problem = validate_upload(upload.name, data)
+            data = upload_data(upload)
+            filename = upload_name(upload)
+            problem = validate_upload(filename, data)
             if problem:
                 results.append({
-                    "filename": upload.name,
+                    "filename": filename,
                     "status": "failed",
                     "fact_count": 0,
                     "extracted_count": 0,
                     "appended_count": 0,
                     "message": problem,
                 })
-                run.write(f"{upload.name}: Failed validation.")
+                run.write(f"{filename}: Failed validation.")
                 continue
             try:
-                doc, skipped = prepare_document(docket_id, upload.name, data, mode)
+                doc, skipped = prepare_document(docket_id, filename, data, mode)
             except Exception as exc:  # noqa: BLE001
-                LOG.exception("prepare failed for %s", upload.name)
+                LOG.exception("prepare failed for %s", filename)
                 results.append({
-                    "filename": upload.name,
+                    "filename": filename,
                     "status": "failed",
                     "fact_count": 0,
                     "extracted_count": 0,
                     "appended_count": 0,
                     "message": f"Could not store the file ({clean_text(exc)[:200]}).",
                 })
-                run.write(f"{upload.name}: Failed while being stored.")
+                run.write(f"{filename}: Failed while being stored.")
                 continue
             if doc is None:
                 results.append(skipped)
-                run.write(f"{upload.name}: {skipped['status'].capitalize()}.")
+                run.write(f"{filename}: {skipped['status'].capitalize()}.")
                 continue
             try:
                 result = process_document(doc, run)
@@ -2147,18 +2156,42 @@ def page_workspace(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) ->
         st.radio("Extraction mode", ["Local", "Gemini"], horizontal=True, key="extraction_mode",
                  help="Local uses text-layer rules and works offline. Gemini sends each batch of "
                       "documents in one request and also reads scans and images.")
-        uploads = st.file_uploader(
+        if st.session_state.get("upload_queue_docket") != docket_id:
+            st.session_state["upload_queue"] = {}
+            st.session_state["upload_queue_docket"] = docket_id
+        incoming_uploads = st.file_uploader(
             f"Drop PDF, PNG, JPG, TXT or XLSX files (up to {fmt_size(MAX_UPLOAD_BYTES)} each)",
             type=SUPPORTED_TYPES,
             accept_multiple_files=True,
             key=f"uploads_{st.session_state.get('upload_nonce', 0)}",
         )
-        run = st.button(f"Process {len(uploads)} document(s)" if uploads else "Process documents",
-                        type="primary", disabled=not uploads, **stretch())
-        if not uploads:
+        upload_queue = st.session_state.setdefault("upload_queue", {})
+        for upload in incoming_uploads:
+            data = upload.getvalue()
+            queue_key = f"{upload.name}\0{hashlib.sha256(data).hexdigest()}"
+            upload_queue.setdefault(
+                queue_key,
+                {"name": upload.name, "data": data, "type": upload.type},
+            )
+        uploads = list(upload_queue.values())
+        if uploads:
+            st.caption(f"{len(uploads)} document(s) queued and ready to process.")
+            st.dataframe(
+                [{"Document": upload["name"], "Size": fmt_size(len(upload["data"]))} for upload in uploads],
+                hide_index=True,
+                **stretch(),
+            )
+        else:
             st.caption("Choose one or more files to enable processing.")
+        run = st.button(
+            f"Process {len(uploads)} document(s)" if uploads else "Process documents",
+            type="primary",
+            disabled=not uploads,
+            **stretch(),
+        )
         if run and uploads:
             process_uploads(docket_id, uploads)
+            st.session_state.pop("upload_queue", None)
             st.rerun()
 
     results = st.session_state.get("last_results")
