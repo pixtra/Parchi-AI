@@ -1,7 +1,6 @@
 """PSV cleaning, Excel formatting, and manual verification workflow helpers."""
 from __future__ import annotations
 
-import csv
 import io
 import re
 from typing import Iterable
@@ -48,11 +47,13 @@ def _score(value: object) -> float | None:
 
 
 def confidence_level(score: object = None, level: object = None) -> str:
+    # Thresholds mirror app.band_for (Green >= 90, Yellow >= 60, else Red) exactly, so the
+    # same confidence score is never shown as a different band on different screens.
     numeric = _score(score)
     if numeric is not None:
-        if numeric > 80:
+        if numeric >= 90:
             return "High"
-        if numeric >= 50:
+        if numeric >= 60:
             return "Medium"
         return "Low"
     text = str(level or "").strip().lower()
@@ -161,6 +162,12 @@ def build_excel(frame: pd.DataFrame) -> bytes:
         export.to_excel(writer, index=False, sheet_name="PSV Verification")
     workbook = load_workbook(output)
     sheet = workbook["PSV Verification"]
+    # Neutralise formula/CSV injection: a value such as =HYPERLINK(...) or +CMD(...) coming
+    # from an uploaded PSV must never become a live formula in the generated workbook.
+    for row in sheet.iter_rows(min_row=2):
+        for cell in row:
+            if isinstance(cell.value, str) and cell.value[:1] in ("=", "+", "-", "@"):
+                cell.data_type = "s"
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = sheet.dimensions
     table = Table(displayName="PSVVerificationTable", ref=sheet.dimensions)

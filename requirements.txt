@@ -4,3 +4,5 @@ Pillow
 PyMuPDF
 streamlit
 google-genai
+rapidfuzz
+keyring

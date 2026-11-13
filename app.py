@@ -1,7 +1,7 @@
 """Parchi AI: supplier document extraction, review and verification (Streamlit)."""
 from __future__ import annotations
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font, PatternFill
+from openpyxl.styles import Font
 import csv
 import functools
 import hashlib
@@ -15,13 +15,15 @@ import shutil
 import sqlite3
 import tempfile
 import time
+import threading
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from itertools import islice
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import streamlit as st
 import pandas as pd
@@ -32,11 +34,36 @@ from psv_workflow import (
     next_pending_index,
     auto_verified_indices,
 )
+from metadata_workflow import (
+    json_bytes,
+    sheet_text,
+    suggestions,
+    unique_labels,
+)
+
+try:
+    from metadata_workflow import exact_template_label, normalize_label
+except ImportError:
+    def normalize_label(label: Any) -> str:
+        return str(label or "").strip().casefold()
+
+    def exact_template_label(source_label: str, requested_labels: Iterable[str]) -> Optional[str]:
+        normalized = normalize_label(source_label)
+        return next(
+            (str(label) for label in requested_labels if normalize_label(label) == normalized),
+            None,
+        )
 
 try:
     import fitz  # PyMuPDF
 except ImportError:
     fitz = None
+
+try:
+    import keyring
+    import keyring.errors
+except ImportError:
+    keyring = None
 
 try:
     from google import genai
@@ -46,6 +73,10 @@ except ImportError:
     types = None
 
 LOG = logging.getLogger("parchai")
+PROCESSING_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="parchai-extraction")
+PROCESSING_LOCK = threading.RLock()
+PROCESSING_JOBS: Dict[str, Dict[str, Any]] = {}
+WORKER_STATE = threading.local()
 
 
 # ---------------------------------------------------------------- configuration
@@ -69,19 +100,21 @@ MAX_PARTS_PER_BATCH = int(os.getenv("PARCHAI_MAX_PARTS_PER_BATCH", "12"))
 MAX_UPLOAD_BYTES = int(os.getenv("PARCHAI_MAX_UPLOAD_MB", "50")) * 1024 * 1024
 KEY_COOLDOWN_SECONDS = 60
 AUTH_COOLDOWN_SECONDS = 3600
-SUPPORTED_TYPES = ["pdf", "png", "jpg", "jpeg", "txt"]
+SUPPORTED_TYPES = ["pdf", "png", "jpg", "jpeg", "txt", "xlsx", "csv"]
 MIME_TYPES = {
     "pdf": "application/pdf",
     "png": "image/png",
     "jpg": "image/jpeg",
     "jpeg": "image/jpeg",
     "txt": "text/plain",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "csv": "text/csv",
 }
 BANDS = ("Green", "Yellow", "Red")
 REVIEW_STATUSES = ("pending", "approved", "rejected")
-PAGES = ["Dockets", "Workspace", "Review", "PSV Verify", "Validation", "Export", "Settings"]
+PAGES = ["Dockets", "Workspace", "Review", "Organize", "PSV Verify", "Validation", "Export", "Settings"]
 PAGE_ICONS = {
-    "Dockets": "▤", "Workspace": "⬆", "Review": "✎", "PSV Verify": "✓",
+    "Dockets": "▤", "Workspace": "⬆", "Review": "✎", "Organize": "⌘", "PSV Verify": "✓",
     "Validation": "✔", "Export": "⇩", "Settings": "⚙",
 }
 IDENTITY_CONCEPTS = {
@@ -133,15 +166,57 @@ CREATE TABLE IF NOT EXISTS documents (
     document_type TEXT NOT NULL,
     status TEXT NOT NULL,
     extraction_mode TEXT NOT NULL,
+    processed_units INTEGER NOT NULL DEFAULT 0,
+    failed_units INTEGER NOT NULL DEFAULT 0,
+    completeness_status TEXT NOT NULL DEFAULT 'pending',
+    completeness_message TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     UNIQUE(docket_id, sha256)
 );
 CREATE TABLE IF NOT EXISTS pages (
     document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     page_number INTEGER NOT NULL,
+    sheet_name TEXT NOT NULL DEFAULT '',
     text TEXT NOT NULL,
     readable INTEGER NOT NULL,
     PRIMARY KEY (document_id, page_number)
+);
+-- Deprecated: kept only for backward compatibility with older database files.
+-- Main Metadata is now derived live from `facts` (see fetch_metadata) so that document
+-- deletion, fact correction and rejection are always reflected consistently.
+CREATE TABLE IF NOT EXISTS metadata (
+    id TEXT PRIMARY KEY,
+    docket_id TEXT NOT NULL REFERENCES dockets(id) ON DELETE CASCADE,
+    document_name TEXT NOT NULL,
+    label TEXT NOT NULL,
+    value TEXT NOT NULL,
+    confidence_score INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS templates (
+    id TEXT PRIMARY KEY,
+    docket_id TEXT NOT NULL REFERENCES dockets(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    labels_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(docket_id, name)
+);
+CREATE TABLE IF NOT EXISTS label_mappings (
+    id TEXT PRIMARY KEY,
+    docket_id TEXT NOT NULL REFERENCES dockets(id) ON DELETE CASCADE,
+    source_label TEXT NOT NULL,
+    requested_label TEXT NOT NULL,
+    method TEXT NOT NULL,
+    approved INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    UNIQUE(docket_id, source_label, requested_label)
+);
+CREATE TABLE IF NOT EXISTS rejected_suggestions (
+    docket_id TEXT NOT NULL REFERENCES dockets(id) ON DELETE CASCADE,
+    source_label TEXT NOT NULL,
+    requested_label TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (docket_id, source_label, requested_label)
 );
 CREATE TABLE IF NOT EXISTS facts (
     id TEXT PRIMARY KEY,
@@ -173,6 +248,7 @@ CREATE TABLE IF NOT EXISTS fact_history (
 );
 CREATE INDEX IF NOT EXISTS idx_facts_docket ON facts(docket_id);
 CREATE INDEX IF NOT EXISTS idx_documents_docket ON documents(docket_id);
+CREATE INDEX IF NOT EXISTS idx_metadata_docket ON metadata(docket_id);
 """
 
 KV_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9 /().#&'-]{1,48}?)\s*:\s*(\S.*?)\s*$")
@@ -185,13 +261,15 @@ PATTERNS = [
 
 BATCH_PROMPT = """You extract data from SEVERAL supplier documents in one request.
 Each document part is preceded by a line "=== DOCUMENT: <label> ===". Use that label EXACTLY
-as the "document" value. Page numbers restart at 1 for every labelled part.
+as the "document" value. Page numbers restart at 1 for every labelled part. Spreadsheet
+parts contain every worksheet, including hidden worksheets, represented as a page with a
+sheet name. Account for every supplied page or worksheet in the response.
 Return ONLY a JSON object of this exact shape:
 {"documents": [
    {"document": "<label exactly as given>", "document_type": "short type name",
     "facts": [{"page_number": 1, "label": "Human readable field name",
                "concept": "snake_case_name", "value": "value as written",
-               "evidence": "text copied verbatim from that page (max 200 chars)"}]}
+               "evidence": "text copied verbatim from that page or sheet (max 200 chars)"}]}
  ],
  "cross_references": [
    {"from_document": "<label>", "to_document": "<label>", "page_number": 1,
@@ -205,6 +283,8 @@ Rules:
 - Copy values exactly as written, including handwritten entries when legible.
 - Never invent or infer values that are not on the page. Use an empty value for illegible fields.
 - Evidence must be copied verbatim from the named document and page.
+- Do not omit a page or worksheet. If it contains no identifiable value, return a
+  "Page processing status" fact with an empty value and explain the limitation in evidence.
 - Report links between documents (invoice to PO, challan to GRN, weighment slip to challan)
   in cross_references only when the text shows the link."""
 
@@ -412,7 +492,7 @@ def validate_upload(filename: str, data: bytes) -> Optional[str]:
     """Return a human-readable problem, or None when the upload looks sound."""
     extension = extension_of(filename)
     if extension not in SUPPORTED_TYPES:
-        return f"Unsupported file type “.{extension or '?'}”. Use PDF, PNG, JPG or TXT."
+        return f"Unsupported file type “.{extension or '?'}”. Use PDF, PNG, JPG, TXT, CSV or XLSX."
     if not data:
         return "The file is empty (0 bytes)."
     if len(data) > MAX_UPLOAD_BYTES:
@@ -424,6 +504,16 @@ def validate_upload(filename: str, data: bytes) -> Optional[str]:
         return f"The content is not a valid .{extension} image. The file may be corrupt or renamed."
     if extension == "txt" and b"\x00" in data:
         return "The file contains binary data and is not plain text."
+    if extension == "csv" and b"\x00" in data:
+        return "The file contains binary data and is not CSV text."
+    if extension == "xlsx":
+        try:
+            import openpyxl
+            workbook = openpyxl.load_workbook(io.BytesIO(data), read_only=False, data_only=False)
+            if not workbook.worksheets:
+                return "The workbook contains no worksheets."
+        except Exception as exc:  # noqa: BLE001
+            return f"The workbook could not be opened ({exc.__class__.__name__})."
     if extension == "pdf" and fitz is not None:
         try:
             with fitz.open(stream=data, filetype="pdf") as document:
@@ -466,6 +556,18 @@ def init_db() -> bool:
             connection.execute(
                 "ALTER TABLE dockets ADD COLUMN docket_type TEXT NOT NULL DEFAULT 'Miscellaneous'"
             )
+        document_columns = {row["name"] for row in connection.execute("PRAGMA table_info(documents)")}
+        for name, definition in (
+            ("processed_units", "INTEGER NOT NULL DEFAULT 0"),
+            ("failed_units", "INTEGER NOT NULL DEFAULT 0"),
+            ("completeness_status", "TEXT NOT NULL DEFAULT 'pending'"),
+            ("completeness_message", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if name not in document_columns:
+                connection.execute(f"ALTER TABLE documents ADD COLUMN {name} {definition}")
+        page_columns = {row["name"] for row in connection.execute("PRAGMA table_info(pages)")}
+        if "sheet_name" not in page_columns:
+            connection.execute("ALTER TABLE pages ADD COLUMN sheet_name TEXT NOT NULL DEFAULT ''")
     return True
 
 
@@ -540,7 +642,8 @@ def list_documents(docket_id: str) -> List[sqlite3.Row]:
     with connect() as connection:
         return connection.execute(
             """SELECT id, filename, mime_type, sha256, size_bytes, storage_path, document_type, status,
-                      extraction_mode, page_count, created_at
+                      extraction_mode, page_count, processed_units, failed_units,
+                      completeness_status, completeness_message, created_at
                FROM documents WHERE docket_id = ? ORDER BY created_at""",
             (docket_id,),
         ).fetchall()
@@ -555,6 +658,134 @@ def fetch_facts(docket_id: str) -> List[sqlite3.Row]:
                ORDER BY d.filename, f.page_number, f.created_at""",
             (docket_id,),
         ).fetchall()
+
+
+def fetch_metadata(docket_id: str) -> List[sqlite3.Row]:
+    with connect() as connection:
+        return connection.execute(
+            """SELECT d.filename AS document_name, f.label AS label, f.value AS value,
+                      f.confidence_score AS confidence_score
+               FROM facts f JOIN documents d ON d.id = f.document_id
+               WHERE f.docket_id = ? AND f.review_status != 'rejected'
+                 AND f.concept != 'page_processing_status'
+               ORDER BY d.filename, f.page_number, f.created_at""",
+            (docket_id,),
+        ).fetchall()
+
+
+def list_templates(docket_id: str) -> List[sqlite3.Row]:
+    with connect() as connection:
+        return connection.execute(
+            "SELECT * FROM templates WHERE docket_id = ? ORDER BY updated_at DESC", (docket_id,)
+        ).fetchall()
+
+
+def save_template(docket_id: str, name: str, labels: List[str], template_id: Optional[str] = None) -> None:
+    """Create a template, or update one. Pass the template's own id (not just its name) to
+    update an EXISTING template, including renaming it - looking it up by name only meant a
+    rename always created a duplicate row instead of updating the original."""
+    clean_name = clean_text(name).strip()
+    clean_labels: List[str] = []
+    seen_labels: set[str] = set()
+    for label in labels:
+        clean_label = clean_text(label)
+        normalized = normalize_label(clean_label)
+        if normalized and normalized not in seen_labels:
+            clean_labels.append(clean_label)
+            seen_labels.add(normalized)
+    if not clean_name or not clean_labels:
+        raise ValueError("A template name and at least one requested label are required.")
+    now = utc_now()
+    with connect() as connection:
+        existing = None
+        if template_id:
+            existing = connection.execute(
+                "SELECT id FROM templates WHERE docket_id = ? AND id = ?", (docket_id, template_id)
+            ).fetchone()
+        if existing is None:
+            existing = connection.execute(
+                "SELECT id FROM templates WHERE docket_id = ? AND name = ?", (docket_id, clean_name)
+            ).fetchone()
+        if existing:
+            try:
+                connection.execute(
+                    "UPDATE templates SET name = ?, labels_json = ?, updated_at = ? WHERE id = ?",
+                    (clean_name, json.dumps(clean_labels, ensure_ascii=False), now, existing["id"]),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(f"A template named “{clean_name}” already exists.") from exc
+        else:
+            try:
+                connection.execute(
+                    """INSERT INTO templates
+                       (id, docket_id, name, labels_json, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (str(uuid.uuid4()), docket_id, clean_name,
+                     json.dumps(clean_labels, ensure_ascii=False), now, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(f"A template named “{clean_name}” already exists.") from exc
+
+
+def save_mapping(docket_id: str, source_label: str, requested_label: str, method: str) -> None:
+    source_label, requested_label = clean_text(source_label).strip(), clean_text(requested_label).strip()
+    if not source_label or not requested_label:
+        return
+    with connect() as connection:
+        connection.execute(
+            """INSERT INTO label_mappings
+               (id, docket_id, source_label, requested_label, method, approved, created_at)
+               VALUES (?, ?, ?, ?, ?, 1, ?)
+               ON CONFLICT(docket_id, source_label, requested_label)
+               DO UPDATE SET method = excluded.method, approved = 1""",
+            (str(uuid.uuid4()), docket_id, source_label, requested_label, method, utc_now()),
+        )
+
+
+def approved_mappings(docket_id: str) -> Dict[str, List[str]]:
+    """Maps each source label to EVERY target label it has been approved for (a source
+    label can be approved for several client templates at once)."""
+    with connect() as connection:
+        rows = connection.execute(
+            """SELECT source_label, requested_label FROM label_mappings
+               WHERE docket_id = ? AND approved = 1""", (docket_id,)
+        ).fetchall()
+    out: Dict[str, List[str]] = {}
+    for row in rows:
+        out.setdefault(row["source_label"], []).append(row["requested_label"])
+    return out
+
+
+def delete_mappings_to_labels(docket_id: str, labels: Iterable[str]) -> None:
+    """Remove mappings that point at labels no longer offered by any template (bug: a
+    mapping used to survive a label's removal and would silently keep exporting under
+    a label that no template lists anymore)."""
+    labels = [str(label) for label in labels if str(label).strip()]
+    if not labels:
+        return
+    with connect() as connection:
+        connection.executemany(
+            "DELETE FROM label_mappings WHERE docket_id = ? AND requested_label = ?",
+            [(docket_id, label) for label in labels],
+        )
+
+
+def reject_suggestion(docket_id: str, source_label: str, requested_label: str) -> None:
+    with connect() as connection:
+        connection.execute(
+            """INSERT OR IGNORE INTO rejected_suggestions
+               (docket_id, source_label, requested_label, created_at) VALUES (?, ?, ?, ?)""",
+            (docket_id, source_label, requested_label, utc_now()),
+        )
+
+
+def rejected_suggestions(docket_id: str) -> set:
+    with connect() as connection:
+        rows = connection.execute(
+            "SELECT source_label, requested_label FROM rejected_suggestions WHERE docket_id = ?",
+            (docket_id,),
+        ).fetchall()
+    return {(row["source_label"], row["requested_label"]) for row in rows}
 
 
 def fact_history(fact_id: str) -> List[sqlite3.Row]:
@@ -583,14 +814,21 @@ def read_pages(filename: str, data: bytes) -> List[Dict[str, Any]]:
         with fitz.open(stream=data, filetype="pdf") as document:
             for index, page in enumerate(document, start=1):
                 text = clean_text(page.get_text("text")).strip()
-                pages.append({"page_number": index, "text": text, "readable": bool(text)})
+                pages.append({"page_number": index, "sheet_name": "", "text": text, "readable": bool(text)})
         if not pages:
             raise RuntimeError("The PDF contains no pages.")
         return pages
     if extension == "txt":
         text = clean_text(decode_text(data)).strip()
-        return [{"page_number": 1, "text": text, "readable": bool(text)}]
-    return [{"page_number": 1, "text": "", "readable": False}]  # images: no text layer
+        return [{"page_number": 1, "sheet_name": "", "text": text, "readable": bool(text)}]
+    if extension == "xlsx":
+        import openpyxl
+        workbook = openpyxl.load_workbook(io.BytesIO(data), read_only=False, data_only=False)
+        return sheet_text(workbook)
+    if extension == "csv":
+        text = clean_text(decode_text(data)).strip()
+        return [{"page_number": 1, "sheet_name": "CSV", "text": text, "readable": bool(text)}]
+    return [{"page_number": 1, "sheet_name": "", "text": "", "readable": False}]  # images: vision-only
 
 
 def split_pdf(data: bytes, pages_per_part: int) -> List[Tuple[int, int, bytes]]:
@@ -655,28 +893,29 @@ def local_extract(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not page["readable"]:
             facts.append(_fact(number, "Page readability", "page_status", "", ""))
             continue
-        seen_pairs: set = set()
-        seen_values: set = set()
         structured = 0
         for raw_line in page["text"].splitlines():
             line = raw_line.strip()
             if not line:
                 continue
+            # Every occurrence of a value is a separate, meaningful fact (e.g. two line
+            # items that happen to share a rate or an amount must both be kept), so nothing
+            # is deduplicated across lines. The only thing we avoid is counting the SAME
+            # token twice from THIS SAME line when both the key:value pattern and a generic
+            # regex pattern match it (e.g. "Total: Rs. 500" matching both KV_RE and the
+            # amount regex) - that is one value, not two.
             match = KV_RE.match(line)
+            line_value_already_captured = None
             if match:
                 label, value = match.group(1).strip(), match.group(2).strip()
-                pair = (to_concept(label), value.lower())
-                if pair not in seen_pairs:
-                    seen_pairs.add(pair)
-                    seen_values.add(value.lower())
-                    facts.append(_fact(number, label, to_concept(label), value, line))
-                    structured += 1
+                facts.append(_fact(number, label, to_concept(label), value, line))
+                structured += 1
+                line_value_already_captured = value.lower()
             for concept, label, pattern in PATTERNS:
                 for hit in pattern.finditer(line):
                     value = hit.group(0).strip()
-                    if value.lower() in seen_values:
+                    if value.lower() == line_value_already_captured:
                         continue
-                    seen_values.add(value.lower())
                     facts.append(_fact(number, label, concept, value, line))
                     structured += 1
         if structured == 0:
@@ -741,22 +980,93 @@ def classify_error(exc: Exception) -> Optional[int]:
 
 def is_size_error(exc: Exception) -> bool:
     text = str(exc).lower()
+    if "quota" in text or "rate limit" in text or "per minute" in text or "per day" in text:
+        return False  # a quota/rate-limit error, not an oversized request
     return "too large" in text or ("token" in text and ("exceed" in text or "limit" in text))
 
 
 def cooldown_remaining(cooldown_id: str) -> float:
-    until = st.session_state.get("key_cooldowns", {}).get(cooldown_id, 0.0)
+    state = getattr(WORKER_STATE, "state", None)
+    cooldowns = state["key_cooldowns"] if state is not None else st.session_state.get("key_cooldowns", {})
+    until = cooldowns.get(cooldown_id, 0.0)
     return max(0.0, until - time.time())
 
 
 def set_cooldown(cooldown_id: str, seconds: int) -> None:
-    st.session_state.setdefault("key_cooldowns", {})[cooldown_id] = time.time() + seconds
+    state = getattr(WORKER_STATE, "state", None)
+    if state is not None:
+        state.setdefault("key_cooldowns", {})[cooldown_id] = time.time() + seconds
+    else:
+        st.session_state.setdefault("key_cooldowns", {})[cooldown_id] = time.time() + seconds
+
+
+KEYRING_SERVICE = "parchai-gemini-keys"
+KEYRING_INDEX_ACCOUNT = "__index__"
+
+
+@functools.lru_cache(maxsize=1)
+def keyring_available() -> bool:
+    """True only if an OS credential store actually works here (not just importable)."""
+    if keyring is None:
+        return False
+    try:
+        probe = f"__probe__{uuid.uuid4().hex}"
+        keyring.set_password(KEYRING_SERVICE, probe, "x")
+        keyring.delete_password(KEYRING_SERVICE, probe)
+        return True
+    except Exception:  # noqa: BLE001 - any backend failure means "not available"
+        return False
+
+
+def _persisted_key_ids() -> List[str]:
+    if not keyring_available():
+        return []
+    raw = keyring.get_password(KEYRING_SERVICE, KEYRING_INDEX_ACCOUNT)
+    return json.loads(raw) if raw else []
+
+
+def persisted_keys() -> List[str]:
+    if not keyring_available():
+        return []
+    keys = []
+    for identifier in _persisted_key_ids():
+        value = keyring.get_password(KEYRING_SERVICE, identifier)
+        if value:
+            keys.append(value)
+    return keys
+
+
+def save_key_persistently(raw: str) -> None:
+    if not keyring_available():
+        raise RuntimeError("No OS credential store is available here, so the key cannot be saved "
+                            "securely. It will only be kept for this session.")
+    identifier = key_id(raw)
+    keyring.set_password(KEYRING_SERVICE, identifier, raw)
+    ids = _persisted_key_ids()
+    if identifier not in ids:
+        ids.append(identifier)
+        keyring.set_password(KEYRING_SERVICE, KEYRING_INDEX_ACCOUNT, json.dumps(ids))
+
+
+def remove_persisted_key(identifier: str) -> None:
+    if not keyring_available():
+        return
+    ids = _persisted_key_ids()
+    if identifier in ids:
+        try:
+            keyring.delete_password(KEYRING_SERVICE, identifier)
+        except keyring.errors.PasswordDeleteError:
+            pass
+        ids.remove(identifier)
+        keyring.set_password(KEYRING_SERVICE, KEYRING_INDEX_ACCOUNT, json.dumps(ids))
 
 
 def _key_candidates() -> Iterator[Tuple[str, str]]:
     for raw in re.split(r"[\n,;]+", os.getenv("GEMINI_API_KEYS", "")):
         yield raw.strip(), "env pool"
     yield os.getenv("GEMINI_API_KEY", "").strip(), "env"
+    for raw in persisted_keys():
+        yield raw, "persisted"
     for raw in st.session_state.get("session_keys", []):
         yield str(raw).strip(), "session"
 
@@ -957,6 +1267,7 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
                     contents.append(f"=== DOCUMENT: {unit['label']} ===")
                     contents.append(handle)
                 contents.append(BATCH_PROMPT)
+                set_gemini_activity(True, f"Gemini request in progress · {model}")
                 try:
                     response = client.models.generate_content(
                         model=model,
@@ -975,6 +1286,8 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
                     if cooldown:
                         set_cooldown(f"{entry['id']}:{model}", cooldown)
                     continue
+                finally:
+                    set_gemini_activity(False)
 
                 if "MAX_TOKENS" in finish_reason(response):
                     raise OversizedBatch("response was truncated at the output token limit")
@@ -1062,14 +1375,16 @@ def prepare_document(docket_id: str, filename: str, data: bytes, mode: str) -> T
         with connect() as connection:
             connection.execute(
                 """INSERT INTO documents (id, docket_id, filename, mime_type, sha256, size_bytes,
-                   storage_path, page_count, document_type, status, extraction_mode, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   storage_path, page_count, document_type, status, extraction_mode,
+                   processed_units, failed_units, completeness_status, completeness_message, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (doc_id, docket_id, clean_text(filename), mime, digest, len(data), storage_path, len(pages),
-                 classify_local(pages), "pending", mode, now),
+                 classify_local(pages), "pending", mode, 0, 0, "pending", "", now),
             )
             connection.executemany(
-                "INSERT INTO pages (document_id, page_number, text, readable) VALUES (?, ?, ?, ?)",
-                [(doc_id, p["page_number"], p["text"], int(p["readable"])) for p in pages],
+                "INSERT INTO pages (document_id, page_number, sheet_name, text, readable) VALUES (?, ?, ?, ?, ?)",
+                [(doc_id, p["page_number"], p.get("sheet_name", ""), p["text"], int(p["readable"]))
+                 for p in pages],
             )
     except Exception:
         remove_stored_document(storage_path)
@@ -1087,6 +1402,27 @@ def finalize_document(docket_id: str, doc: Dict[str, Any], status: str,
                       document_type: str, items: List[Dict[str, Any]]) -> None:
     """Save all facts for a document in one transaction: all of them are stored, or none."""
     now = utc_now()
+    # Pages/sheets the extractor actually returned at least one fact for. A page with no
+    # text layer (e.g. an image, vision-only) can still land here once Gemini reads it -
+    # "no text layer" and "nothing came back" are NOT the same thing.
+    accounted_pages = {int(item.get("page_number", 1)) for item in items}
+    failed_pages = [page for page in doc["pages"] if page["page_number"] not in accounted_pages]
+    for page in failed_pages:
+        items.append(_fact(
+            page["page_number"],
+            "Page processing status",
+            "page_processing_status",
+            "" if not page["readable"] else "No identifiable value returned",
+            "",
+        ))
+    failed_units = len(failed_pages)
+    completeness_status = "complete" if not failed_units and status == "gemini" else "complete_with_warnings"
+    if completeness_status == "complete":
+        completeness_message = "Every page/sheet produced at least one extracted value via Gemini."
+    elif failed_units:
+        completeness_message = f"{failed_units} page/sheet(s) returned no extracted value at all."
+    else:
+        completeness_message = "Local fallback extraction was used instead of Gemini; results may be less complete."
     with connect() as connection:
         for item in items:
             page_number = min(max(1, item["page_number"]), doc["page_count"])
@@ -1103,8 +1439,14 @@ def finalize_document(docket_id: str, doc: Dict[str, Any], status: str,
                  assessment["band"], assessment["score"], json.dumps(assessment["reasons"]),
                  "pending", 0, now, now),
             )
-        connection.execute("UPDATE documents SET status = ?, document_type = ? WHERE id = ?",
-                           (status, clean_text(document_type or "Unclassified")[:80], doc["id"]))
+        connection.execute(
+            """UPDATE documents SET status = ?, document_type = ?, processed_units = ?,
+               failed_units = ?, completeness_status = ?, completeness_message = ?
+               WHERE id = ?""",
+            (status, clean_text(document_type or "Unclassified")[:80],
+             doc["page_count"] - failed_units,
+             failed_units, completeness_status, completeness_message, doc["id"]),
+        )
         connection.execute("UPDATE dockets SET updated_at = ? WHERE id = ?", (now, docket_id))
     apply_extraction_integrity(docket_id)
 
@@ -1212,14 +1554,23 @@ def gemini_document_status(doc: Dict[str, Any]) -> str:
     return "partial"
 
 
-def process_uploads(docket_id: str, uploads: List[Any]) -> None:
-    mode = st.session_state.get("extraction_mode", "Local")
-    keys = key_pool() if mode == "Gemini" else []
-    if mode == "Gemini" and not keys:
-        queue_flash("error", "Gemini mode needs at least one valid API key. Add one in Settings, "
-                             "or switch to Local mode.")
+def set_gemini_activity(active: bool, message: str = "") -> None:
+    job_id = getattr(WORKER_STATE, "job_id", None)
+    if not job_id:
         return
+    with PROCESSING_LOCK:
+        job = PROCESSING_JOBS.get(job_id)
+        if job is not None:
+            job["gemini_active"] = active
+            job["phase"] = "gemini" if active else "processing"
+            if message:
+                job["message"] = message
 
+
+def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any]],
+                        keys: List[Dict[str, str]]) -> None:
+    WORKER_STATE.job_id = job_id
+    WORKER_STATE.state = {"key_cooldowns": {}}
     results: List[Dict[str, Any]] = []
     documents: List[Dict[str, Any]] = []
     finalized: set = set()
@@ -1235,71 +1586,193 @@ def process_uploads(docket_id: str, uploads: List[Any]) -> None:
             results.append({"filename": doc["filename"], "status": "failed", "facts": 0,
                             "message": f"Could not save results ({clean_text(exc)[:150]}). Nothing was kept; try again."})
 
-    with st.status("Processing docket…", expanded=True) as run:
-        try:
-            for upload in uploads:
-                data = upload.getvalue()
-                problem = validate_upload(upload.name, data)
-                if problem:
-                    results.append({"filename": upload.name, "status": "failed", "facts": 0, "message": problem})
-                    continue
-                try:
-                    doc, skipped = prepare_document(docket_id, upload.name, data, mode)
-                except Exception as exc:  # noqa: BLE001
-                    LOG.exception("prepare failed for %s", upload.name)
-                    results.append({"filename": upload.name, "status": "failed", "facts": 0,
-                                    "message": f"Could not store the file ({clean_text(exc)[:200]})."})
-                    continue
-                if doc:
-                    documents.append(doc)
-                else:
-                    results.append(skipped)
+    def progress(message: str) -> None:
+        with PROCESSING_LOCK:
+            PROCESSING_JOBS[job_id].update(message=message, phase="processing", gemini_active=False)
 
-            if mode == "Local":
-                for doc in documents:
-                    run.write(f"Local rules: {doc['filename']}")
-                    items = local_extract(doc["pages"])
-                    save(doc, "local", classify_local(doc["pages"]), items, "Extracted with local rules.")
+    try:
+        with PROCESSING_LOCK:
+            PROCESSING_JOBS[job_id].update(status="running", phase="processing", gemini_active=False)
+        progress("Validating and storing uploaded documents…")
+        for upload in uploads:
+            data = upload["data"]
+            problem = validate_upload(upload["filename"], data)
+            if problem:
+                results.append({"filename": upload["filename"], "status": "failed", "facts": 0, "message": problem})
+                continue
+            try:
+                doc, skipped = prepare_document(docket_id, upload["filename"], data, "Gemini")
+            except Exception as exc:  # noqa: BLE001
+                LOG.exception("prepare failed for %s", upload["filename"])
+                results.append({"filename": upload["filename"], "status": "failed", "facts": 0,
+                                "message": f"Could not store the file ({clean_text(exc)[:200]})."})
+                continue
+            if doc:
+                documents.append(doc)
             else:
-                units: List[Dict[str, Any]] = []
-                for doc in documents:
-                    try:
-                        units.extend(make_units(doc))
-                    except Exception as exc:  # noqa: BLE001
-                        doc["units"] = [{
-                            "label": doc["filename"], "doc": doc, "offset": 0, "pages": doc["page_count"],
-                            "data": doc["data"], "mime": doc["mime"], "suffix": "",
-                            "pages_slice": doc["pages"], "items": None, "status": None,
-                            "message": "", "doc_type": None,
-                        }]
-                        unit_fallback(doc["units"][0], f"could not split document ({str(exc)[:120]})")
-                batches = pack_batches([u for u in units if u["status"] is None])
-                run.write(f"{len(units)} part(s) packed into {len(batches)} request(s).")
-                for index, batch in enumerate(batches, start=1):
-                    run.write(f"Request {index}/{len(batches)}: {len(batch)} part(s)")
-                    process_units(batch, keys)
-                for doc in documents:
-                    items = [item for unit in doc["units"] for item in (unit["items"] or [])]
-                    doc_type = next((u["doc_type"] for u in doc["units"] if u["doc_type"]), "")
-                    messages = sorted({u["message"] for u in doc["units"] if u["message"]})
-                    save(doc, gemini_document_status(doc), doc_type or classify_local(doc["pages"]),
-                         items, " | ".join(messages))
-            run.update(label="Processing complete", state="complete", expanded=False)
-        except Exception as exc:  # noqa: BLE001
-            LOG.exception("processing run failed")
-            for doc in documents:
-                if doc["id"] not in finalized:
-                    delete_document(docket_id, doc["id"])
-                    results.append({"filename": doc["filename"], "status": "failed", "facts": 0,
-                                    "message": f"Processing was interrupted ({clean_text(exc)[:150]}). "
-                                               "The file was removed so you can retry."})
-            run.update(label="Processing stopped with an error", state="error", expanded=True)
+                results.append(skipped)
 
-    st.session_state["last_results"] = results
-    st.session_state["upload_nonce"] = st.session_state.get("upload_nonce", 0) + 1  # clears the queue
-    good = sum(r["status"] not in ("failed", "skipped") for r in results)
-    queue_flash("success" if good else "warning",
-                f"{good} of {len(results)} file(s) processed. See “Latest processing run” for details.")
+        units: List[Dict[str, Any]] = []
+        for doc in documents:
+            try:
+                units.extend(make_units(doc))
+            except Exception as exc:  # noqa: BLE001
+                doc["units"] = [{
+                    "label": doc["filename"], "doc": doc, "offset": 0, "pages": doc["page_count"],
+                    "data": doc["data"], "mime": doc["mime"], "suffix": "",
+                    "pages_slice": doc["pages"], "items": None, "status": None,
+                    "message": "", "doc_type": None,
+                }]
+                unit_fallback(doc["units"][0], f"could not split document ({str(exc)[:120]})")
+        batches = pack_batches([u for u in units if u["status"] is None])
+        for index, batch in enumerate(batches, start=1):
+            progress(f"Gemini request {index}/{len(batches)}…")
+            process_units(batch, keys)
+        for doc in documents:
+            items = [item for unit in doc["units"] for item in (unit["items"] or [])]
+            doc_type = next((u["doc_type"] for u in doc["units"] if u["doc_type"]), "")
+            messages = sorted({u["message"] for u in doc["units"] if u["message"]})
+            save(doc, gemini_document_status(doc), doc_type or classify_local(doc["pages"]),
+                 items, " | ".join(messages))
+        with PROCESSING_LOCK:
+            PROCESSING_JOBS[job_id].update(
+                status="complete", phase="complete", gemini_active=False,
+                results=results, message="Processing complete.", finished_at=time.time(),
+            )
+    except Exception as exc:  # noqa: BLE001
+        LOG.exception("processing run failed")
+        for doc in documents:
+            if doc["id"] not in finalized:
+                delete_document(docket_id, doc["id"])
+                results.append({"filename": doc["filename"], "status": "failed", "facts": 0,
+                                "message": f"Processing was interrupted ({clean_text(exc)[:150]}). "
+                                           "The file was removed so you can retry."})
+        with PROCESSING_LOCK:
+            PROCESSING_JOBS[job_id].update(
+                status="error", phase="error", gemini_active=False,
+                results=results, message=f"Processing stopped: {clean_text(exc)[:200]}",
+                finished_at=time.time(),
+            )
+    finally:
+        WORKER_STATE.job_id = None
+        WORKER_STATE.state = None
+
+
+def processing_job(docket_id: str) -> Optional[Dict[str, Any]]:
+    with PROCESSING_LOCK:
+        jobs = [job for job in PROCESSING_JOBS.values() if job["docket_id"] == docket_id]
+        active = [job for job in jobs if job["status"] in {"queued", "running"}]
+        return dict((active or jobs)[-1]) if (active or jobs) else None
+
+
+def _render_processing_status(job: Optional[Dict[str, Any]]) -> None:
+    if not job:
+        return
+    if job["status"] in {"queued", "running"}:
+        title = "Gemini is processing…" if job.get("gemini_active") else "Preparing processing…"
+        with st.status(title, state="running", expanded=True):
+            st.write(job["message"] or "Preparing the uploaded documents.")
+            st.caption("You can switch tabs safely; processing continues in the background.")
+    elif job["status"] == "error":
+        st.error(job["message"], icon="🚫")
+
+
+@st.fragment(run_every=1)
+def render_processing_loader(docket_id: str) -> None:
+    _render_processing_status(processing_job(docket_id))
+
+
+@st.fragment(run_every=1)
+def render_processing_controls(docket_id: str) -> None:
+    active_job = processing_job(docket_id)
+    if active_job and active_job.get("gemini_active"):
+        st.markdown(
+            """
+            <style>
+            .st-key-process_documents button:disabled {
+                background: #c7b9ff !important;
+                border-color: #c7b9ff !important;
+                color: #2b2350 !important;
+                opacity: 1 !important;
+            }
+                .st-key-process_documents button:disabled::before {
+                    content: "⟳";
+                    display: inline-block;
+                    margin-right: 0.45rem;
+                    animation: parchi-button-spin 0.9s linear infinite;
+                }
+                @keyframes parchi-button-spin {
+                    to { transform: rotate(360deg); }
+                }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+    with st.container(border=True):
+        st.markdown("**Add documents**")
+        st.caption("Documents are processed with Gemini in the background. You can switch tabs or open Settings while processing continues.")
+        uploads = st.file_uploader(
+            f"Drop PDF, PNG, JPG, TXT, CSV or XLSX files (up to {fmt_size(MAX_UPLOAD_BYTES)} each)",
+            type=SUPPORTED_TYPES,
+            accept_multiple_files=True,
+            key=f"uploads_{st.session_state.get('upload_nonce', 0)}",
+        )
+        is_active = bool(active_job and active_job["status"] in {"queued", "running"})
+        if active_job and active_job.get("gemini_active"):
+            label = "Gemini processing…"
+        elif is_active:
+            label = "Preparing…"
+        else:
+            label = f"Process {len(uploads)} document(s)" if uploads else "Process documents"
+        run = st.button(
+            label,
+            key="process_documents",
+            type="primary",
+            disabled=is_active or not uploads,
+            **stretch(),
+        )
+        if not uploads:
+            st.caption("Choose one or more files to enable processing.")
+        if run and uploads:
+            process_uploads(docket_id, uploads)
+            st.session_state["upload_nonce"] = st.session_state.get("upload_nonce", 0) + 1
+            st.rerun(scope="app")
+    _render_processing_status(processing_job(docket_id))
+
+
+JOB_RETENTION_SECONDS = 3600
+
+
+def _prune_finished_jobs() -> None:
+    cutoff = time.time() - JOB_RETENTION_SECONDS
+    with PROCESSING_LOCK:
+        for stale_id in [
+            job_id for job_id, job in PROCESSING_JOBS.items()
+            if job["status"] in {"complete", "error"} and job.get("finished_at", 0) < cutoff
+        ]:
+            del PROCESSING_JOBS[stale_id]
+
+
+def process_uploads(docket_id: str, uploads: List[Any]) -> None:
+    keys = key_pool()
+    if not keys:
+        queue_flash("error", "Gemini processing needs at least one valid API key. Add one in Settings.")
+        return
+    existing = processing_job(docket_id)
+    if existing and existing["status"] == "running":
+        queue_flash("warning", "This docket is already being processed in the background.")
+        return
+    _prune_finished_jobs()
+    job_id = str(uuid.uuid4())
+    payload = [{"filename": upload.name, "data": upload.getvalue()} for upload in uploads]
+    with PROCESSING_LOCK:
+        PROCESSING_JOBS[job_id] = {
+            "id": job_id, "docket_id": docket_id, "status": "queued", "phase": "queued",
+            "gemini_active": False, "message": "Queued for Gemini extraction…", "results": [],
+            "finished_at": 0.0,
+        }
+    PROCESSING_EXECUTOR.submit(_run_processing_job, job_id, docket_id, payload, keys)
+    queue_flash("success", "Processing started in the background. You can switch tabs safely.")
 
 
 # ---------------------------------------------------------------- review operations
@@ -1353,8 +1826,13 @@ def approve_green(docket_id: str) -> int:
 
 # ---------------------------------------------------------------- validation
 def _number(value: str) -> Optional[float]:
+    if "%" in value:
+        return None  # a rate (e.g. "18%"), not an absolute amount
+    match = re.search(r"-?\d[\d,]*(?:\.\d+)?", value)
+    if not match:
+        return None
     try:
-        return float(re.sub(r"[^\d.\-]", "", value))
+        return float(match.group(0).replace(",", ""))
     except ValueError:
         return None
 
@@ -1362,7 +1840,9 @@ def _number(value: str) -> Optional[float]:
 def validation_report(docket_id: str) -> List[Dict[str, str]]:
     with connect() as connection:
         documents = connection.execute(
-            "SELECT id, filename, status, storage_path, sha256 FROM documents WHERE docket_id = ? ORDER BY filename",
+            """SELECT id, filename, status, storage_path, sha256, page_count,
+                      processed_units, failed_units, completeness_status, completeness_message
+               FROM documents WHERE docket_id = ? ORDER BY filename""",
             (docket_id,),
         ).fetchall()
         unreadable = connection.execute(
@@ -1385,6 +1865,13 @@ def validation_report(docket_id: str) -> List[Dict[str, str]]:
             add("Red", "Storage", f"{document['filename']}: {problem}")
         if document["status"] in ("fallback", "partial"):
             add("Yellow", "Extraction", f"{document['filename']}: some parts used local rules after Gemini failed.")
+        if document["processed_units"] != document["page_count"]:
+            add("Red", "Completeness",
+                f"{document['filename']}: only {document['processed_units']} of "
+                f"{document['page_count']} pages/sheets were accounted for.")
+        elif document["completeness_status"] != "complete":
+            add("Yellow", "Completeness",
+                f"{document['filename']}: {document['completeness_message']}")
     for page in unreadable:
         add("Yellow", "Completeness",
             f"{page['filename']} p.{page['page_number']}: no text layer; Gemini mode or OCR required.")
@@ -1532,22 +2019,52 @@ def build_json(docket: sqlite3.Row) -> Tuple[bytes, int]:
     if len(reloaded["facts"]) != len(facts) or len(reloaded["documents"]) != len(documents):
         raise ExportError("JSON integrity check failed: record counts do not match.")
     return data, len(facts)
-VIEW_HEADERS = ["filename", "label", "value", "confidence_level"]
-XLSX_HEADERS = ["Filename", "Label", "Value", "Confidence Level"]
-XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-BAND_FILLS = {"Green": "C6EFCE", "Yellow": "FFEB9C", "Red": "FFC7CE"}
 
 
-def build_view_rows(docket_id: str) -> List[List[str]]:
+def build_metadata_json(docket_id: str) -> Tuple[bytes, int]:
+    return build_metadata_export(metadata_records(docket_id), "Main Metadata File")
+
+
+METADATA_HEADERS = ["document_name", "label", "value", "confidence_score"]
+
+
+def metadata_records(docket_id: str) -> List[dict]:
     return [
-        [clean_text(f["filename"]), clean_text(f["label"]), clean_text(f["value"]), f["confidence_band"]]
-        for f in fetch_facts(docket_id)
+        {
+            "document_name": row["document_name"],
+            "label": row["label"],
+            "value": row["value"],
+            "confidence_score": int(row["confidence_score"]),
+        }
+        for row in fetch_metadata(docket_id)
     ]
 
 
-def build_view_psv(docket_id: str) -> Tuple[bytes, int]:
-    rows = build_view_rows(docket_id)
-    expected = [VIEW_HEADERS] + [[safe_cell(cell) for cell in row] for row in rows]
+def client_template_records(docket_id: str, template: sqlite3.Row) -> Tuple[List[dict], List[str]]:
+    labels = json.loads(template["labels_json"])
+    records = metadata_records(docket_id)
+    mappings = approved_mappings(docket_id)
+    output: List[dict] = []
+    matched = {label: 0 for label in labels}
+    for record in records:
+        for target in mappings.get(record["label"], []):
+            if target in matched:
+                output.append({**record, "label": target})
+                matched[target] += 1
+    return output, [label for label, count in matched.items() if count == 0]
+
+
+def build_metadata_export(records: List[dict], description: str) -> Tuple[bytes, int]:
+    data = json_bytes(records)
+    if json.loads(data.decode("utf-8")) != records:
+        raise ExportError(f"{description} integrity check failed after re-reading.")
+    return data, len(records)
+
+
+def build_metadata_psv(records: List[dict], description: str) -> Tuple[bytes, int]:
+    expected = [METADATA_HEADERS] + [
+        [safe_cell(record[field]) for field in METADATA_HEADERS] for record in records
+    ]
     buffer = io.StringIO(newline="")
     csv.writer(buffer, delimiter="|", quotechar='"', quoting=csv.QUOTE_MINIMAL,
                doublequote=True, lineterminator="\r\n").writerows(expected)
@@ -1556,48 +2073,52 @@ def build_view_psv(docket_id: str) -> Tuple[bytes, int]:
         parsed = list(csv.reader(io.StringIO(text, newline=""), delimiter="|", quotechar='"',
                                  doublequote=True, strict=True))
     except csv.Error as exc:
-        raise ExportError(f"PSV could not be read back: {exc}") from exc
+        raise ExportError(f"{description} PSV could not be read back: {exc}") from exc
     if parsed != expected:
-        raise ExportError("PSV integrity check failed: re-reading the file did not reproduce the data.")
-    return ("\ufeff" + text).encode("utf-8"), len(rows)
+        raise ExportError(f"{description} PSV integrity check failed after re-reading.")
+    return ("\ufeff" + text).encode("utf-8"), len(records)
 
 
-def build_view_xlsx(docket_id: str) -> Tuple[bytes, int]:
-    rows = build_view_rows(docket_id)
+def build_metadata_xlsx(records: List[dict], description: str) -> Tuple[bytes, int]:
     workbook = Workbook()
     sheet = workbook.active
-    sheet.title = "Extraction"
-    sheet.append(XLSX_HEADERS)
+    sheet.title = "Metadata"
+    sheet.append(METADATA_HEADERS)
     for cell in sheet[1]:
         cell.font = Font(bold=True)
-
-    for row_number, row in enumerate(rows, start=2):
-        for column_number, value in enumerate(row, start=1):
-            cell = sheet.cell(row=row_number, column=column_number)
-            cell.value = value
+    for row_number, record in enumerate(records, start=2):
+        for column_number, field in enumerate(METADATA_HEADERS, start=1):
+            value = record[field]
+            cell = sheet.cell(row=row_number, column=column_number, value=value)
             if isinstance(value, str) and value[:1] in ("=", "+", "-", "@"):
-                cell.data_type = "s"  # keep as text, never a formula
-        colour = BAND_FILLS.get(row[3], "FFFFFF")
-        sheet.cell(row=row_number, column=4).fill = PatternFill(
-            fill_type="solid", start_color=colour, end_color=colour
-        )
-
+                cell.data_type = "s"
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = f"A1:D{max(sheet.max_row, 1)}"
-    for letter, width in zip("ABCD", (34, 30, 42, 18)):
+    for letter, width in zip("ABCD", (34, 34, 60, 18)):
         sheet.column_dimensions[letter].width = width
-
     output = io.BytesIO()
     workbook.save(output)
     data = output.getvalue()
-
-    # Re-read the file and confirm it matches the database before offering it.
     reloaded = load_workbook(io.BytesIO(data), read_only=True)
-    got = list(reloaded.active.iter_rows(min_row=2, max_col=4, values_only=True))
+    raw_rows = list(reloaded.active.iter_rows(min_row=2, max_col=4, values_only=True))
     reloaded.close()
-    if len(got) != len(rows) or [r[3] for r in got] != [r[3] for r in rows]:
-        raise ExportError("Excel integrity check failed: re-reading the file did not match the data.")
-    return data, len(rows)
+    # openpyxl has no concept of "blank but present" - an empty string cell round-trips as
+    # None. That is expected, not corruption, so None is normalised back to "" for the
+    # text columns before the comparison (confidence_score has no such ambiguity).
+    got = []
+    for document_name, label, value, confidence_score in raw_rows:
+        got.append({
+            "document_name": document_name or "",
+            "label": label or "",
+            "value": "" if value is None else value,
+            "confidence_score": int(confidence_score) if confidence_score is not None else 0,
+        })
+    if got != records:
+        raise ExportError(f"{description} XLSX integrity check failed after re-reading.")
+    return data, len(records)
+
+
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 # ---------------------------------------------------------------- styling
 def inject_css() -> None:
@@ -1644,7 +2165,6 @@ def inject_css() -> None:
         button[kind="primary"]:hover, button[data-testid="stBaseButton-primary"]:hover {
             background: #3f60d6 !important; border-color: #3f60d6 !important; }
         button[kind="secondary"], button[data-testid="stBaseButton-secondary"] { border-radius: 8px !important; }
-
         /* headings */
         .page-head { margin: 6px 0 16px; }
         .page-crumb { font-size:13px; color:var(--muted); }
@@ -1685,8 +2205,8 @@ STATUS_META = {"approved": ("ok", "✔"), "pending": ("warn", "…"), "rejected"
 
 
 def badge(text: str, kind: str = "", icon: str = "") -> str:
-    return f'<span class="badge {esc(kind)}">{esc(icon)} {esc(text)}</span>'.replace("> ", ">", 1) if not icon else \
-        f'<span class="badge {esc(kind)}">{esc(icon)} {esc(text)}</span>'
+    inner = f"{esc(icon)} {esc(text)}" if icon else esc(text)
+    return f'<span class="badge {esc(kind)}">{inner}</span>'
 
 
 def band_badge(band: str) -> str:
@@ -1734,7 +2254,6 @@ def render_topbar(dockets: List[sqlite3.Row]) -> Optional[sqlite3.Row]:
         ids = [d["id"] for d in dockets]
         if st.session_state.get("active_docket") not in ids:
             st.session_state["active_docket"] = ids[0]
-    mode = st.session_state.get("extraction_mode", "Local")
     keys = len(key_pool())
     cooling = sum(1 for until in st.session_state.get("key_cooldowns", {}).values() if until > time.time())
     rejected = len(rejected_keys())
@@ -1757,12 +2276,15 @@ def render_topbar(dockets: List[sqlite3.Row]) -> Optional[sqlite3.Row]:
                       **stretch())
     with chips_col:
         extra = ""
+        active_job = processing_job(st.session_state.get("active_docket")) if st.session_state.get("active_docket") else None
+        if active_job and active_job["status"] in {"queued", "running"}:
+            extra += '<span class="chip accent">⏳ Processing in background</span>'
         if cooling:
             extra += f'<span class="chip warn">▲ {cooling} key(s) cooling</span>'
         if rejected:
             extra += f'<span class="chip bad">✖ {rejected} invalid key(s)</span>'
         st.markdown(
-            f'<div class="chips"><span class="chip accent">Mode: {esc(mode)}</span>'
+            f'<div class="chips"><span class="chip accent">Mode: Gemini</span>'
             f'<span class="chip ok">✔ {keys} key(s) ready</span>{extra}</div>',
             unsafe_allow_html=True,
         )
@@ -1839,11 +2361,20 @@ def delete_document_callback(docket_id: str, document_id: str, filename: str) ->
 @guarded
 def add_key_callback() -> None:
     raw = st.session_state.get("add_key_input", "").strip()
+    remember = bool(st.session_state.get("add_key_remember", False))
     problem = key_problem(raw)
     if problem:
         queue_flash("error", problem)
     elif any(e["key"] == raw for e in key_pool()):
         queue_flash("warning", "That key is already in the pool.")
+    elif remember:
+        try:
+            save_key_persistently(raw)
+            queue_flash("success", "Key saved securely (OS credential store) and will still be "
+                                    "there next time you open Parchi AI.")
+        except RuntimeError as exc:
+            st.session_state.setdefault("session_keys", []).append(raw)
+            queue_flash("warning", f"{exc} Added for this session instead.")
     else:
         st.session_state.setdefault("session_keys", []).append(raw)
         queue_flash("success", "Key added for this session. It is not saved to disk.")
@@ -1852,10 +2383,13 @@ def add_key_callback() -> None:
 
 @guarded
 def remove_key_callback(identifier: str) -> None:
+    before = len(st.session_state.get("session_keys", []))
     st.session_state["session_keys"] = [
         k for k in st.session_state.get("session_keys", []) if key_id(str(k).strip()) != identifier
     ]
-    queue_flash("success", "Session key removed.")
+    if len(st.session_state["session_keys"]) == before:
+        remove_persisted_key(identifier)
+    queue_flash("success", "Key removed.")
 
 
 @guarded
@@ -1887,7 +2421,7 @@ def page_dockets(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> N
         name_col.text_input("New docket name", key="new_docket_name",
                             placeholder="e.g. Acme Steel, March deliveries", max_chars=120)
         type_col.selectbox(
-            "Type Of Docket",
+            "Docket type",
             ["Select a docket type", *DOCKET_TYPES],
             key="new_docket_type",
             index=0,
@@ -1960,24 +2494,14 @@ def page_workspace(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) ->
     metrics[2].metric("Pending review", sum(f["review_status"] == "pending" for f in facts))
     metrics[3].metric("Red confidence", sum(f["confidence_band"] == "Red" for f in facts))
 
-    with st.container(border=True):
-        st.markdown("**Add documents**")
-        st.radio("Extraction mode", ["Local", "Gemini"], horizontal=True, key="extraction_mode",
-                 help="Local uses text-layer rules and works offline. Gemini sends each batch of "
-                      "documents in one request and also reads scans and images.")
-        uploads = st.file_uploader(
-            f"Drop PDF, PNG, JPG or TXT files (up to {fmt_size(MAX_UPLOAD_BYTES)} each)",
-            type=SUPPORTED_TYPES,
-            accept_multiple_files=True,
-            key=f"uploads_{st.session_state.get('upload_nonce', 0)}",
-        )
-        run = st.button(f"Process {len(uploads)} document(s)" if uploads else "Process documents",
-                        type="primary", disabled=not uploads, **stretch())
-        if not uploads:
-            st.caption("Choose one or more files to enable processing.")
-        if run and uploads:
-            process_uploads(docket_id, uploads)
-            st.rerun()
+    render_processing_controls(docket_id)
+    job = processing_job(docket_id)
+    if job and job["status"] in {"queued", "running"}:
+        st.info(f"Background processing is active: {job['message']}", icon="⏳")
+    elif (job and job["status"] in {"complete", "error"} and job.get("results")
+          and st.session_state.get("last_surfaced_job_id") != job["id"]):
+        st.session_state["last_results"] = job["results"]
+        st.session_state["last_surfaced_job_id"] = job["id"]
 
     results = st.session_state.get("last_results")
     if results:
@@ -2004,6 +2528,8 @@ def page_workspace(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) ->
                 "Document": d["filename"],
                 "Type": d["document_type"],
                 "Pages": d["page_count"],
+                "Processed": f"{d['processed_units']}/{d['page_count']}",
+                "Completeness": d["completeness_status"],
                 "Size": fmt_size(d["size_bytes"]),
                 "Extraction": d["extraction_mode"],
                 "Status": d["status"],
@@ -2088,6 +2614,21 @@ def source_preview(fact: sqlite3.Row) -> None:
             st.image(image, caption=f"{fact['filename']} · page {fact['page_number']}", **stretch())
         elif extension == "txt":
             st.code(decode_text(path.read_bytes())[:4000], language=None)
+        elif extension == "csv":
+            st.dataframe(pd.read_csv(io.StringIO(decode_text(path.read_bytes())), dtype=str,
+                                      keep_default_na=False).head(200), hide_index=True, **stretch())
+        elif extension == "xlsx":
+            with connect() as connection:
+                page = connection.execute(
+                    "SELECT sheet_name, text FROM pages WHERE document_id = ? AND page_number = ?",
+                    (fact["document_id"], fact["page_number"]),
+                ).fetchone()
+            if page and page["text"]:
+                rows = [line.split(" | ") for line in page["text"].splitlines()]
+                st.caption(f"Sheet: {page['sheet_name'] or '(unnamed)'}")
+                st.dataframe(rows, hide_index=True, **stretch())
+            else:
+                st.info("This sheet has no readable rows to preview.")
         else:
             st.info("No preview available for this file type.")
     except Exception as exc:  # noqa: BLE001
@@ -2169,9 +2710,213 @@ def page_review(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
             st.caption("No changes recorded yet.")
 
 
-def page_psv_verify(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
-    page_header("PSV verification", "Clean a pipe-separated export and verify low-confidence extractions first.",
+def page_organize(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
+    page_header("Organize", "Select exact client labels, save reusable templates, and approve label mappings.",
                 active["name"] if active else None)
+    if not need_docket(active):
+        return
+    metadata = [dict(row) for row in fetch_metadata(active["id"])]
+    if not metadata:
+        st.info("Process documents first. The Main Metadata File will appear here after extraction.")
+        return
+    labels = unique_labels(metadata)
+    st.metric("Unique extracted labels", len(labels))
+    with st.expander("Main Metadata File preview", expanded=False):
+        st.dataframe(metadata, hide_index=True, width="stretch")
+
+    templates = list_templates(active["id"])
+    template_names = [row["name"] for row in templates]
+    # Apply any pending default BEFORE the selectbox below is instantiated. Setting
+    # st.session_state["organize_template_choice"] AFTER that selectbox has already been
+    # created in this same script run raises StreamlitAPIException, so a save/rename
+    # schedules its pending selection here rather than writing the widget key directly.
+    pending_select = st.session_state.pop("organize_template_pending_select", None)
+    if pending_select is not None and pending_select in ("New template", *template_names):
+        st.session_state["organize_template_choice"] = pending_select
+    with st.container(border=True):
+        st.markdown("**Create or update a client template**")
+        selected = st.selectbox("Saved template", ["New template", *template_names],
+                                key="organize_template_choice")
+        existing = next((row for row in templates if row["name"] == selected), None)
+        default_name = existing["name"] if existing else ""
+        default_labels = json.loads(existing["labels_json"]) if existing else []
+        default_normalized = {normalize_label(label) for label in default_labels}
+        template_pill_options = [
+            *default_labels,
+            *[label for label in labels if normalize_label(label) not in default_normalized],
+        ]
+        name = st.text_input("Template name", value=default_name, key="template_name")
+        selected_labels = st.pills(
+            "Select template labels",
+            template_pill_options,
+            selection_mode="multi",
+            default=default_labels,
+            key=f"create_template_labels_{active['id']}_{selected}",
+            help="Select the extracted labels to include. Labels are kept exactly as displayed.",
+            width="stretch",
+        )
+        if st.button("Save template", type="primary", disabled=not selected_labels):
+            try:
+                save_template(active["id"], name, selected_labels,
+                               template_id=existing["id"] if existing else None)
+                removed_labels = [label for label in default_labels if label not in selected_labels]
+                delete_mappings_to_labels(active["id"], removed_labels)
+                st.success("Template saved.", icon="✅")
+                st.session_state["organize_template_pending_select"] = name.strip()
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc), icon="🚫")
+
+    if not templates:
+        return
+    template = existing or templates[0]
+    template_labels = json.loads(template["labels_json"])
+    st.markdown(f"#### Label matching · {template['name']}")
+    st.caption("Exact matches are mapped automatically. Suggestions require explicit approval.")
+
+    add_key = f"add_template_labels_{active['id']}_{template['id']}"
+
+    def add_selected_labels() -> None:
+        selected_labels = st.session_state.get(add_key, [])
+        existing_normalized = {normalize_label(label) for label in template_labels}
+        additions = [
+            label for label in selected_labels
+            if normalize_label(label) not in existing_normalized
+        ]
+        if additions:
+            save_template(active["id"], template["name"], [*template_labels, *additions],
+                           template_id=template["id"])
+        st.session_state[add_key] = []
+
+    template_normalized = {normalize_label(label) for label in template_labels}
+    available_labels = [
+        label for label in labels if normalize_label(label) not in template_normalized
+    ]
+    with st.container(border=True):
+        st.markdown("**Add extracted labels to this template**")
+        if available_labels:
+            st.pills(
+                "Available extracted labels",
+                available_labels,
+                selection_mode="multi",
+                key=add_key,
+                on_change=add_selected_labels,
+                help="Select one or more labels. They are added immediately without changing their spelling.",
+            )
+        else:
+            st.caption("All extracted labels are already present in this template.")
+
+    remove_key = f"remove_template_labels_{active['id']}_{template['id']}"
+
+    def remove_selected_labels() -> None:
+        selected_labels = st.session_state.get(remove_key, [])
+        remaining = [label for label in template_labels if label not in selected_labels]
+        if remaining:
+            save_template(active["id"], template["name"], remaining, template_id=template["id"])
+            delete_mappings_to_labels(active["id"], selected_labels)
+
+    selected_for_removal = st.pills(
+        "Selected template labels",
+        template_labels,
+        selection_mode="multi",
+        key=remove_key,
+        help="Select labels to remove from this template.",
+    )
+    if selected_for_removal and st.button(
+        "Remove selected labels",
+        key=f"remove_selected_{active['id']}_{template['id']}",
+        on_click=remove_selected_labels,
+    ):
+        st.rerun()
+    if selected_for_removal and len(selected_for_removal) == len(template_labels):
+        st.warning("Keep at least one template label; templates cannot be empty.", icon="⚠️")
+
+    current_mappings = approved_mappings(active["id"])
+    exact_matches: list[tuple[str, str]] = []
+    suggested_matches: list[tuple[str, list[dict[str, Any]]]] = []
+    unmatched_labels: list[str] = []
+    rejected = rejected_suggestions(active["id"])
+
+    for source in labels:
+        exact = exact_template_label(source, template_labels)
+        # A source label may already be approved for OTHER templates; what matters here
+        # is only whether it already has an approved target inside THIS template.
+        mapped_for_this_template = [
+            target for target in current_mappings.get(source, []) if target in template_labels
+        ]
+        if exact:
+            if exact not in mapped_for_this_template:
+                save_mapping(active["id"], source, exact, "exact")
+            exact_matches.append((source, exact))
+            continue
+        if mapped_for_this_template:
+            continue
+        matches = [
+            match for match in suggestions(source, template_labels, limit=3, min_score=70)
+            if (source, match["label"]) not in rejected
+        ]
+        if matches:
+            suggested_matches.append((source, matches))
+        else:
+            unmatched_labels.append(source)
+
+    with st.container(border=True):
+        st.markdown("**Automatically matched**")
+        if exact_matches:
+            for source, target in exact_matches:
+                st.success(f"`{source}` → `{target}`", icon="✅")
+        else:
+            st.caption("No new exact matches.")
+
+    with st.container(border=True):
+        st.markdown("**Suggested matches · 70%+ similarity**")
+        if suggested_matches:
+            for source, matches in suggested_matches:
+                st.markdown(f"**{source}**")
+                for match in matches:
+                    target = match["label"]
+                    pair_id = key_id(f"{source}\u241f{target}")
+                    accept_col, reject_col, score_col = st.columns([1, 1, 3], vertical_alignment="center")
+                    with accept_col:
+                        if st.button(
+                            "Accept",
+                            key=f"accept_suggestion_{active['id']}_{template['id']}_{pair_id}",
+                            width="stretch",
+                        ):
+                            save_mapping(active["id"], source, target, "user-approved")
+                            st.rerun()
+                    with reject_col:
+                        if st.button(
+                            "Reject",
+                            key=f"reject_suggestion_{active['id']}_{template['id']}_{pair_id}",
+                            width="stretch",
+                        ):
+                            reject_suggestion(active["id"], source, target)
+                            st.rerun()
+                    with score_col:
+                        st.caption(f"`{target}` · {match['score']:.0f}%")
+        else:
+            st.caption("No suggestions meet the 70% threshold.")
+
+    with st.container(border=True):
+        st.markdown("**Unmatched extracted labels**")
+        if unmatched_labels:
+            st.pills(
+                "Labels not mapped",
+                unmatched_labels,
+                selection_mode="multi",
+                key=f"unmatched_labels_{active['id']}_{template['id']}",
+                label_visibility="collapsed",
+            )
+        else:
+            st.caption("All extracted labels are mapped or have reviewable suggestions.")
+
+    st.caption("Approve mappings, then use the Client Template export in the Export page.")
+
+
+def page_psv_verify(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
+    page_header("PSV verification", "Clean a pipe-separated export and verify low-confidence extractions first. "
+                "This works on any uploaded PSV file and is independent of the active docket.", None)
     upload = st.file_uploader("Upload PSV file", type=["psv", "txt", "csv"], key="psv_upload")
     if upload is not None:
         try:
@@ -2279,8 +3024,8 @@ def page_validation(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -
 
 
 def page_export(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
-    page_header("Export", "Download the review view as PSV or Excel, or the full structured JSON. "
-                          "Each file is re-read and checked before it can be downloaded.",
+    page_header("Export", "Download the unchanged Main Metadata File or a mapped Client Template "
+                          "without additional AI processing.",
                 active["name"] if active else None)
     if not need_docket(active):
         return
@@ -2290,45 +3035,77 @@ def page_export(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
     slug = to_concept(active["name"]) or "docket"
 
-    # (title, caption, builder, filename, mime, show_text_preview)
-    specs = [
-        ("PSV (review view)",
-         "Four columns: filename, label, value, confidence_level. Pipe-delimited, UTF-8 with BOM. "
-         "Can be uploaded straight into PSV Verify.",
-         lambda: build_view_psv(active["id"]), f"parchai-{slug}-{stamp}.psv",
-         "text/plain; charset=utf-8", True),
-        ("Excel (review view)",
-         "The same four columns in a spreadsheet. Confidence Level cells are green, yellow or red.",
-         lambda: build_view_xlsx(active["id"]), f"parchai-{slug}-{stamp}.xlsx", XLSX_MIME, False),
-        ("JSON (full)",
-         "Docket, documents, facts with confidence, review state and full change history.",
-         lambda: build_json(active), f"parchai-{slug}-{stamp}.json", "application/json", True),
-    ]
-    for column, (title, caption, builder, filename, mime, show_preview) in zip(st.columns(3), specs):
-        with column, st.container(border=True):
-            st.markdown(f"**{title}**")
-            st.caption(caption)
+    formats = ["JSON", "PSV", "XLSX"]
+    mime_by_format = {"JSON": "application/json", "PSV": "text/plain; charset=utf-8", "XLSX": XLSX_MIME}
+
+    def export_panel(title: str, caption: str, records: List[dict], missing: List[str],
+                     prefix: str) -> None:
+        st.markdown(f"**{title}**")
+        st.caption(caption)
+        if missing:
+            st.warning("No approved mapping for: " + ", ".join(missing), icon="⚠️")
+        selected_format = st.selectbox("Format", formats, key=f"{prefix}_format")
+        cache_key = f"{prefix}_export_cache"
+        if st.button("Build export", type="primary", key=f"{prefix}_build", **stretch()):
             try:
-                with st.spinner(f"Building and verifying {title}…"):
-                    data, count = builder()
+                if selected_format == "JSON":
+                    data, count = build_metadata_export(records, title)
+                    extension = "json"
+                elif selected_format == "PSV":
+                    data, count = build_metadata_psv(records, title)
+                    extension = "psv"
+                else:
+                    data, count = build_metadata_xlsx(records, title)
+                    extension = "xlsx"
             except ExportError as exc:
+                st.session_state.pop(cache_key, None)
                 st.error(f"{title} export blocked: {exc}", icon="🚫")
-                continue
+                return
             except Exception as exc:  # noqa: BLE001
                 LOG.exception("export failed")
+                st.session_state.pop(cache_key, None)
                 st.error(f"{title} export failed: {clean_text(exc)[:200]}", icon="🚫")
-                continue
-            st.success(f"Integrity verified · {count} row(s) · {fmt_size(len(data))}", icon="✅")
-            st.caption(f"SHA-256 `{hashlib.sha256(data).hexdigest()[:16]}…`")
-            st.download_button(f"Download {title.split(' (')[0]}", data, file_name=filename,
-                               mime=mime, key=f"dl_{title}", **stretch())
-            if show_preview:
-                with st.expander("Preview"):
-                    st.code(data.decode("utf-8-sig")[:1500], language=None)
+                return
+            st.session_state[cache_key] = {
+                "format": selected_format, "data": data, "count": count, "extension": extension,
+            }
+        cached = st.session_state.get(cache_key)
+        if cached and cached["format"] == selected_format:
+            st.success(f"Integrity verified · {cached['count']} row(s) · {fmt_size(len(cached['data']))}", icon="✅")
+            st.download_button(
+                "Download export", cached["data"],
+                file_name=f"parchai-{slug}-{prefix}-{stamp}.{cached['extension']}",
+                mime=mime_by_format[selected_format], key=f"{prefix}_download", **stretch(),
+            )
+
+    main_records = metadata_records(active["id"])
+    templates = list_templates(active["id"])
+    with st.container(border=True):
+        export_panel(
+            "Main Metadata",
+            "The unchanged exhaustive four-field ledger: document_name, label, value and confidence_score.",
+            main_records, [], "main_metadata",
+        )
+    with st.container(border=True):
+        if templates:
+            template_names = [row["name"] for row in templates]
+            selected_name = st.selectbox("Client template", template_names, key="export_template_choice")
+            selected_template = next(row for row in templates if row["name"] == selected_name)
+            client_records, missing = client_template_records(active["id"], selected_template)
+            export_panel(
+                "Client Template",
+                "Mapped records only; duplicate and conflicting values remain separate and labels retain exact template spelling.",
+                client_records, missing, "client_template",
+            )
+        else:
+            st.markdown("**Client Template**")
+            st.info("Create and save a client template in Organize before exporting.")
 
 
 def page_settings(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
     page_header("Settings", "Gemini key pool, model fallback, storage and integrity checks.", None)
+    if active:
+        render_processing_loader(active["id"])
     entries = key_pool()
 
     st.markdown("#### Gemini API key pool")
@@ -2340,7 +3117,7 @@ def page_settings(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> 
                  "API key (it must be a complete ASCII key beginning with “AQ.” or “AIza”, with no spaces). "
                  "Check the GEMINI_API_KEY(S) value.", icon="🚫")
     if not entries:
-        st.warning("No valid keys configured. Local extraction still works without keys.", icon="⚠️")
+        st.warning("No valid Gemini keys configured. Add a key before processing documents.", icon="⚠️")
     else:
         rows = []
         for entry in entries:
@@ -2354,21 +3131,30 @@ def page_settings(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> 
             })
         st.dataframe(rows, hide_index=True, **stretch())
 
-    session_entries = [e for e in entries if e["source"] == "session"]
-    if session_entries:
-        st.markdown("**Remove session keys**")
-        for entry in session_entries:
+    removable_entries = [e for e in entries if e["source"] in ("session", "persisted")]
+    if removable_entries:
+        st.markdown("**Remove keys**")
+        for entry in removable_entries:
             col_key, col_btn = st.columns([4, 1], vertical_alignment="center")
-            col_key.code(entry["masked"], language=None)
+            tag = " · saved securely" if entry["source"] == "persisted" else " · this session only"
+            col_key.code(entry["masked"] + tag, language=None)
             col_btn.button("Remove", key=f"remove_{entry['id']}", on_click=remove_key_callback,
                            args=(entry["id"],))
 
     with st.container(border=True):
-        st.markdown("**Add a key for this session**")
+        st.markdown("**Add a key**")
         key_col, add_col = st.columns([4, 1], vertical_alignment="bottom")
         key_col.text_input("Gemini API key", type="password", key="add_key_input",
                            help="Paste only the complete key. Current Gemini keys start with “AQ.”.")
         add_col.button("Add key", on_click=add_key_callback, **stretch())
+        if keyring_available():
+            st.checkbox(
+                "Remember this key securely (OS credential store) so it survives a restart",
+                key="add_key_remember",
+            )
+        else:
+            st.caption("No OS credential store is available here, so keys can only be kept for this "
+                       "session; they are never written to disk in plain text.")
 
     if entries:
         options = [f"{e['label']} ({e['masked']})" for e in entries]
@@ -2411,6 +3197,7 @@ RENDERERS = {
     "Dockets": page_dockets,
     "Workspace": page_workspace,
     "Review": page_review,
+    "Organize": page_organize,
     "PSV Verify": page_psv_verify,
     "Validation": page_validation,
     "Export": page_export,
