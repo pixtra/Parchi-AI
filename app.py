@@ -2872,6 +2872,19 @@ def page_workspace(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) ->
           and st.session_state.get("last_surfaced_job_id") != job["id"]):
         st.session_state["last_results"] = job["results"]
         st.session_state["last_surfaced_job_id"] = job["id"]
+        results = job["results"]
+        st.session_state["last_run_summary"] = {
+            "total": len(results),
+            "completed": sum(result["status"] == "completed" for result in results),
+            "failed": sum(result["status"] == "failed" for result in results),
+            "partial": sum(result["status"] == "partial" for result in results),
+            "pending": sum(result["status"] in {"queued", "processing"} for result in results),
+            "extracted": sum(result.get("extracted_count", 0) for result in results),
+            "appended": sum(result.get("appended_count", 0) for result in results),
+        }
+        # Refresh the page-level document query so completed extraction statuses
+        # and fact counts are visible immediately after the worker finishes.
+        st.rerun(scope="app")
 
     results = st.session_state.get("last_results")
     if results:
@@ -3435,7 +3448,7 @@ def page_export(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
             st.warning("No approved mapping for: " + ", ".join(missing), icon="⚠️")
         selected_format = st.selectbox("Format", formats, key=f"{prefix}_format")
         cache_key = f"{prefix}_export_cache"
-        if         st.button("Export", type="primary", key=f"{prefix}_build", **stretch()):
+        if st.button("Export", type="primary", key=f"{prefix}_build", **stretch()):
             try:
                 if selected_format == "JSON":
                     data, count = build_metadata_export(records, title)
