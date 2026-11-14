@@ -2859,11 +2859,10 @@ def page_workspace(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) ->
     facts = fetch_facts(docket_id)
     documents = list_documents(docket_id)
 
-    metrics = st.columns(4)
+    metrics = st.columns(3)
     metrics[0].metric("Documents", len(documents))
     metrics[1].metric("Facts", len(facts))
     metrics[2].metric("Pending review", sum(f["review_status"] == "pending" for f in facts))
-    metrics[3].metric("Red confidence", sum(f["confidence_band"] == "Red" for f in facts))
 
     render_processing_controls(docket_id)
     job = processing_job(docket_id)
