@@ -68,7 +68,8 @@ except ImportError:
     types = None
 
 LOG = logging.getLogger("parchai")
-PROCESSING_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="parchai-extraction")
+# One worker: dockets are extracted sequentially, never concurrently (checklist §6).
+PROCESSING_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="parchai-extraction")
 PROCESSING_LOCK = threading.RLock()
 PROCESSING_JOBS: Dict[str, Dict[str, Any]] = {}
 WORKER_STATE = threading.local()
@@ -550,6 +551,51 @@ def connect() -> Iterator[sqlite3.Connection]:
         connection.close()
 
 
+def _retire_legacy_table(connection: sqlite3.Connection, table: str) -> None:
+    """Move a pre-migration table aside instead of dropping it, so no saved approval or
+    rejection is ever erased by an upgrade. Rows without a template_id cannot be
+    attributed to a template, so they are preserved for manual recovery."""
+    legacy = f"{table}_legacy"
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (legacy,)
+    ).fetchone():
+        legacy = f"{table}_legacy_{int(time.time())}"
+    connection.execute(f"ALTER TABLE {table} RENAME TO {legacy}")
+
+
+def _migrate_template_tables(connection: sqlite3.Connection) -> None:
+    """Upgrade template tables to template_id scoping without losing data."""
+    mapping_columns = {row["name"] for row in connection.execute("PRAGMA table_info(label_mappings)")}
+    if mapping_columns and "template_id" not in mapping_columns:
+        _retire_legacy_table(connection, "label_mappings")
+        connection.executescript("""
+            CREATE TABLE label_mappings (
+                id TEXT PRIMARY KEY,
+                docket_id TEXT NOT NULL REFERENCES dockets(id) ON DELETE CASCADE,
+                template_id TEXT NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
+                source_label TEXT NOT NULL,
+                requested_label TEXT NOT NULL,
+                method TEXT NOT NULL,
+                approved INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                UNIQUE(docket_id, template_id, source_label)
+            );
+        """)
+    rejection_columns = {row["name"] for row in connection.execute("PRAGMA table_info(rejected_suggestions)")}
+    if rejection_columns and "template_id" not in rejection_columns:
+        _retire_legacy_table(connection, "rejected_suggestions")
+        connection.executescript("""
+            CREATE TABLE rejected_suggestions (
+                docket_id TEXT NOT NULL REFERENCES dockets(id) ON DELETE CASCADE,
+                template_id TEXT NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
+                source_label TEXT NOT NULL,
+                requested_label TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (docket_id, template_id, source_label, requested_label)
+            );
+        """)
+
+
 @st.cache_resource
 def init_db() -> bool:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -574,35 +620,7 @@ def init_db() -> bool:
         page_columns = {row["name"] for row in connection.execute("PRAGMA table_info(pages)")}
         if "sheet_name" not in page_columns:
             connection.execute("ALTER TABLE pages ADD COLUMN sheet_name TEXT NOT NULL DEFAULT ''")
-        mapping_columns = {row["name"] for row in connection.execute("PRAGMA table_info(label_mappings)")}
-        if "template_id" not in mapping_columns:
-            connection.execute("DROP TABLE IF EXISTS label_mappings")
-            connection.executescript("""
-                CREATE TABLE label_mappings (
-                    id TEXT PRIMARY KEY,
-                    docket_id TEXT NOT NULL REFERENCES dockets(id) ON DELETE CASCADE,
-                    template_id TEXT NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
-                    source_label TEXT NOT NULL,
-                    requested_label TEXT NOT NULL,
-                    method TEXT NOT NULL,
-                    approved INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL,
-                    UNIQUE(docket_id, template_id, source_label)
-                );
-            """)
-        rejection_columns = {row["name"] for row in connection.execute("PRAGMA table_info(rejected_suggestions)")}
-        if "template_id" not in rejection_columns:
-            connection.execute("DROP TABLE IF EXISTS rejected_suggestions")
-            connection.executescript("""
-                CREATE TABLE rejected_suggestions (
-                    docket_id TEXT NOT NULL REFERENCES dockets(id) ON DELETE CASCADE,
-                    template_id TEXT NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
-                    source_label TEXT NOT NULL,
-                    requested_label TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    PRIMARY KEY (docket_id, template_id, source_label, requested_label)
-                );
-            """)
+        _migrate_template_tables(connection)
     return True
 
 
@@ -884,6 +902,11 @@ def delete_mapping(docket_id: str, template_id: str, source_label: str, requeste
 
 
 def reject_suggestion(docket_id: str, template_id: str, source_label: str, requested_label: str) -> None:
+    # Normalized the same way save_mapping/delete_mapping store and look up labels,
+    # so a rejection always matches on later lookups regardless of incidental whitespace.
+    source_label, requested_label = clean_text(source_label).strip(), clean_text(requested_label).strip()
+    if not source_label or not requested_label:
+        return
     with connect() as connection:
         connection.execute(
             """INSERT OR IGNORE INTO rejected_suggestions
@@ -2391,7 +2414,7 @@ def build_psv(docket_id: str) -> Tuple[bytes, int]:
             safe_cell(row["filename"]),
             safe_cell(row["label"]),
             safe_cell(row["value"]),
-            clamp_confidence(row["confidence_score"], 50),
+            str(clamp_confidence(row["confidence_score"], 50)),   # csv.reader returns str
         ])
 
     buffer = io.StringIO(newline="")
@@ -2490,8 +2513,15 @@ def client_template_records(docket_id: str, template: sqlite3.Row) -> Tuple[List
     mappings = approved_mappings(docket_id, template["id"])
     output: List[dict] = []
     matched = {label: 0 for label in labels}
+    # Mappings are stored under one canonical spelling per source label (the first
+    # spelling seen during apply). Facts may carry other spellings of the same
+    # label, so the lookup must compare case-insensitively — otherwise every fact
+    # spelled, e.g., "grand total" would be silently dropped even though
+    # "Grand Total" is approved. Checklist item 8: "Include every Main Metadata
+    # occurrence associated with an approved mapping".
+    mapping_by_normalized = {normalize_label(source): target for source, target in mappings.items()}
     for record in records:
-        target = mappings.get(record["label"])
+        target = mapping_by_normalized.get(normalize_label(record["label"]))
         if target in matched:
             output.append({**record, "label": target})
             matched[target] += 1
@@ -3185,18 +3215,6 @@ def page_review(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
         else:
             st.caption("No changes recorded yet.")
 
-
-# ---------------------------------------------------------------- client templates
-#
-# Rebuilt workflow. Three distinct operations:
-#   * create_template_mode - select labels per uploaded document (pills), save new
-#   * edit_template_mode   - same selection UI against an existing template
-#   * apply_template_mode  - exact auto-map, RapidFuzz >=70% needs Approve/Reject,
-#                            unmatched labels are mapped manually or explicitly added
-# Invariants: Main Metadata is never written by any template operation; applying
-# never silently rewrites saved labels (labels are only added via the explicit
-# "Add to template" action); mappings/rejections persist per template_id.
-
 FUZZY_MIN_SCORE = 70
 
 
@@ -3273,12 +3291,14 @@ def fuzzy_suggestions(
     return [{"label": label, "score": score} for label, score in scored[:limit]]
 
 
-def template_sections_key(docket_id: str) -> str:
-    """Session key for {document_name: [submitted labels]} in the pill workflow."""
-    return f"template_sections_{docket_id}"
+def template_sections_key(docket_id: str, scope: str) -> str:
+    """Session key for {document_name: [submitted labels]} in the pill workflow.
+    `scope` isolates Create ("create") from Edit ("edit_<template id>") so their
+    selections can never leak into each other."""
+    return f"template_sections_{docket_id}_{scope}"
 
 
-def _document_label_picker(docket_id: str, metadata: List[dict], sections: Dict[str, List[str]]) -> None:
+def _document_label_picker(docket_id: str, metadata: List[dict], sections: Dict[str, List[str]], scope: str) -> None:
     """Step 1 (shared by create/edit): choose ONE document, see ONLY its unique
     labels as pills, submit them below. Switching documents never disturbs the
     pills of another document or any submitted section."""
@@ -3288,7 +3308,7 @@ def _document_label_picker(docket_id: str, metadata: List[dict], sections: Dict[
         document_name = st.selectbox(
             "Uploaded document",
             ["Select a document", *document_names],
-            key=f"template_doc_{docket_id}",
+            key=f"template_doc_{docket_id}_{scope}",
             help="Labels appear only after a document is chosen; each pill is one unique label.",
         )
         if document_name == "Select a document":
@@ -3309,23 +3329,23 @@ def _document_label_picker(docket_id: str, metadata: List[dict], sections: Dict[
             f"Unique labels extracted from “{document_name}”",
             available,
             selection_mode="multi",
-            key=f"template_pills_{docket_id}_{key_id(document_name)}_{len(sections.get(document_name, []))}",
+            key=f"template_pills_{docket_id}_{scope}_{key_id(document_name)}_{len(sections.get(document_name, []))}",
             width="stretch",
         ) or []
         if st.button(
             "Submit labels",
             type="primary",
-            key=f"template_submit_{docket_id}",
+            key=f"template_submit_{docket_id}_{scope}",
             disabled=not picked,
             **stretch(),
         ):
             # Duplicate submissions of the same label (any casing) are blocked.
             sections[document_name] = _dedupe_labels([*sections.get(document_name, []), *picked])
-            st.session_state[template_sections_key(docket_id)] = sections
+            st.session_state[template_sections_key(docket_id, scope)] = sections
             st.rerun()
 
 
-def _submitted_sections_editor(docket_id: str, sections: Dict[str, List[str]]) -> None:
+def _submitted_sections_editor(docket_id: str, sections: Dict[str, List[str]], scope: str) -> None:
     """Step 2 (shared): one bordered section per submitted document, filename as
     heading, selected labels as editable pills beneath it."""
     st.markdown("#### 2. Submitted document sections")
@@ -3337,16 +3357,16 @@ def _submitted_sections_editor(docket_id: str, sections: Dict[str, List[str]]) -
             head_col, clear_col = st.columns([5, 1], vertical_alignment="center")
             head_col.markdown(f"**{document}**")
             head_col.caption(f"{len(section_labels)} label(s) selected")
-            if clear_col.button("Remove section", key=f"template_drop_{docket_id}_{key_id(document)}", **stretch()):
+            if clear_col.button("Remove section", key=f"template_drop_{docket_id}_{scope}_{key_id(document)}", **stretch()):
                 del sections[document]
-                st.session_state[template_sections_key(docket_id)] = sections
+                st.session_state[template_sections_key(docket_id, scope)] = sections
                 st.rerun()
             kept = st.pills(
                 f"Labels for {document}",
                 section_labels,
                 selection_mode="multi",
                 default=section_labels,
-                key=f"template_section_{docket_id}_{key_id(document)}_{len(section_labels)}",
+                key=f"template_section_{docket_id}_{scope}_{key_id(document)}_{len(section_labels)}",
                 label_visibility="collapsed",
                 width="stretch",
             )
@@ -3356,17 +3376,22 @@ def _submitted_sections_editor(docket_id: str, sections: Dict[str, List[str]]) -
                     sections[document] = kept
                 else:
                     del sections[document]
-                st.session_state[template_sections_key(docket_id)] = sections
+                st.session_state[template_sections_key(docket_id, scope)] = sections
                 st.rerun()
 
 
 def create_template_mode(active: sqlite3.Row, metadata: List[dict]) -> None:
     """Create a new template purely by selecting labels per document. No similarity
-    scoring, no automatic mapping, no mapping writes; Main Metadata untouched."""
+    scoring, no automatic mapping, no mapping writes; Main Metadata untouched.
+    Saving stays on this page: it never switches to Apply."""
     docket_id = active["id"]
-    sections: Dict[str, List[str]] = st.session_state.setdefault(template_sections_key(docket_id), {})
-    _document_label_picker(docket_id, metadata, sections)
-    _submitted_sections_editor(docket_id, sections)
+    scope = "create"
+    if st.session_state.pop(f"template_create_reset_{docket_id}", False):
+        # Clear the name box before its widget is rendered (safe: nothing rendered yet).
+        st.session_state.pop(f"template_name_{docket_id}", None)
+    sections: Dict[str, List[str]] = st.session_state.setdefault(template_sections_key(docket_id, scope), {})
+    _document_label_picker(docket_id, metadata, sections, scope)
+    _submitted_sections_editor(docket_id, sections, scope)
     st.markdown("#### 3. Save template")
     all_labels = _dedupe_labels(label for labels in sections.values() for label in labels)
     name = st.text_input("Template name", key=f"template_name_{docket_id}", max_chars=120)
@@ -3383,10 +3408,9 @@ def create_template_mode(active: sqlite3.Row, metadata: List[dict]) -> None:
         except ValueError as exc:
             st.error(str(exc), icon="🚫")
             return
-        st.session_state.pop(template_sections_key(docket_id), None)
-        queue_flash("success", "Template saved. Main Metadata was not changed.")
-        st.session_state["org_mode_pending"] = "Apply existing template"
-        st.session_state["org_template_pending"] = clean_text(name).strip()
+        st.session_state.pop(template_sections_key(docket_id, scope), None)
+        st.session_state[f"template_create_reset_{docket_id}"] = True
+        queue_flash("success", f"Template “{clean_text(name).strip()}” saved. Main Metadata was not changed.")
         st.rerun()
 
 
@@ -3403,15 +3427,16 @@ def edit_template_mode(active: sqlite3.Row, metadata: List[dict]) -> None:
     selected = st.selectbox("Template to edit", names, key=f"template_edit_pick_{docket_id}")
     template = next(row for row in templates if row["name"] == selected)
     template_id = template["id"]
+    scope = f"edit_{template_id}"
 
     state_key = f"template_edit_state_{docket_id}"
     state = st.session_state.get(state_key)
     if not isinstance(state, dict) or state.get("template_id") != template_id:
         state = {"template_id": template_id, "labels": json.loads(template["labels_json"])}
         st.session_state[state_key] = state
-        st.session_state.pop(template_sections_key(docket_id), None)
+        st.session_state.pop(template_sections_key(docket_id, scope), None)
 
-    sections: Dict[str, List[str]] = st.session_state.setdefault(template_sections_key(docket_id), {})
+    sections: Dict[str, List[str]] = st.session_state.setdefault(template_sections_key(docket_id, scope), {})
 
     with st.container(border=True):
         st.markdown("**Current template labels**")
@@ -3430,8 +3455,8 @@ def edit_template_mode(active: sqlite3.Row, metadata: List[dict]) -> None:
             state["labels"] = kept
             st.rerun()
 
-    _document_label_picker(docket_id, metadata, sections)
-    _submitted_sections_editor(docket_id, sections)
+    _document_label_picker(docket_id, metadata, sections, scope)
+    _submitted_sections_editor(docket_id, sections, scope)
 
     st.markdown("#### 3. Save changes")
     combined = _dedupe_labels([*state["labels"], *(label for labels in sections.values() for label in labels)])
@@ -3445,7 +3470,7 @@ def edit_template_mode(active: sqlite3.Row, metadata: List[dict]) -> None:
             st.error(str(exc), icon="🚫")
             return
         st.session_state.pop(state_key, None)
-        st.session_state.pop(template_sections_key(docket_id), None)
+        st.session_state.pop(template_sections_key(docket_id, scope), None)
         queue_flash("success", "Template updated. Main Metadata was not changed.")
         st.rerun()
     with delete_col.popover("Delete template", **stretch()):
@@ -3456,7 +3481,7 @@ def edit_template_mode(active: sqlite3.Row, metadata: List[dict]) -> None:
         if st.button("Delete permanently", type="primary", disabled=not st.session_state.get(confirm_key, False), **stretch()):
             delete_template(docket_id, template_id)
             st.session_state.pop(state_key, None)
-            st.session_state.pop(template_sections_key(docket_id), None)
+            st.session_state.pop(template_sections_key(docket_id, scope), None)
             queue_flash("success", f"Template “{template['name']}” deleted.")
             st.rerun()
 
@@ -3475,14 +3500,27 @@ def apply_template_mode(active: sqlite3.Row, metadata: List[dict]) -> None:
         st.info("No saved templates yet. Create one first.")
         return
     names = [row["name"] for row in templates]
-    pending = st.session_state.pop("org_template_pending", None)
-    index = names.index(pending) if pending in names else 0
-    selected = st.selectbox("Saved template", names, index=index, key=f"template_apply_pick_{docket_id}")
+    apply_pick_key = f"template_apply_pick_{docket_id}"
+    selected = st.selectbox("Saved template", names, key=apply_pick_key)
     template = next(row for row in templates if row["name"] == selected)
     template_id = template["id"]
-    template_labels: List[str] = json.loads(template["labels_json"])
+    template_labels = json.loads(template["labels_json"])
 
-    labels = unique_labels(metadata)
+    document_names = sorted({record["document_name"] for record in metadata}, key=str.casefold)
+    chosen_documents = st.multiselect(
+        "Newly extracted document(s) to compare against this template",
+        document_names,
+        default=document_names,
+        key=f"template_apply_docs_{docket_id}_{template_id}",
+        help="Only labels from the selected documents are compared below. "
+             "Approved mappings still apply to every matching occurrence in Main Metadata.",
+    )
+    scoped_metadata = [record for record in metadata if record["document_name"] in chosen_documents]
+    if not chosen_documents:
+        st.info("Select at least one document to compare its labels against this template.")
+        return
+
+    labels = unique_labels(scoped_metadata)
     current = approved_mappings(docket_id, template_id)
     details = mapping_details(docket_id, template_id)
     rejected = rejected_suggestions(docket_id, template_id)
@@ -3597,9 +3635,6 @@ def page_organize(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> 
         st.info("Process documents first. The Main Metadata File will appear here after extraction.")
         return
     st.metric("Unique extracted labels", len(unique_labels(metadata)))
-    pending_mode = st.session_state.pop("org_mode_pending", None)
-    if pending_mode is not None:
-        st.session_state["org_mode"] = pending_mode
     mode = st.radio(
         "Operation",
         ["Create new template", "Edit existing template", "Apply existing template"],
@@ -3612,8 +3647,6 @@ def page_organize(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> 
         edit_template_mode(active, metadata)
     else:
         apply_template_mode(active, metadata)
-
-
 def page_viewer(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
     page_header(
         "Viewer",
@@ -3770,7 +3803,6 @@ def page_validation(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -
         hide_index=True, **stretch(),
     )
 
-
 def page_export(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
     page_header("Export", "Download the unchanged Main Metadata File or a mapped Client Template "
                           "without additional AI processing.",
@@ -3794,7 +3826,7 @@ def page_export(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
             st.warning("No approved mapping for: " + ", ".join(missing), icon="⚠️")
         selected_format = st.selectbox("Format", formats, key=f"{prefix}_format")
         cache_key = f"{prefix}_export_cache"
-        if         st.button("Export", type="primary", key=f"{prefix}_build", **stretch()):
+        if st.button("Export", type="primary", key=f"{prefix}_build", **stretch()):
             try:
                 if selected_format == "JSON":
                     data, count = build_metadata_export(records, title)
@@ -3839,6 +3871,113 @@ def page_export(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
             template_names = [row["name"] for row in templates]
             selected_name = st.selectbox("Client template", template_names, key="export_template_choice")
             selected_template = next(row for row in templates if row["name"] == selected_name)
+            template_id = selected_template["id"]
+            # Cache is per-format but not per-template; clear it whenever the user
+            # switches to a different template so Download cannot serve stale bytes.
+            if st.session_state.get("export_active_template_id") != template_id:
+                st.session_state.pop("client_template_export_cache", None)
+                st.session_state["export_active_template_id"] = template_id
+
+            template_labels = json.loads(selected_template["labels_json"])
+            extracted_labels = unique_labels(main_records)
+            current_mappings = approved_mappings(active["id"], template_id)
+            rejected = rejected_suggestions(active["id"], template_id)
+            exact_matches: list[tuple[str, str]] = []
+            manual_overrides: list[tuple[str, str]] = []
+            suggested_matches: list[tuple[str, list[dict[str, Any]]]] = []
+            unmatched_labels: list[str] = []
+
+            for source in extracted_labels:
+                exact = exact_template_label(source, template_labels)
+                existing_mapping = current_mappings.get(source)
+
+                # A human decision always wins over the exact-match rule and must
+                # be shown as an override — otherwise the display contradicts the
+                # actual export, which reads label_mappings verbatim.
+                if existing_mapping and existing_mapping in template_labels:
+                    if exact and existing_mapping == exact:
+                        exact_matches.append((source, exact))
+                    else:
+                        manual_overrides.append((source, existing_mapping))
+                    continue
+
+                if exact:
+                    save_mapping(active["id"], template_id, source, exact, "exact")
+                    exact_matches.append((source, exact))
+                    continue
+
+                matches = [
+                    match for match in fuzzy_suggestions(source, template_labels, limit=3, min_score=70)
+                    if (source, match["label"]) not in rejected
+                ]
+                if matches:
+                    suggested_matches.append((source, matches))
+                else:
+                    unmatched_labels.append(source)
+
+            with st.container(border=True):
+                st.markdown("**Template label matching**")
+                st.caption(
+                    "Matching runs only for this saved template during export. "
+                    "Exact matches are automatic; fuzzy matches require approval; "
+                    "human overrides are never silently replaced."
+                )
+                if exact_matches:
+                    st.markdown("**Exact matches**")
+                    for source, target in exact_matches:
+                        st.success(f"`{source}` → `{target}`", icon="✅")
+                if manual_overrides:
+                    st.markdown("**Manually mapped (override)**")
+                    for source, target in manual_overrides:
+                        st.info(f"`{source}` → `{target}` · human override preserved", icon="ℹ️")
+                if suggested_matches:
+                    st.markdown("**Suggested matches · 70%+ similarity**")
+                    for source, matches in suggested_matches:
+                        st.markdown(f"**{source}**")
+                        for match in matches:
+                            target = match["label"]
+                            pair_id = key_id(f"{source}\u241f{target}")
+                            accept_col, reject_col, score_col = st.columns(
+                                [1, 1, 3], vertical_alignment="center"
+                            )
+                            with accept_col:
+                                if st.button(
+                                    "Accept",
+                                    key=f"export_accept_{active['id']}_{template_id}_{pair_id}",
+                                    width="stretch",
+                                ):
+                                    save_mapping(active["id"], template_id, source, target, "user-approved")
+                                    st.rerun()
+                            with reject_col:
+                                if st.button(
+                                    "Reject",
+                                    key=f"export_reject_{active['id']}_{template_id}_{pair_id}",
+                                    width="stretch",
+                                ):
+                                    # Reject must also undo a previous approval of the
+                                    # same pair, matching apply_template_mode exactly.
+                                    reject_suggestion(active["id"], template_id, source, target)
+                                    delete_mapping(active["id"], template_id, source, target)
+                                    st.rerun()
+                            with score_col:
+                                st.caption(f"`{target}` · {match['score']:.0f}%")
+                if unmatched_labels:
+                    st.markdown("**Unmatched labels**")
+                    for source in unmatched_labels:
+                        manual_key = f"export_manual_{active['id']}_{template_id}_{key_id(source)}"
+                        target = st.selectbox(
+                            f"Manual mapping for {source}",
+                            ["Do not map"] + template_labels,
+                            key=manual_key,
+                        )
+                        if target != "Do not map" and st.button(
+                            "Save manual mapping",
+                            key=f"{manual_key}_save",
+                        ):
+                            save_mapping(active["id"], template_id, source, target, "manual")
+                            st.rerun()
+                if not (exact_matches or manual_overrides or suggested_matches or unmatched_labels):
+                    st.caption("All extracted labels are mapped.")
             client_records, missing = client_template_records(active["id"], selected_template)
             export_panel(
                 "Client Template",
@@ -3848,7 +3987,533 @@ def page_export(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
         else:
             st.markdown("**Client Template**")
             st.info("Create and save a client template in Organize before exporting.")
+    page_header("Export", "Download the unchanged Main Metadata File or a mapped Client Template "
+                          "without additional AI processing.",
+                active["name"] if active else None)
+    if not need_docket(active):
+        return
+    if active["fact_count"] == 0:
+        empty_state("Nothing to export yet", "Process documents in the Workspace to extract facts first.")
+        return
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    slug = to_concept(active["name"]) or "docket"
 
+    formats = ["JSON", "PSV", "XLSX"]
+    mime_by_format = {"JSON": "application/json", "PSV": "text/plain; charset=utf-8", "XLSX": XLSX_MIME}
+
+    def export_panel(title: str, caption: str, records: List[dict], missing: List[str],
+                     prefix: str) -> None:
+        st.markdown(f"**{title}**")
+        st.caption(caption)
+        if missing:
+            st.warning("No approved mapping for: " + ", ".join(missing), icon="⚠️")
+        selected_format = st.selectbox("Format", formats, key=f"{prefix}_format")
+        cache_key = f"{prefix}_export_cache"
+        if st.button("Export", type="primary", key=f"{prefix}_build", **stretch()):
+            try:
+                if selected_format == "JSON":
+                    data, count = build_metadata_export(records, title)
+                    extension = "json"
+                elif selected_format == "PSV":
+                    data, count = build_metadata_psv(records, title)
+                    extension = "psv"
+                else:
+                    data, count = build_metadata_xlsx(records, title)
+                    extension = "xlsx"
+            except ExportError as exc:
+                st.session_state.pop(cache_key, None)
+                st.error(f"{title} export blocked: {exc}", icon="🚫")
+                return
+            except Exception as exc:  # noqa: BLE001
+                LOG.exception("export failed")
+                st.session_state.pop(cache_key, None)
+                st.error(f"{title} export failed: {clean_text(exc)[:200]}", icon="🚫")
+                return
+            st.session_state[cache_key] = {
+                "format": selected_format, "data": data, "count": count, "extension": extension,
+            }
+        cached = st.session_state.get(cache_key)
+        if cached and cached["format"] == selected_format:
+            st.success(f"Integrity verified · {cached['count']} row(s) · {fmt_size(len(cached['data']))}", icon="✅")
+            st.download_button(
+                "Download export", cached["data"],
+                file_name=f"parchai-{slug}-{prefix}-{stamp}.{cached['extension']}",
+                mime=mime_by_format[selected_format], key=f"{prefix}_download", **stretch(),
+            )
+
+    main_records = metadata_records(active["id"])
+    templates = list_templates(active["id"])
+    with st.container(border=True):
+        export_panel(
+            "Main Metadata",
+            "The unchanged exhaustive four-field ledger: document_name, label, value and confidence_score.",
+            main_records, [], "main_metadata",
+        )
+    with st.container(border=True):
+        if templates:
+            template_names = [row["name"] for row in templates]
+            selected_name = st.selectbox("Client template", template_names, key="export_template_choice")
+            selected_template = next(row for row in templates if row["name"] == selected_name)
+            template_id = selected_template["id"]
+            # Cache is per-format but not per-template; clear it whenever the user
+            # switches to a different template so Download cannot serve stale bytes.
+            if st.session_state.get("export_active_template_id") != template_id:
+                st.session_state.pop("client_template_export_cache", None)
+                st.session_state["export_active_template_id"] = template_id
+
+            template_labels = json.loads(selected_template["labels_json"])
+            extracted_labels = unique_labels(main_records)
+            current_mappings = approved_mappings(active["id"], template_id)
+            rejected = rejected_suggestions(active["id"], template_id)
+            exact_matches: list[tuple[str, str]] = []
+            manual_overrides: list[tuple[str, str]] = []
+            suggested_matches: list[tuple[str, list[dict[str, Any]]]] = []
+            unmatched_labels: list[str] = []
+
+            for source in extracted_labels:
+                exact = exact_template_label(source, template_labels)
+                existing_mapping = current_mappings.get(source)
+
+                # A human decision always wins over the exact-match rule and must
+                # be shown as an override — otherwise the display contradicts the
+                # actual export, which reads label_mappings verbatim.
+                if existing_mapping and existing_mapping in template_labels:
+                    if exact and existing_mapping == exact:
+                        exact_matches.append((source, exact))
+                    else:
+                        manual_overrides.append((source, existing_mapping))
+                    continue
+
+                if exact:
+                    save_mapping(active["id"], template_id, source, exact, "exact")
+                    exact_matches.append((source, exact))
+                    continue
+
+                matches = [
+                    match for match in fuzzy_suggestions(source, template_labels, limit=3, min_score=70)
+                    if (source, match["label"]) not in rejected
+                ]
+                if matches:
+                    suggested_matches.append((source, matches))
+                else:
+                    unmatched_labels.append(source)
+
+            with st.container(border=True):
+                st.markdown("**Template label matching**")
+                st.caption(
+                    "Matching runs only for this saved template during export. "
+                    "Exact matches are automatic; fuzzy matches require approval; "
+                    "human overrides are never silently replaced."
+                )
+                if exact_matches:
+                    st.markdown("**Exact matches**")
+                    for source, target in exact_matches:
+                        st.success(f"`{source}` → `{target}`", icon="✅")
+                if manual_overrides:
+                    st.markdown("**Manually mapped (override)**")
+                    for source, target in manual_overrides:
+                        st.info(f"`{source}` → `{target}` · human override preserved", icon="ℹ️")
+                if suggested_matches:
+                    st.markdown("**Suggested matches · 70%+ similarity**")
+                    for source, matches in suggested_matches:
+                        st.markdown(f"**{source}**")
+                        for match in matches:
+                            target = match["label"]
+                            pair_id = key_id(f"{source}\u241f{target}")
+                            accept_col, reject_col, score_col = st.columns(
+                                [1, 1, 3], vertical_alignment="center"
+                            )
+                            with accept_col:
+                                if st.button(
+                                    "Accept",
+                                    key=f"export_accept_{active['id']}_{template_id}_{pair_id}",
+                                    width="stretch",
+                                ):
+                                    save_mapping(active["id"], template_id, source, target, "user-approved")
+                                    st.rerun()
+                            with reject_col:
+                                if st.button(
+                                    "Reject",
+                                    key=f"export_reject_{active['id']}_{template_id}_{pair_id}",
+                                    width="stretch",
+                                ):
+                                    # Reject must also undo a previous approval of the
+                                    # same pair, matching apply_template_mode exactly.
+                                    reject_suggestion(active["id"], template_id, source, target)
+                                    delete_mapping(active["id"], template_id, source, target)
+                                    st.rerun()
+                            with score_col:
+                                st.caption(f"`{target}` · {match['score']:.0f}%")
+                if unmatched_labels:
+                    st.markdown("**Unmatched labels**")
+                    for source in unmatched_labels:
+                        manual_key = f"export_manual_{active['id']}_{template_id}_{key_id(source)}"
+                        target = st.selectbox(
+                            f"Manual mapping for {source}",
+                            ["Do not map"] + template_labels,
+                            key=manual_key,
+                        )
+                        if target != "Do not map" and st.button(
+                            "Save manual mapping",
+                            key=f"{manual_key}_save",
+                        ):
+                            save_mapping(active["id"], template_id, source, target, "manual")
+                            st.rerun()
+                if not (exact_matches or manual_overrides or suggested_matches or unmatched_labels):
+                    st.caption("All extracted labels are mapped.")
+            client_records, missing = client_template_records(active["id"], selected_template)
+            export_panel(
+                "Client Template",
+                "Mapped records only; duplicate and conflicting values remain separate and labels retain exact template spelling.",
+                client_records, missing, "client_template",
+            )
+        else:
+            st.markdown("**Client Template**")
+            st.info("Create and save a client template in Organize before exporting.")
+    page_header("Export", "Download the unchanged Main Metadata File or a mapped Client Template "
+                          "without additional AI processing.",
+                active["name"] if active else None)
+    if not need_docket(active):
+        return
+    if active["fact_count"] == 0:
+        empty_state("Nothing to export yet", "Process documents in the Workspace to extract facts first.")
+        return
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    slug = to_concept(active["name"]) or "docket"
+
+    formats = ["JSON", "PSV", "XLSX"]
+    mime_by_format = {"JSON": "application/json", "PSV": "text/plain; charset=utf-8", "XLSX": XLSX_MIME}
+
+    def export_panel(title: str, caption: str, records: List[dict], missing: List[str],
+                     prefix: str) -> None:
+        st.markdown(f"**{title}**")
+        st.caption(caption)
+        if missing:
+            st.warning("No approved mapping for: " + ", ".join(missing), icon="⚠️")
+        selected_format = st.selectbox("Format", formats, key=f"{prefix}_format")
+        cache_key = f"{prefix}_export_cache"
+        if st.button("Export", type="primary", key=f"{prefix}_build", **stretch()):
+            try:
+                if selected_format == "JSON":
+                    data, count = build_metadata_export(records, title)
+                    extension = "json"
+                elif selected_format == "PSV":
+                    data, count = build_metadata_psv(records, title)
+                    extension = "psv"
+                else:
+                    data, count = build_metadata_xlsx(records, title)
+                    extension = "xlsx"
+            except ExportError as exc:
+                st.session_state.pop(cache_key, None)
+                st.error(f"{title} export blocked: {exc}", icon="🚫")
+                return
+            except Exception as exc:  # noqa: BLE001
+                LOG.exception("export failed")
+                st.session_state.pop(cache_key, None)
+                st.error(f"{title} export failed: {clean_text(exc)[:200]}", icon="🚫")
+                return
+            st.session_state[cache_key] = {
+                "format": selected_format, "data": data, "count": count, "extension": extension,
+            }
+        cached = st.session_state.get(cache_key)
+        if cached and cached["format"] == selected_format:
+            st.success(f"Integrity verified · {cached['count']} row(s) · {fmt_size(len(cached['data']))}", icon="✅")
+            st.download_button(
+                "Download export", cached["data"],
+                file_name=f"parchai-{slug}-{prefix}-{stamp}.{cached['extension']}",
+                mime=mime_by_format[selected_format], key=f"{prefix}_download", **stretch(),
+            )
+
+    main_records = metadata_records(active["id"])
+    templates = list_templates(active["id"])
+    with st.container(border=True):
+        export_panel(
+            "Main Metadata",
+            "The unchanged exhaustive four-field ledger: document_name, label, value and confidence_score.",
+            main_records, [], "main_metadata",
+        )
+    with st.container(border=True):
+        if templates:
+            template_names = [row["name"] for row in templates]
+            selected_name = st.selectbox("Client template", template_names, key="export_template_choice")
+            selected_template = next(row for row in templates if row["name"] == selected_name)
+            template_id = selected_template["id"]
+            # Cache must not leak between templates: the previous template's bytes
+            # would otherwise sit under the current template's download button.
+            if st.session_state.get("export_active_template_id") != template_id:
+                st.session_state.pop("client_template_export_cache", None)
+                st.session_state["export_active_template_id"] = template_id
+
+            template_labels = json.loads(selected_template["labels_json"])
+            extracted_labels = unique_labels(main_records)
+            current_mappings = approved_mappings(active["id"], template_id)
+            rejected = rejected_suggestions(active["id"], template_id)
+            exact_matches: list[tuple[str, str]] = []
+            manual_overrides: list[tuple[str, str]] = []
+            suggested_matches: list[tuple[str, list[dict[str, Any]]]] = []
+            unmatched_labels: list[str] = []
+
+            for source in extracted_labels:
+                exact = exact_template_label(source, template_labels)
+                existing_mapping = current_mappings.get(source)
+
+                # A human-approved mapping to a label that still exists wins over
+                # the exact-match rule, and is shown as an override instead of being
+                # silently relabelled as "exact".
+                if existing_mapping and existing_mapping in template_labels:
+                    if exact and existing_mapping == exact:
+                        exact_matches.append((source, exact))
+                    else:
+                        manual_overrides.append((source, existing_mapping))
+                    continue
+
+                if exact:
+                    # No prior mapping (or it pointed at a template label that no
+                    # longer exists): record the exact match idempotently.
+                    save_mapping(active["id"], template_id, source, exact, "exact")
+                    exact_matches.append((source, exact))
+                    continue
+
+                matches = [
+                    match for match in fuzzy_suggestions(source, template_labels, limit=3, min_score=70)
+                    if (source, match["label"]) not in rejected
+                ]
+                if matches:
+                    suggested_matches.append((source, matches))
+                else:
+                    unmatched_labels.append(source)
+
+            with st.container(border=True):
+                st.markdown("**Template label matching**")
+                st.caption(
+                    "Matching runs only for this saved template during export. "
+                    "Exact matches are automatic; fuzzy matches require approval; "
+                    "human overrides are never silently replaced."
+                )
+                if exact_matches:
+                    st.markdown("**Exact matches**")
+                    for source, target in exact_matches:
+                        st.success(f"`{source}` → `{target}`", icon="✅")
+                if manual_overrides:
+                    st.markdown("**Manually mapped (override)**")
+                    for source, target in manual_overrides:
+                        st.info(f"`{source}` → `{target}` · human override preserved", icon="ℹ️")
+                if suggested_matches:
+                    st.markdown("**Suggested matches · 70%+ similarity**")
+                    for source, matches in suggested_matches:
+                        st.markdown(f"**{source}**")
+                        for match in matches:
+                            target = match["label"]
+                            pair_id = key_id(f"{source}\u241f{target}")
+                            accept_col, reject_col, score_col = st.columns(
+                                [1, 1, 3], vertical_alignment="center"
+                            )
+                            with accept_col:
+                                if st.button(
+                                    "Accept",
+                                    key=f"export_accept_{active['id']}_{template_id}_{pair_id}",
+                                    width="stretch",
+                                ):
+                                    save_mapping(active["id"], template_id, source, target, "user-approved")
+                                    st.rerun()
+                            with reject_col:
+                                if st.button(
+                                    "Reject",
+                                    key=f"export_reject_{active['id']}_{template_id}_{pair_id}",
+                                    width="stretch",
+                                ):
+                                    # Reject must also undo a previously approved pair,
+                                    # matching the Apply page's behaviour exactly.
+                                    reject_suggestion(active["id"], template_id, source, target)
+                                    delete_mapping(active["id"], template_id, source, target)
+                                    st.rerun()
+                            with score_col:
+                                st.caption(f"`{target}` · {match['score']:.0f}%")
+                if unmatched_labels:
+                    st.markdown("**Unmatched labels**")
+                    for source in unmatched_labels:
+                        manual_key = f"export_manual_{active['id']}_{template_id}_{key_id(source)}"
+                        target = st.selectbox(
+                            f"Manual mapping for {source}",
+                            ["Do not map"] + template_labels,
+                            key=manual_key,
+                        )
+                        if target != "Do not map" and st.button(
+                            "Save manual mapping",
+                            key=f"{manual_key}_save",
+                        ):
+                            save_mapping(active["id"], template_id, source, target, "manual")
+                            st.rerun()
+                if not (exact_matches or manual_overrides or suggested_matches or unmatched_labels):
+                    st.caption("All extracted labels are mapped.")
+            client_records, missing = client_template_records(active["id"], selected_template)
+            export_panel(
+                "Client Template",
+                "Mapped records only; duplicate and conflicting values remain separate and labels retain exact template spelling.",
+                client_records, missing, "client_template",
+            )
+        else:
+            st.markdown("**Client Template**")
+            st.info("Create and save a client template in Organize before exporting.")
+    page_header("Export", "Download the unchanged Main Metadata File or a mapped Client Template "
+                          "without additional AI processing.",
+                active["name"] if active else None)
+    if not need_docket(active):
+        return
+    if active["fact_count"] == 0:
+        empty_state("Nothing to export yet", "Process documents in the Workspace to extract facts first.")
+        return
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    slug = to_concept(active["name"]) or "docket"
+
+    formats = ["JSON", "PSV", "XLSX"]
+    mime_by_format = {"JSON": "application/json", "PSV": "text/plain; charset=utf-8", "XLSX": XLSX_MIME}
+
+    def export_panel(title: str, caption: str, records: List[dict], missing: List[str],
+                     prefix: str) -> None:
+        st.markdown(f"**{title}**")
+        st.caption(caption)
+        if missing:
+            st.warning("No approved mapping for: " + ", ".join(missing), icon="⚠️")
+        selected_format = st.selectbox("Format", formats, key=f"{prefix}_format")
+        cache_key = f"{prefix}_export_cache"
+        if st.button("Export", type="primary", key=f"{prefix}_build", **stretch()):
+            try:
+                if selected_format == "JSON":
+                    data, count = build_metadata_export(records, title)
+                    extension = "json"
+                elif selected_format == "PSV":
+                    data, count = build_metadata_psv(records, title)
+                    extension = "psv"
+                else:
+                    data, count = build_metadata_xlsx(records, title)
+                    extension = "xlsx"
+            except ExportError as exc:
+                st.session_state.pop(cache_key, None)
+                st.error(f"{title} export blocked: {exc}", icon="🚫")
+                return
+            except Exception as exc:  # noqa: BLE001
+                LOG.exception("export failed")
+                st.session_state.pop(cache_key, None)
+                st.error(f"{title} export failed: {clean_text(exc)[:200]}", icon="🚫")
+                return
+            st.session_state[cache_key] = {
+                "format": selected_format, "data": data, "count": count, "extension": extension,
+            }
+        cached = st.session_state.get(cache_key)
+        if cached and cached["format"] == selected_format:
+            st.success(f"Integrity verified · {cached['count']} row(s) · {fmt_size(len(cached['data']))}", icon="✅")
+            st.download_button(
+                "Download export", cached["data"],
+                file_name=f"parchai-{slug}-{prefix}-{stamp}.{cached['extension']}",
+                mime=mime_by_format[selected_format], key=f"{prefix}_download", **stretch(),
+            )
+
+    main_records = metadata_records(active["id"])
+    templates = list_templates(active["id"])
+    with st.container(border=True):
+        export_panel(
+            "Main Metadata",
+            "The unchanged exhaustive four-field ledger: document_name, label, value and confidence_score.",
+            main_records, [], "main_metadata",
+        )
+    with st.container(border=True):
+        if templates:
+            template_names = [row["name"] for row in templates]
+            selected_name = st.selectbox("Client template", template_names, key="export_template_choice")
+            selected_template = next(row for row in templates if row["name"] == selected_name)
+            template_id = selected_template["id"]
+            template_labels = json.loads(selected_template["labels_json"])
+            extracted_labels = unique_labels(main_records)
+            current_mappings = approved_mappings(active["id"], template_id)
+            rejected = rejected_suggestions(active["id"], template_id)
+            exact_matches: list[tuple[str, str]] = []
+            suggested_matches: list[tuple[str, list[dict[str, Any]]]] = []
+            unmatched_labels: list[str] = []
+
+            for source in extracted_labels:
+                exact = exact_template_label(source, template_labels)
+                existing_mapping = current_mappings.get(source)
+                if exact:
+                    if existing_mapping is None:
+                        save_mapping(active["id"], template_id, source, exact, "exact")
+                    exact_matches.append((source, exact))
+                    continue
+                if existing_mapping and existing_mapping in template_labels:
+                    continue
+                matches = [
+                    match for match in fuzzy_suggestions(source, template_labels, limit=3, min_score=70)
+                    if (source, match["label"]) not in rejected
+                ]
+                if matches:
+                    suggested_matches.append((source, matches))
+                else:
+                    unmatched_labels.append(source)
+
+            with st.container(border=True):
+                st.markdown("**Template label matching**")
+                st.caption(
+                    "Matching runs only for this saved template during export. "
+                    "Exact matches are automatic; fuzzy matches require approval."
+                )
+                if exact_matches:
+                    st.markdown("**Exact matches**")
+                    for source, target in exact_matches:
+                        st.success(f"`{source}` → `{target}`", icon="✅")
+                if suggested_matches:
+                    st.markdown("**Suggested matches · 70%+ similarity**")
+                    for source, matches in suggested_matches:
+                        st.markdown(f"**{source}**")
+                        for match in matches:
+                            target = match["label"]
+                            pair_id = key_id(f"{source}\u241f{target}")
+                            accept_col, reject_col, score_col = st.columns(
+                                [1, 1, 3], vertical_alignment="center"
+                            )
+                            with accept_col:
+                                if st.button(
+                                    "Accept",
+                                    key=f"export_accept_{active['id']}_{template_id}_{pair_id}",
+                                    width="stretch",
+                                ):
+                                    save_mapping(active["id"], template_id, source, target, "user-approved")
+                                    st.rerun()
+                            with reject_col:
+                                if st.button(
+                                    "Reject",
+                                    key=f"export_reject_{active['id']}_{template_id}_{pair_id}",
+                                    width="stretch",
+                                ):
+                                    reject_suggestion(active["id"], template_id, source, target)
+                                    st.rerun()
+                            with score_col:
+                                st.caption(f"`{target}` · {match['score']:.0f}%")
+                if unmatched_labels:
+                    st.markdown("**Unmatched labels**")
+                    for source in unmatched_labels:
+                        manual_key = f"export_manual_{active['id']}_{template_id}_{key_id(source)}"
+                        target = st.selectbox(
+                            f"Manual mapping for {source}",
+                            ["Do not map"] + template_labels,
+                            key=manual_key,
+                        )
+                        if target != "Do not map" and st.button(
+                            "Save manual mapping",
+                            key=f"{manual_key}_save",
+                        ):
+                            save_mapping(active["id"], template_id, source, target, "manual")
+                            st.rerun()
+                if not exact_matches and not suggested_matches and not unmatched_labels:
+                    st.caption("All extracted labels are mapped.")
+            client_records, missing = client_template_records(active["id"], selected_template)
+            export_panel(
+                "Client Template",
+                "Mapped records only; duplicate and conflicting values remain separate and labels retain exact template spelling.",
+                client_records, missing, "client_template",
+            )
+        else:
+            st.markdown("**Client Template**")
+            st.info("Create and save a client template in Organize before exporting.")
 
 def page_settings(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
     page_header("Settings", "Gemini key pool, model fallback, storage and integrity checks.", None)
