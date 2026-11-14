@@ -3194,6 +3194,8 @@ def page_organize(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> 
                 all_selected_labels,
                 template_id=existing["id"] if existing else None,
             )
+            saved_sections_key = f"template_sections_{active['id']}_{name.strip()}"
+            st.session_state[saved_sections_key] = dict(submitted_sections)
             st.session_state["organize_template_pending_select"] = name.strip()
             st.success("Template saved.", icon="✅")
             st.rerun()
