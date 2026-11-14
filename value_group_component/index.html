@@ -1,0 +1,157 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<script src="sortable.min.js"></script>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font: 13px/1.4 system-ui, -apple-system, Segoe UI, sans-serif; color: #e5e7eb; background: transparent; }
+  h4 { margin: 12px 0 6px; font-size: 13px; font-weight: 600; color: #cbd5e1; }
+  .doc { border: 1px solid #374151; border-radius: 10px; padding: 8px; margin-bottom: 8px; }
+  .doc-title { font-size: 12px; color: #9ca3af; margin-bottom: 6px; overflow-wrap: anywhere; }
+  .zone { display: flex; flex-wrap: wrap; gap: 6px; min-height: 40px; align-items: flex-start;
+          border: 1px dashed #4b5563; border-radius: 10px; padding: 6px; }
+  .zone.draft { border-color: #f59e0b; background: rgba(245, 158, 11, 0.06); min-height: 56px; }
+  .zone.drag-target { border-color: #818cf8; background: rgba(129, 140, 248, 0.10); }
+  .pill { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; box-sizing: border-box;
+          border: 1px solid #6366f1; border-radius: 999px; padding: 4px 10px; background: #1f2937;
+          cursor: grab; user-select: none; }
+  .pill .lbl { font-weight: 600; white-space: nowrap; }
+  .pill .val { color: #9ca3af; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 240px; }
+  .pill .score { font-size: 11px; color: #a5b4fc; white-space: nowrap; }
+  .draft .pill { border-color: #f59e0b; }
+  .sortable-ghost { opacity: 0.35; }
+  .empty { color: #6b7280; font-size: 12px; padding: 4px 2px; }
+  .group { margin-bottom: 6px; }
+  .group summary { list-style: none; cursor: pointer; display: inline-block; max-width: 100%;
+                   border-radius: 999px; padding: 6px 12px; color: #fff; font-weight: 600; }
+  .group summary::-webkit-details-marker { display: none; }
+  .members { margin: 6px 0 4px 4px; display: grid; gap: 4px; }
+  .member { border-left: 3px solid #6b7280; padding: 4px 8px; background: #111827; border-radius: 6px; overflow-wrap: anywhere; }
+  .member small { color: #9ca3af; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+(function () {
+  // Draft = the records dragged into Group Values. It lives here, in the component, so it
+  // survives Streamlit reruns. Python receives the full snapshot after every drop.
+  let draft = [];
+  let lastReset = null;
+  let lastSent = null;
+
+  function send(type, data) {
+    window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data), "*");
+  }
+  function setHeight() {
+    send("streamlit:setFrameHeight", { height: document.documentElement.scrollHeight });
+  }
+  function el(tag, cls, text) {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined) node.textContent = text;   // textContent: never interpret labels as HTML
+    return node;
+  }
+  function pill(item) {
+    const p = el("div", "pill");
+    p.dataset.id = item.id;
+    p.title = item.document + " · " + item.label + " · " + item.value;
+    p.appendChild(el("span", "lbl", item.label));
+    p.appendChild(el("span", "val", item.value));
+    p.appendChild(el("span", "score", item.score + "%"));
+    return p;
+  }
+  function colour(id) {
+    let hue = 0;
+    for (const ch of id) hue = (hue * 31 + ch.charCodeAt(0)) % 360;
+    return "hsl(" + hue + " 55% 32%)";
+  }
+  function emit() {
+    const ids = [...document.querySelectorAll("#draft .pill")].map(p => p.dataset.id);
+    draft = ids;
+    const key = JSON.stringify(ids);
+    if (key === lastSent) return;
+    lastSent = key;
+    send("streamlit:setComponentValue", { value: { draft: ids }, dataType: "json" });
+  }
+  function sortable(node) {
+    new Sortable(node, {
+      group: "value-groups",
+      draggable: ".pill",
+      animation: 150,
+      ghostClass: "sortable-ghost",
+      onStart: () => document.querySelectorAll(".zone").forEach(z => z.classList.add("drag-target")),
+      onEnd: () => {
+        document.querySelectorAll(".zone").forEach(z => z.classList.remove("drag-target"));
+        emit();
+      },
+    });
+  }
+
+  function render(args) {
+    const root = document.getElementById("root");
+    root.textContent = "";
+    const docs = args.documents || {};
+    const all = {};
+    Object.values(docs).forEach(list => list.forEach(item => { all[item.id] = item; }));
+
+    // A save bumps `reset`, which clears the draft. Otherwise drop records that were grouped
+    // elsewhere, so the draft can never hold a record that is no longer ungrouped.
+    if (args.reset !== lastReset) { lastReset = args.reset; draft = []; }
+    draft = draft.filter(id => all[id]);
+
+    root.appendChild(el("h4", null, "Documents"));
+    const names = Object.keys(docs).sort((a, b) => a.localeCompare(b));
+    if (names.length === 0) root.appendChild(el("div", "empty", "No ungrouped records. Everything is in a group."));
+    names.forEach(name => {
+      const box = el("div", "doc");
+      box.appendChild(el("div", "doc-title", name));
+      const zone = el("div", "zone");
+      docs[name].forEach(item => { if (!draft.includes(item.id)) zone.appendChild(pill(item)); });
+      if (!zone.children.length) zone.appendChild(el("div", "empty", "All records here are grouped or in Group Values."));
+      box.appendChild(zone);
+      root.appendChild(box);
+      sortable(zone);
+    });
+
+    root.appendChild(el("h4", null, "Group Values"));
+    const drop = el("div", "zone draft");
+    drop.id = "draft";
+    draft.forEach(id => drop.appendChild(pill(all[id])));
+    if (!draft.length) drop.appendChild(el("div", "empty", "Drag records from any document here."));
+    root.appendChild(drop);
+    sortable(drop);
+
+    root.appendChild(el("h4", null, "Grouped Values"));
+    const groups = args.groups || [];
+    if (!groups.length) root.appendChild(el("div", "empty", "No saved groups yet."));
+    groups.forEach(group => {
+      const details = el("details", "group");
+      const summary = el("summary", null, group.name + "  ·  primary: " + (group.primary || "—"));
+      summary.style.background = colour(group.id);
+      details.appendChild(summary);
+      const list = el("div", "members");
+      group.members.forEach(m => {
+        const row = el("div", "member");
+        row.appendChild(el("div", null, m.label + "  =  " + m.value));
+        row.appendChild(el("small", null, m.document + "  ·  confidence " + m.score + "%"));
+        list.appendChild(row);
+      });
+      details.appendChild(list);
+      root.appendChild(details);
+    });
+    setHeight();
+  }
+
+  window.addEventListener("message", event => {
+    const msg = event.data;
+    if (!msg || msg.type !== "streamlit:render") return;
+    render(msg.args || {});
+  });
+  window.addEventListener("load", setHeight);
+  send("streamlit:componentReady", { apiVersion: 1 });
+})();
+</script>
+</body>
+</html>

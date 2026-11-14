@@ -2843,6 +2843,8 @@ def build_metadata_xlsx(records: List[dict], description: str) -> Tuple[bytes, i
 
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+METADATA_FIELDS = ("document_name", "label", "value", "confidence_score")
+METADATA_HEADERS = ["Document Name", "Label", "Value", "Confidence Score"]
 
 # ---------------------------------------------------------------- styling
 def inject_css() -> None:
@@ -3454,19 +3456,8 @@ def normalize_label(label: Any) -> str:
     return str(label or "").strip().casefold()
 
 
-def exact_template_label(source_label: str, requested_labels: Iterable[str]) -> Optional[str]:
-    """The template label equal to `source_label` ignoring case and leading/trailing
-    whitespace, else None."""
-    normalized = normalize_label(source_label)
-    return next(
-        (str(label) for label in requested_labels if normalize_label(label) == normalized),
-        None,
-    )
-
-
 def unique_labels(records: Iterable[Any]) -> List[str]:
-    """Every distinct label in first-seen order, original spelling preserved.
-    Each result is one unique label - not one extracted value."""
+    """Every distinct label in first-seen order, original spelling preserved."""
     seen: set = set()
     labels: List[str] = []
     for record in records:
@@ -3479,8 +3470,26 @@ def unique_labels(records: Iterable[Any]) -> List[str]:
     return labels
 
 
+def exact_template_label(source_label: str, requested_labels: Iterable[str]) -> Optional[str]:
+    """The template label equal to `source_label` ignoring case and surrounding whitespace."""
+    normalized = normalize_label(source_label)
+    return next(
+        (str(label) for label in requested_labels if normalize_label(label) == normalized),
+        None,
+    )
+
+
+def documents_by_label(records: Iterable[Any]) -> Dict[str, List[str]]:
+    """Map each normalized label to the sorted document names where it appears."""
+    found: Dict[str, set] = {}
+    for record in records:
+        normalized = normalize_label(record["label"])
+        if normalized:
+            found.setdefault(normalized, set()).add(record["document_name"])
+    return {key: sorted(names, key=str.casefold) for key, names in found.items()}
+
 def _dedupe_labels(labels: Iterable[str]) -> List[str]:
-    """Collapse repeats of the same label (any casing/spacing) to the first spelling."""
+    """Collapse repeats of the same label (any casing or spacing) to the first spelling."""
     seen: set = set()
     out: List[str] = []
     for label in labels:
@@ -3490,7 +3499,6 @@ def _dedupe_labels(labels: Iterable[str]) -> List[str]:
             seen.add(normalized)
             out.append(clean)
     return out
-
 
 def fuzzy_suggestions(
     source: str, candidates: List[str], min_score: int = FUZZY_MIN_SCORE, limit: int = 5
@@ -3583,37 +3591,42 @@ def _render_create(active: sqlite3.Row, metadata: List[dict]) -> None:
 
 
 def _render_apply(active: sqlite3.Row, metadata: List[dict]) -> None:
-    """Apply a saved template. Exact matches are saved automatically, fuzzy suggestions
-    need an explicit approval, unmatched labels are mapped or added by the user."""
+    """Apply a saved template. Tabs run in this order: Decided, Suggested, Unmatched."""
     docket_id = active["id"]
     templates = list_templates(docket_id)
     if not templates:
-        st.info("No saved templates yet. Create one with “New template” first.")
+        st.info("No templates yet. Create one first.")
         return
+
     pick_col, docs_col = st.columns([2, 3], vertical_alignment="bottom")
-    selected = pick_col.selectbox("Saved template", [row["name"] for row in templates],
+    selected = pick_col.selectbox("Template", [row["name"] for row in templates],
                                   key=f"org_apply_pick_{docket_id}")
     template = next(row for row in templates if row["name"] == selected)
     template_id = template["id"]
     template_labels = json.loads(template["labels_json"])
     documents = sorted({record["document_name"] for record in metadata}, key=str.casefold)
-    chosen = docs_col.multiselect("Documents to compare", documents, default=documents,
+    chosen = docs_col.multiselect("Documents", documents, default=documents,
                                   key=f"org_apply_docs_{docket_id}_{template_id}")
     if not chosen:
-        st.info("Select at least one document to compare.")
+        st.info("Select at least one document.")
         return
 
-    labels = unique_labels([record for record in metadata if record["document_name"] in chosen])
+    chosen_records = [record for record in metadata if record["document_name"] in chosen]
+    labels = unique_labels(chosen_records)
+    sources_map = documents_by_label(chosen_records)
+
+    def from_docs(source: str) -> str:
+        names = sources_map.get(normalize_label(source), [])
+        return ", ".join(names) if names else "—"
+
     current = approved_mappings(docket_id, template_id)
-    details = mapping_details(docket_id, template_id)
     rejected = rejected_suggestions(docket_id, template_id)
-    fuzzy: Dict[str, List[Dict[str, Any]]] = {}
+
+    suggested: Dict[str, List[Dict[str, Any]]] = {}
     unmatched: List[str] = []
-    exact_count = 0
     for source in labels:
         exact_target = exact_template_label(source, template_labels)
         if exact_target is not None:
-            exact_count += 1
             if source not in current:
                 save_mapping(docket_id, template_id, source, exact_target, "exact")
             continue
@@ -3622,24 +3635,54 @@ def _render_apply(active: sqlite3.Row, metadata: List[dict]) -> None:
         options = [m for m in fuzzy_suggestions(source, template_labels)
                    if (source, m["label"]) not in rejected]
         if options:
-            fuzzy[source] = options
+            suggested[source] = options
         else:
             unmatched.append(source)
 
-    st.caption(f"{len(labels)} label(s) · {exact_count} exact · {len(fuzzy)} to review · "
-               f"{len(unmatched)} unmatched · {len(details)} decided")
-    review_tab, unmatched_tab, decided_tab = st.tabs(
-        [f"To review ({len(fuzzy)})", f"Unmatched ({len(unmatched)})", f"Decided ({len(details)})"]
+    details = mapping_details(docket_id, template_id)
+
+    st.info(
+        "**How mapping works:** the left label (**source**) comes from Main Metadata, "
+        "the right label (**target**) is a field in your template. "
+        "The output file uses the target name."
     )
-    with review_tab:
-        if not fuzzy:
-            st.caption(f"No suggestions at or above {FUZZY_MIN_SCORE}% similarity.")
-        for source, options in fuzzy.items():
+
+    decided_tab, suggested_tab, unmatched_tab = st.tabs([
+        f"Decided ({len(details)})",
+        f"Suggested ({sum(len(v) for v in suggested.values())})",
+        f"Unmatched ({len(unmatched)})",
+    ])
+
+    with decided_tab:
+        st.subheader("Decided")
+        if not details:
+            st.caption("No mappings yet.")
+        for source, info in sorted(details.items(), key=lambda item: item[0].casefold()):
+            text_col, unmap_col = st.columns([5, 1], vertical_alignment="center")
+            text_col.markdown(
+                f"**{source}**  →  **{info['target']}**  \n"
+                f"<small>from: {esc(from_docs(source))}</small>",
+                unsafe_allow_html=True,
+            )
+            if unmap_col.button("Unmap", key=f"tpl_unmap_{docket_id}_{template_id}_{key_id(source)}",
+                                **stretch()):
+                delete_mapping(docket_id, template_id, source, info["target"])
+                st.rerun()
+
+    with suggested_tab:
+        st.subheader("Suggested")
+        if not suggested:
+            st.caption("No suggestions.")
+        for source, options in suggested.items():
             for match in options:
                 target = match["label"]
                 pid = key_id(f"{source}\u241f{target}")
                 text_col, approve_col, reject_col = st.columns([4, 1, 1], vertical_alignment="center")
-                text_col.markdown(f"`{source}` → `{target}` · {match['score']:.0f}%")
+                text_col.markdown(
+                    f"**{source}**  →  **{target}**  ({match['score']:.0f}%)  \n"
+                    f"<small>from: {esc(from_docs(source))}</small>",
+                    unsafe_allow_html=True,
+                )
                 if approve_col.button("Approve", key=f"tpl_approve_{docket_id}_{template_id}_{pid}",
                                       **stretch()):
                     save_mapping(docket_id, template_id, source, target, "user-approved")
@@ -3649,13 +3692,16 @@ def _render_apply(active: sqlite3.Row, metadata: List[dict]) -> None:
                     reject_suggestion(docket_id, template_id, source, target)
                     delete_mapping(docket_id, template_id, source, target)
                     st.rerun()
+
     with unmatched_tab:
+        st.subheader("Unmatched")
         if not unmatched:
-            st.caption("Every label is matched, mapped or has a pending suggestion.")
+            st.caption("Nothing unmatched.")
         for source in unmatched:
             label_col, target_col, map_col, add_col = st.columns([2, 2, 1, 1.5], vertical_alignment="bottom")
-            label_col.markdown(f"`{source}`")
-            target = target_col.selectbox(f"Map “{source}” to", template_labels,
+            label_col.markdown(f"**{source}**  \n<small>from: {esc(from_docs(source))}</small>",
+                               unsafe_allow_html=True)
+            target = target_col.selectbox(f"Field for {source}", template_labels,
                                           key=f"tpl_manual_t_{docket_id}_{template_id}_{key_id(source)}",
                                           label_visibility="collapsed")
             if map_col.button("Map", key=f"tpl_manual_b_{docket_id}_{template_id}_{key_id(source)}",
@@ -3663,24 +3709,10 @@ def _render_apply(active: sqlite3.Row, metadata: List[dict]) -> None:
                 save_mapping(docket_id, template_id, source, target, "manual")
                 st.rerun()
             if add_col.button("Add as field", key=f"tpl_add_{docket_id}_{template_id}_{key_id(source)}",
-                              help="Add this label to the template; it then matches exactly.",
                               **stretch()):
                 append_template_labels(docket_id, template_id, [source])
-                queue_flash("success", f"“{source}” added to template “{template['name']}”.")
+                queue_flash("success", f"“{source}” added to {template['name']}.")
                 st.rerun()
-    with decided_tab:
-        if not details:
-            st.caption("No decisions yet. Exact matches are recorded automatically.")
-        for source, info in sorted(details.items(), key=lambda item: item[0].casefold()):
-            text_col, unmap_col = st.columns([5, 1], vertical_alignment="center")
-            method = {"exact": "exact match", "user-approved": "approved", "manual": "mapped"}.get(
-                info["method"], info["method"])
-            text_col.markdown(f"`{source}` → `{info['target']}` · {method}")
-            if unmap_col.button("Unmap", key=f"tpl_unmap_{docket_id}_{template_id}_{key_id(source)}",
-                                **stretch()):
-                delete_mapping(docket_id, template_id, source, info["target"])
-                st.rerun()
-
 
 def _render_manage(active: sqlite3.Row, metadata: List[dict]) -> None:
     """Rename a template, change its fields, or delete it."""
