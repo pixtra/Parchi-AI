@@ -1,6 +1,7 @@
 import io
 import json
 import unittest
+from unittest.mock import patch
 
 from openpyxl import load_workbook
 
@@ -25,6 +26,16 @@ class MetadataWorkflowTests(unittest.TestCase):
     def test_fuzzy_suggestions_require_rapidfuzz_threshold(self):
         self.assertTrue(suggestions("Invoice No", ["Invoice Number"], min_score=70))
         self.assertEqual(suggestions("Unrelated", ["Invoice Number"], min_score=70), [])
+
+    def test_client_export_requires_approved_mapping_and_keeps_duplicates(self):
+        template = {"labels_json": json.dumps(["Invoice Number", "Supplier Name"])}
+        with (
+            patch.object(app, "metadata_records", return_value=RECORDS),
+            patch.object(app, "approved_mappings", return_value={"Invoice Number": ["Invoice Number"]}),
+        ):
+            records, missing = app.client_template_records("docket", template)
+        self.assertEqual([record["value"] for record in records], ["INV-1", "INV-2"])
+        self.assertEqual(missing, ["Supplier Name"])
 
     def test_exports_preserve_duplicates_and_four_fields(self):
         expected_headers = ["Document Name", "Label", "Value", "Confidence Score"]
