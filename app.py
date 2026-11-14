@@ -117,9 +117,9 @@ MIME_TYPES = {
 }
 BANDS = ("Green", "Yellow", "Red")
 REVIEW_STATUSES = ("pending", "approved", "rejected")
-PAGES = ["Dockets", "Workspace", "Review", "Organize", "PSV Verify", "Validation", "Export", "Settings"]
+PAGES = ["Dockets", "Workspace", "Review", "Organize", "Viewer", "Validation", "Export", "Settings"]
 PAGE_ICONS = {
-    "Dockets": "▤", "Workspace": "⬆", "Review": "✎", "Organize": "⌘", "PSV Verify": "✓",
+    "Dockets": "▤", "Workspace": "⬆", "Review": "✎", "Organize": "⌘", "Viewer": "▣",
     "Validation": "✔", "Export": "⇩", "Settings": "⚙",
 }
 IDENTITY_CONCEPTS = {
@@ -3209,6 +3209,50 @@ def page_organize(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> 
     st.caption("Approve mappings, then use the Client Template export in the Export page.")
 
 
+def page_viewer(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
+    page_header(
+        "Viewer",
+        "View the complete Main Metadata file or an approved Client Template as a table.",
+        active["name"] if active else None,
+    )
+    if not need_docket(active):
+        return
+    metadata = metadata_records(active["id"])
+    if not metadata:
+        empty_state("No metadata available", "Process documents in the Workspace first.")
+        return
+
+    view_options = ["Main Metadata"]
+    templates = list_templates(active["id"])
+    if templates:
+        view_options.append("Client Template")
+    selected_view = st.selectbox("Table", view_options, key="viewer_table")
+
+    if selected_view == "Main Metadata":
+        rows = metadata
+        st.caption(f"All extracted records · {len(rows)} row(s), including duplicates and conflicts.")
+    else:
+        template_names = [template["name"] for template in templates]
+        selected_name = st.selectbox("Client template", template_names, key="viewer_template")
+        template = next(row for row in templates if row["name"] == selected_name)
+        rows, missing = client_template_records(active["id"], template)
+        if missing:
+            st.warning(
+                "No approved mapping for: " + ", ".join(missing),
+                icon="⚠️",
+            )
+        st.caption(
+            f"Approved mapped records only · {len(rows)} row(s), with duplicate values preserved."
+        )
+
+    st.dataframe(
+        rows,
+        hide_index=True,
+        width="stretch",
+        height=min(720, max(180, 44 + 36 * len(rows))),
+    )
+
+
 def page_psv_verify(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
     page_header("PSV verification", "Clean a pipe-separated export and verify low-confidence extractions first. "
                 "This works on any uploaded PSV file and is independent of the active docket.", None)
@@ -3497,7 +3541,7 @@ RENDERERS = {
     "Workspace": page_workspace,
     "Review": page_review,
     "Organize": page_organize,
-    "PSV Verify": page_psv_verify,
+    "Viewer": page_viewer,
     "Validation": page_validation,
     "Export": page_export,
     "Settings": page_settings,
