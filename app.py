@@ -37,22 +37,12 @@ from psv_workflow import (
 from metadata_workflow import (
     json_bytes,
     sheet_text,
-    suggestions,
-    unique_labels,
 )
-
 try:
-    from metadata_workflow import exact_template_label, normalize_label
-except ImportError:
-    def normalize_label(label: Any) -> str:
-        return str(label or "").strip().casefold()
+    import rapidfuzz
+except ImportError:  # pip install rapidfuzz; without it fuzzy matching falls back to difflib
+    rapidfuzz = None
 
-    def exact_template_label(source_label: str, requested_labels: Iterable[str]) -> Optional[str]:
-        normalized = normalize_label(source_label)
-        return next(
-            (str(label) for label in requested_labels if normalize_label(label) == normalized),
-            None,
-        )
 
 try:
     from PIL import Image
@@ -201,19 +191,21 @@ CREATE TABLE IF NOT EXISTS templates (
 CREATE TABLE IF NOT EXISTS label_mappings (
     id TEXT PRIMARY KEY,
     docket_id TEXT NOT NULL REFERENCES dockets(id) ON DELETE CASCADE,
+    template_id TEXT NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
     source_label TEXT NOT NULL,
     requested_label TEXT NOT NULL,
     method TEXT NOT NULL,
     approved INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
-    UNIQUE(docket_id, source_label, requested_label)
+    UNIQUE(docket_id, template_id, source_label)
 );
 CREATE TABLE IF NOT EXISTS rejected_suggestions (
     docket_id TEXT NOT NULL REFERENCES dockets(id) ON DELETE CASCADE,
+    template_id TEXT NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
     source_label TEXT NOT NULL,
     requested_label TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    PRIMARY KEY (docket_id, source_label, requested_label)
+    PRIMARY KEY (docket_id, template_id, source_label, requested_label)
 );
 CREATE TABLE IF NOT EXISTS facts (
     id TEXT PRIMARY KEY,
@@ -582,6 +574,35 @@ def init_db() -> bool:
         page_columns = {row["name"] for row in connection.execute("PRAGMA table_info(pages)")}
         if "sheet_name" not in page_columns:
             connection.execute("ALTER TABLE pages ADD COLUMN sheet_name TEXT NOT NULL DEFAULT ''")
+        mapping_columns = {row["name"] for row in connection.execute("PRAGMA table_info(label_mappings)")}
+        if "template_id" not in mapping_columns:
+            connection.execute("DROP TABLE IF EXISTS label_mappings")
+            connection.executescript("""
+                CREATE TABLE label_mappings (
+                    id TEXT PRIMARY KEY,
+                    docket_id TEXT NOT NULL REFERENCES dockets(id) ON DELETE CASCADE,
+                    template_id TEXT NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
+                    source_label TEXT NOT NULL,
+                    requested_label TEXT NOT NULL,
+                    method TEXT NOT NULL,
+                    approved INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(docket_id, template_id, source_label)
+                );
+            """)
+        rejection_columns = {row["name"] for row in connection.execute("PRAGMA table_info(rejected_suggestions)")}
+        if "template_id" not in rejection_columns:
+            connection.execute("DROP TABLE IF EXISTS rejected_suggestions")
+            connection.executescript("""
+                CREATE TABLE rejected_suggestions (
+                    docket_id TEXT NOT NULL REFERENCES dockets(id) ON DELETE CASCADE,
+                    template_id TEXT NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
+                    source_label TEXT NOT NULL,
+                    requested_label TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (docket_id, template_id, source_label, requested_label)
+                );
+            """)
     return True
 
 
@@ -702,32 +723,31 @@ def list_templates(docket_id: str) -> List[sqlite3.Row]:
         ).fetchall()
 
 
-def save_template(docket_id: str, name: str, labels: List[str], template_id: Optional[str] = None) -> None:
-    """Create a template, or update one. Pass the template's own id (not just its name) to
-    update an EXISTING template, including renaming it - looking it up by name only meant a
-    rename always created a duplicate row instead of updating the original."""
+def save_template(docket_id: str, name: str, labels: List[str], template_id: Optional[str] = None) -> str:
+    """Create a template, or update one in place when `template_id` is passed.
+
+    - Labels are deduplicated by comparison form while keeping the first spelling.
+    - Creating refuses an already-used name (edit that template instead).
+    - Updating keeps kept labels verbatim, drops deselected ones, and prunes
+      approved mappings pointing at labels the template no longer offers, so a
+      template can never export under a label it does not list.
+    Returns the template id. Never touches Main Metadata."""
     clean_name = clean_text(name).strip()
-    clean_labels: List[str] = []
-    seen_labels: set[str] = set()
-    for label in labels:
-        clean_label = clean_text(label)
-        normalized = normalize_label(clean_label)
-        if normalized and normalized not in seen_labels:
-            clean_labels.append(clean_label)
-            seen_labels.add(normalized)
+    clean_labels = _dedupe_labels(labels)
     if not clean_name or not clean_labels:
-        raise ValueError("A template name and at least one requested label are required.")
+        raise ValueError("A template name and at least one label are required.")
     now = utc_now()
+    removed: List[str] = []
+    resolved_id: str
     with connect() as connection:
         existing = None
         if template_id:
             existing = connection.execute(
-                "SELECT id FROM templates WHERE docket_id = ? AND id = ?", (docket_id, template_id)
+                "SELECT id, labels_json FROM templates WHERE docket_id = ? AND id = ?",
+                (docket_id, template_id),
             ).fetchone()
-        if existing is None:
-            existing = connection.execute(
-                "SELECT id FROM templates WHERE docket_id = ? AND name = ?", (docket_id, clean_name)
-            ).fetchone()
+            if existing is None:
+                raise ValueError("That template no longer exists.")
         if existing:
             try:
                 connection.execute(
@@ -736,76 +756,149 @@ def save_template(docket_id: str, name: str, labels: List[str], template_id: Opt
                 )
             except sqlite3.IntegrityError as exc:
                 raise ValueError(f"A template named “{clean_name}” already exists.") from exc
+            resolved_id = str(existing["id"])
+            kept = {normalize_label(label) for label in clean_labels}
+            removed = [
+                label
+                for label in json.loads(existing["labels_json"])
+                if normalize_label(label) not in kept
+            ]
         else:
-            try:
-                connection.execute(
-                    """INSERT INTO templates
-                       (id, docket_id, name, labels_json, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    (str(uuid.uuid4()), docket_id, clean_name,
-                     json.dumps(clean_labels, ensure_ascii=False), now, now),
+            clash = connection.execute(
+                "SELECT id FROM templates WHERE docket_id = ? AND name = ?",
+                (docket_id, clean_name),
+            ).fetchone()
+            if clash:
+                raise ValueError(
+                    f"A template named “{clean_name}” already exists. Choose another name, "
+                    "or edit that template instead."
                 )
-            except sqlite3.IntegrityError as exc:
-                raise ValueError(f"A template named “{clean_name}” already exists.") from exc
+            resolved_id = str(uuid.uuid4())
+            connection.execute(
+                """INSERT INTO templates (id, docket_id, name, labels_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (resolved_id, docket_id, clean_name, json.dumps(clean_labels, ensure_ascii=False), now, now),
+            )
+    if removed:
+        delete_mappings_to_labels(docket_id, resolved_id, removed)
+    return resolved_id
 
 
-def save_mapping(docket_id: str, source_label: str, requested_label: str, method: str) -> None:
+def delete_template(docket_id: str, template_id: str) -> None:
+    """Delete a template; its mappings and rejected suggestions cascade with it."""
+    with connect() as connection:
+        connection.execute(
+            "DELETE FROM templates WHERE docket_id = ? AND id = ?", (docket_id, template_id)
+        )
+
+
+def append_template_labels(docket_id: str, template_id: str, labels: List[str]) -> List[str]:
+    """Explicitly add labels to a template (the "Add to template" action in the apply
+    workflow). Existing labels and their spelling are never altered; labels already
+    present in any casing are skipped. Returns the labels actually added."""
+    added: List[str] = []
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT labels_json FROM templates WHERE docket_id = ? AND id = ?",
+            (docket_id, template_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("That template no longer exists.")
+        current_labels = json.loads(row["labels_json"])
+        seen = {normalize_label(label) for label in current_labels}
+        for label in labels:
+            clean = clean_text(label).strip()
+            normalized = normalize_label(clean)
+            if normalized and normalized not in seen:
+                current_labels.append(clean)
+                seen.add(normalized)
+                added.append(clean)
+        connection.execute(
+            "UPDATE templates SET labels_json = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(current_labels, ensure_ascii=False), utc_now(), template_id),
+        )
+    return added
+
+
+def save_mapping(docket_id: str, template_id: str, source_label: str, requested_label: str, method: str) -> None:
+    """Approve a mapping from an extracted label to one of THIS template's labels.
+    A source maps to exactly one target per template; re-approving replaces it."""
     source_label, requested_label = clean_text(source_label).strip(), clean_text(requested_label).strip()
     if not source_label or not requested_label:
         return
     with connect() as connection:
         connection.execute(
-            """INSERT INTO label_mappings
-               (id, docket_id, source_label, requested_label, method, approved, created_at)
-               VALUES (?, ?, ?, ?, ?, 1, ?)
-               ON CONFLICT(docket_id, source_label, requested_label)
-               DO UPDATE SET method = excluded.method, approved = 1""",
-            (str(uuid.uuid4()), docket_id, source_label, requested_label, method, utc_now()),
+            """INSERT INTO label_mappings (id, docket_id, template_id, source_label, requested_label, method, approved, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+               ON CONFLICT(docket_id, template_id, source_label)
+               DO UPDATE SET requested_label = excluded.requested_label, method = excluded.method, approved = 1""",
+            (str(uuid.uuid4()), docket_id, template_id, source_label, requested_label, method, utc_now()),
         )
 
 
-def approved_mappings(docket_id: str) -> Dict[str, List[str]]:
-    """Maps each source label to EVERY target label it has been approved for (a source
-    label can be approved for several client templates at once)."""
+def approved_mappings(docket_id: str, template_id: str) -> Dict[str, str]:
+    """Maps each source label to the one target approved WITHIN this template."""
     with connect() as connection:
         rows = connection.execute(
             """SELECT source_label, requested_label FROM label_mappings
-               WHERE docket_id = ? AND approved = 1""", (docket_id,)
+               WHERE docket_id = ? AND template_id = ? AND approved = 1""",
+            (docket_id, template_id),
         ).fetchall()
-    out: Dict[str, List[str]] = {}
-    for row in rows:
-        out.setdefault(row["source_label"], []).append(row["requested_label"])
-    return out
+    return {row["source_label"]: row["requested_label"] for row in rows}
 
 
-def delete_mappings_to_labels(docket_id: str, labels: Iterable[str]) -> None:
-    """Remove mappings that point at labels no longer offered by any template (bug: a
-    mapping used to survive a label's removal and would silently keep exporting under
-    a label that no template lists anymore)."""
+def mapping_details(docket_id: str, template_id: str) -> Dict[str, Dict[str, str]]:
+    """Approved mappings with their method: {source: {"target": ..., "method": ...}}."""
+    with connect() as connection:
+        rows = connection.execute(
+            """SELECT source_label, requested_label, method FROM label_mappings
+               WHERE docket_id = ? AND template_id = ? AND approved = 1""",
+            (docket_id, template_id),
+        ).fetchall()
+    return {
+        row["source_label"]: {"target": row["requested_label"], "method": row["method"]}
+        for row in rows
+    }
+
+
+def delete_mappings_to_labels(docket_id: str, template_id: str, labels: Iterable[str]) -> None:
+    """Remove this template's mappings pointing at labels it no longer offers."""
     labels = [str(label) for label in labels if str(label).strip()]
     if not labels:
         return
     with connect() as connection:
         connection.executemany(
-            "DELETE FROM label_mappings WHERE docket_id = ? AND requested_label = ?",
-            [(docket_id, label) for label in labels],
+            "DELETE FROM label_mappings WHERE docket_id = ? AND template_id = ? AND requested_label = ?",
+            [(docket_id, template_id, label) for label in labels],
         )
 
 
-def reject_suggestion(docket_id: str, source_label: str, requested_label: str) -> None:
+def delete_mapping(docket_id: str, template_id: str, source_label: str, requested_label: str) -> None:
+    """Remove one approved mapping (Reject-after-approval or explicit Unmap)."""
+    with connect() as connection:
+        connection.execute(
+            """DELETE FROM label_mappings
+               WHERE docket_id = ? AND template_id = ? AND source_label = ? AND requested_label = ?""",
+            (docket_id, template_id, clean_text(source_label).strip(), clean_text(requested_label).strip()),
+        )
+
+
+def reject_suggestion(docket_id: str, template_id: str, source_label: str, requested_label: str) -> None:
     with connect() as connection:
         connection.execute(
             """INSERT OR IGNORE INTO rejected_suggestions
-               (docket_id, source_label, requested_label, created_at) VALUES (?, ?, ?, ?)""",
-            (docket_id, source_label, requested_label, utc_now()),
+               (docket_id, template_id, source_label, requested_label, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (docket_id, template_id, source_label, requested_label, utc_now()),
         )
 
 
-def rejected_suggestions(docket_id: str) -> set:
+def rejected_suggestions(docket_id: str, template_id: str) -> set:
     with connect() as connection:
         rows = connection.execute(
-            "SELECT source_label, requested_label FROM rejected_suggestions WHERE docket_id = ?",
-            (docket_id,),
+            """SELECT source_label, requested_label FROM rejected_suggestions
+               WHERE docket_id = ? AND template_id = ?""",
+            (docket_id, template_id),
         ).fetchall()
     return {(row["source_label"], row["requested_label"]) for row in rows}
 
@@ -2394,14 +2487,14 @@ def metadata_records(docket_id: str) -> List[dict]:
 def client_template_records(docket_id: str, template: sqlite3.Row) -> Tuple[List[dict], List[str]]:
     labels = json.loads(template["labels_json"])
     records = metadata_records(docket_id)
-    mappings = approved_mappings(docket_id)
+    mappings = approved_mappings(docket_id, template["id"])
     output: List[dict] = []
     matched = {label: 0 for label in labels}
     for record in records:
-        for target in mappings.get(record["label"], []):
-            if target in matched:
-                output.append({**record, "label": target})
-                matched[target] += 1
+        target = mappings.get(record["label"])
+        if target in matched:
+            output.append({**record, "label": target})
+            matched[target] += 1
     return output, [label for label, count in matched.items() if count == 0]
 
 
@@ -3093,168 +3186,432 @@ def page_review(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
             st.caption("No changes recorded yet.")
 
 
-def page_organize(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
-    page_header("Organize", "Select exact client labels, save reusable templates, and approve label mappings.",
-                active["name"] if active else None)
-    if not need_docket(active):
-        return
-    metadata = [dict(row) for row in fetch_metadata(active["id"])]
-    if not metadata:
-        st.info("Process documents first. The Main Metadata File will appear here after extraction.")
-        return
-    labels = unique_labels(metadata)
-    st.metric("Unique extracted labels", len(labels))
-    with st.expander("Main Metadata File preview", expanded=False):
-        st.dataframe(metadata, hide_index=True, width="stretch")
+# ---------------------------------------------------------------- client templates
+#
+# Rebuilt workflow. Three distinct operations:
+#   * create_template_mode - select labels per uploaded document (pills), save new
+#   * edit_template_mode   - same selection UI against an existing template
+#   * apply_template_mode  - exact auto-map, RapidFuzz >=70% needs Approve/Reject,
+#                            unmatched labels are mapped manually or explicitly added
+# Invariants: Main Metadata is never written by any template operation; applying
+# never silently rewrites saved labels (labels are only added via the explicit
+# "Add to template" action); mappings/rejections persist per template_id.
 
-    templates = list_templates(active["id"])
-    template_names = [row["name"] for row in templates]
-    pending_select = st.session_state.pop("organize_template_pending_select", None)
-    if pending_select is not None and pending_select in ("New template", *template_names):
-        st.session_state["organize_template_choice"] = pending_select
+FUZZY_MIN_SCORE = 70
+
+
+def normalize_label(label: Any) -> str:
+    """Comparison form for label matching: trimmed and case-insensitive."""
+    return str(label or "").strip().casefold()
+
+
+def exact_template_label(source_label: str, requested_labels: Iterable[str]) -> Optional[str]:
+    """The template label equal to `source_label` ignoring case and leading/trailing
+    whitespace, else None."""
+    normalized = normalize_label(source_label)
+    return next(
+        (str(label) for label in requested_labels if normalize_label(label) == normalized),
+        None,
+    )
+
+
+def unique_labels(records: Iterable[Any]) -> List[str]:
+    """Every distinct label in first-seen order, original spelling preserved.
+    Each result is one unique label - not one extracted value."""
+    seen: set = set()
+    labels: List[str] = []
+    for record in records:
+        raw = record.get("label") if isinstance(record, dict) else record
+        label = clean_text(raw).strip()
+        normalized = normalize_label(label)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            labels.append(label)
+    return labels
+
+
+def _dedupe_labels(labels: Iterable[str]) -> List[str]:
+    """Collapse repeats of the same label (any casing/spacing) to the first spelling."""
+    seen: set = set()
+    out: List[str] = []
+    for label in labels:
+        clean = clean_text(label).strip()
+        normalized = normalize_label(clean)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            out.append(clean)
+    return out
+
+
+def fuzzy_suggestions(
+    source: str, candidates: List[str], min_score: int = FUZZY_MIN_SCORE, limit: int = 5
+) -> List[Dict[str, Any]]:
+    """RapidFuzz suggestions for one extracted label against template labels.
+    Only candidates scoring >= min_score are returned, best first. Exact matches are
+    resolved separately and never reach this function."""
+    query = normalize_label(source)
+    if not query or not candidates:
+        return []
+    scored: List[Tuple[str, float]] = []
+    if rapidfuzz is not None:
+        matches = rapidfuzz.process.extract(
+            query,
+            [normalize_label(candidate) for candidate in candidates],
+            scorer=rapidfuzz.fuzz.WRatio,
+            score_cutoff=float(min_score),
+            limit=limit,
+        )
+        scored = [(candidates[index], float(score)) for _, score, index in matches]
+    else:  # graceful degradation; install rapidfuzz for the specified behaviour
+        import difflib
+
+        for candidate in candidates:
+            ratio = difflib.SequenceMatcher(None, query, normalize_label(candidate)).ratio() * 100
+            if ratio >= min_score:
+                scored.append((candidate, ratio))
+    scored.sort(key=lambda item: (-item[1], item[0]))
+    return [{"label": label, "score": score} for label, score in scored[:limit]]
+
+
+def template_sections_key(docket_id: str) -> str:
+    """Session key for {document_name: [submitted labels]} in the pill workflow."""
+    return f"template_sections_{docket_id}"
+
+
+def _document_label_picker(docket_id: str, metadata: List[dict], sections: Dict[str, List[str]]) -> None:
+    """Step 1 (shared by create/edit): choose ONE document, see ONLY its unique
+    labels as pills, submit them below. Switching documents never disturbs the
+    pills of another document or any submitted section."""
+    document_names = sorted({record["document_name"] for record in metadata}, key=str.casefold)
     with st.container(border=True):
-        st.markdown("**Choose labels by document**")
-        selected = st.selectbox(
-            "Template",
-            ["New template", *template_names],
-            key="organize_template_choice",
-        )
-        existing = next((row for row in templates if row["name"] == selected), None)
-        document_names = sorted(
-            {record["document_name"] for record in metadata},
-            key=str.casefold,
-        )
-        sections_key = f"template_sections_{active['id']}_{selected}"
-        submitted_sections = st.session_state.setdefault(sections_key, {})
+        st.markdown("**1. Pick labels from one document**")
         document_name = st.selectbox(
             "Uploaded document",
-            document_names,
-            key=f"template_document_{active['id']}_{selected}",
+            ["Select a document", *document_names],
+            key=f"template_doc_{docket_id}",
+            help="Labels appear only after a document is chosen; each pill is one unique label.",
         )
+        if document_name == "Select a document":
+            st.info("Choose a document to display its unique extracted labels.")
+            return
         document_labels = unique_labels(
             [record for record in metadata if record["document_name"] == document_name]
         )
-        selected_for_document = st.pills(
-            "Labels from this document",
-            document_labels,
+        submitted = {normalize_label(label) for label in sections.get(document_name, [])}
+        available = [label for label in document_labels if normalize_label(label) not in submitted]
+        if not available:
+            st.success("Every label from this document has already been submitted.", icon="✅")
+            return
+        # The key embeds the submission count, so the widget starts fresh whenever
+        # this document's section changes. st.pills renders selected pills in the
+        # accent colour and unselected ones outlined, so selection state is visual.
+        picked = st.pills(
+            f"Unique labels extracted from “{document_name}”",
+            available,
             selection_mode="multi",
-            default=submitted_sections.get(document_name, []),
-            key=f"template_document_labels_{active['id']}_{selected}_{key_id(document_name)}",
-            help="Select the labels required for this document, then submit the section.",
+            key=f"template_pills_{docket_id}_{key_id(document_name)}_{len(sections.get(document_name, []))}",
             width="stretch",
-        )
+        ) or []
         if st.button(
-            "Submit",
+            "Submit labels",
             type="primary",
-            key=f"submit_document_labels_{active['id']}_{selected}",
-            disabled=not selected_for_document,
+            key=f"template_submit_{docket_id}",
+            disabled=not picked,
             **stretch(),
         ):
-            submitted_sections[document_name] = list(selected_for_document)
-            st.session_state[sections_key] = submitted_sections
+            # Duplicate submissions of the same label (any casing) are blocked.
+            sections[document_name] = _dedupe_labels([*sections.get(document_name, []), *picked])
+            st.session_state[template_sections_key(docket_id)] = sections
             st.rerun()
 
-    st.markdown("#### Submitted document sections")
-    if submitted_sections:
-        for document, section_labels in submitted_sections.items():
-            with st.container(border=True):
-                st.markdown(f"**{document}**")
-                st.pills(
-                    f"Selected labels for {document}",
-                    section_labels,
-                    selection_mode="multi",
-                    default=section_labels,
-                    key=f"submitted_section_{active['id']}_{selected}_{key_id(document)}",
-                    disabled=True,
-                    label_visibility="collapsed",
-                )
-    else:
-        st.info("Select labels for a document and click Submit. Submitted sections stay visible here.")
 
-    all_selected_labels = list(dict.fromkeys(
-        label for section in submitted_sections.values() for label in section
-    ))
-    default_name = existing["name"] if existing else ""
-    name = st.text_input(
-        "Template name",
-        value=default_name,
-        key=f"template_name_{active['id']}_{selected}",
-    )
+def _submitted_sections_editor(docket_id: str, sections: Dict[str, List[str]]) -> None:
+    """Step 2 (shared): one bordered section per submitted document, filename as
+    heading, selected labels as editable pills beneath it."""
+    st.markdown("#### 2. Submitted document sections")
+    if not sections:
+        st.info("Pick labels above and click Submit labels. Every submitted document gets its own section here.")
+        return
+    for document, section_labels in list(sections.items()):
+        with st.container(border=True):
+            head_col, clear_col = st.columns([5, 1], vertical_alignment="center")
+            head_col.markdown(f"**{document}**")
+            head_col.caption(f"{len(section_labels)} label(s) selected")
+            if clear_col.button("Remove section", key=f"template_drop_{docket_id}_{key_id(document)}", **stretch()):
+                del sections[document]
+                st.session_state[template_sections_key(docket_id)] = sections
+                st.rerun()
+            kept = st.pills(
+                f"Labels for {document}",
+                section_labels,
+                selection_mode="multi",
+                default=section_labels,
+                key=f"template_section_{docket_id}_{key_id(document)}_{len(section_labels)}",
+                label_visibility="collapsed",
+                width="stretch",
+            )
+            kept = list(kept) if kept is not None else list(section_labels)
+            if kept != list(section_labels):
+                if kept:
+                    sections[document] = kept
+                else:
+                    del sections[document]
+                st.session_state[template_sections_key(docket_id)] = sections
+                st.rerun()
+
+
+def create_template_mode(active: sqlite3.Row, metadata: List[dict]) -> None:
+    """Create a new template purely by selecting labels per document. No similarity
+    scoring, no automatic mapping, no mapping writes; Main Metadata untouched."""
+    docket_id = active["id"]
+    sections: Dict[str, List[str]] = st.session_state.setdefault(template_sections_key(docket_id), {})
+    _document_label_picker(docket_id, metadata, sections)
+    _submitted_sections_editor(docket_id, sections)
+    st.markdown("#### 3. Save template")
+    all_labels = _dedupe_labels(label for labels in sections.values() for label in labels)
+    name = st.text_input("Template name", key=f"template_name_{docket_id}", max_chars=120)
+    st.caption(f"{len(all_labels)} unique label(s) will be saved.")
     if st.button(
         "Save Template",
         type="primary",
-        key=f"save_template_{active['id']}_{selected}",
-        disabled=not all_selected_labels,
+        key=f"template_save_{docket_id}",
+        disabled=not all_labels or not name.strip(),
         **stretch(),
     ):
         try:
-            save_template(
-                active["id"],
-                name,
-                all_selected_labels,
-                template_id=existing["id"] if existing else None,
-            )
-            saved_sections_key = f"template_sections_{active['id']}_{name.strip()}"
-            st.session_state[saved_sections_key] = dict(submitted_sections)
-            st.session_state["organize_template_pending_select"] = name.strip()
-            st.success("Template saved.", icon="✅")
-            st.rerun()
+            template_id = save_template(docket_id, name, all_labels)
         except ValueError as exc:
             st.error(str(exc), icon="🚫")
-
-    if selected == "New template":
-        st.info("Save the template to enable exact and fuzzy mapping review.")
-        return
-    if not templates:
-        return
-    template = existing or templates[0]
-    template_labels = json.loads(template["labels_json"])
-    st.markdown(f"#### Label matching · {template['name']}")
-    st.caption("Exact matches are mapped automatically. Suggestions require explicit approval.")
-
-    add_key = f"add_template_labels_{active['id']}_{template['id']}"
-
-    def add_selected_labels() -> None:
-        selected_labels = st.session_state.get(add_key, [])
-        existing_normalized = {normalize_label(label) for label in template_labels}
-        additions = [
-            label for label in selected_labels
-            if normalize_label(label) not in existing_normalized
-        ]
-        if additions:
-            save_template(active["id"], template["name"], [*template_labels, *additions],
-                           template_id=template["id"])
-        st.session_state[add_key] = []
-
-    template_normalized = {normalize_label(label) for label in template_labels}
-    available_labels = [
-        label for label in labels if normalize_label(label) not in template_normalized
-    ]
-
-    remove_key = f"remove_template_labels_{active['id']}_{template['id']}"
-
-    def remove_selected_labels() -> None:
-        selected_labels = st.session_state.get(remove_key, [])
-        remaining = [label for label in template_labels if label not in selected_labels]
-        if remaining:
-            save_template(active["id"], template["name"], remaining, template_id=template["id"])
-            delete_mappings_to_labels(active["id"], selected_labels)
-
-    selected_for_removal = st.pills(
-        "Selected template labels",
-        template_labels,
-        selection_mode="multi",
-        key=remove_key,
-        help="Select labels to remove from this template.",
-    )
-    if selected_for_removal and st.button(
-        "Remove selected labels",
-        key=f"remove_selected_{active['id']}_{template['id']}",
-        on_click=remove_selected_labels,
-    ):
+            return
+        st.session_state.pop(template_sections_key(docket_id), None)
+        queue_flash("success", "Template saved. Main Metadata was not changed.")
+        st.session_state["org_mode_pending"] = "Apply existing template"
+        st.session_state["org_template_pending"] = clean_text(name).strip()
         st.rerun()
-    if selected_for_removal and len(selected_for_removal) == len(template_labels):
-        st.warning("Keep at least one template label; templates cannot be empty.", icon="⚠️")
+
+
+def edit_template_mode(active: sqlite3.Row, metadata: List[dict]) -> None:
+    """Edit an existing template with the same document-based selection workflow.
+    Saving updates labels in place (kept labels keep their exact spelling) and
+    prunes mappings pointing at removed labels. Mappings are never edited here."""
+    docket_id = active["id"]
+    templates = list_templates(docket_id)
+    if not templates:
+        st.info("No saved templates yet. Create one first.")
+        return
+    names = [row["name"] for row in templates]
+    selected = st.selectbox("Template to edit", names, key=f"template_edit_pick_{docket_id}")
+    template = next(row for row in templates if row["name"] == selected)
+    template_id = template["id"]
+
+    state_key = f"template_edit_state_{docket_id}"
+    state = st.session_state.get(state_key)
+    if not isinstance(state, dict) or state.get("template_id") != template_id:
+        state = {"template_id": template_id, "labels": json.loads(template["labels_json"])}
+        st.session_state[state_key] = state
+        st.session_state.pop(template_sections_key(docket_id), None)
+
+    sections: Dict[str, List[str]] = st.session_state.setdefault(template_sections_key(docket_id), {})
+
+    with st.container(border=True):
+        st.markdown("**Current template labels**")
+        st.caption("Deselect a pill to remove that label when you save. Labels are never renamed here.")
+        kept = st.pills(
+            "Current labels",
+            state["labels"],
+            selection_mode="multi",
+            default=state["labels"],
+            key=f"template_edit_labels_{docket_id}_{template_id}_{len(state['labels'])}",
+            label_visibility="collapsed",
+            width="stretch",
+        )
+        kept = list(kept) if kept is not None else list(state["labels"])
+        if kept != list(state["labels"]):
+            state["labels"] = kept
+            st.rerun()
+
+    _document_label_picker(docket_id, metadata, sections)
+    _submitted_sections_editor(docket_id, sections)
+
+    st.markdown("#### 3. Save changes")
+    combined = _dedupe_labels([*state["labels"], *(label for labels in sections.values() for label in labels)])
+    name = st.text_input("Template name", value=template["name"], key=f"template_edit_name_{docket_id}", max_chars=120)
+    st.caption(f"{len(combined)} unique label(s) will be saved.")
+    save_col, delete_col = st.columns(2)
+    if save_col.button("Save changes", type="primary", key=f"template_edit_save_{docket_id}", disabled=not combined, **stretch()):
+        try:
+            save_template(docket_id, name, combined, template_id=template_id)
+        except ValueError as exc:
+            st.error(str(exc), icon="🚫")
+            return
+        st.session_state.pop(state_key, None)
+        st.session_state.pop(template_sections_key(docket_id), None)
+        queue_flash("success", "Template updated. Main Metadata was not changed.")
+        st.rerun()
+    with delete_col.popover("Delete template", **stretch()):
+        st.markdown(f"Delete **{template['name']}**?")
+        st.caption("Also removes this template's mappings and rejected suggestions. Main Metadata is untouched.")
+        confirm_key = f"template_delete_confirm_{template_id}"
+        st.checkbox("I understand this cannot be undone", key=confirm_key)
+        if st.button("Delete permanently", type="primary", disabled=not st.session_state.get(confirm_key, False), **stretch()):
+            delete_template(docket_id, template_id)
+            st.session_state.pop(state_key, None)
+            st.session_state.pop(template_sections_key(docket_id), None)
+            queue_flash("success", f"Template “{template['name']}” deleted.")
+            st.rerun()
+
+
+def apply_template_mode(active: sqlite3.Row, metadata: List[dict]) -> None:
+    """Apply a saved template to Main Metadata labels.
+
+    - Exact matches (case-insensitive, trimmed) map automatically, no interaction.
+    - Fuzzy suggestions (RapidFuzz >= 70%) require explicit Approve/Reject each.
+    - Unmatched labels can be mapped manually or explicitly added to the template.
+    Applying never silently rewrites saved labels; Main Metadata is never modified;
+    every decision persists in the database across restarts."""
+    docket_id = active["id"]
+    templates = list_templates(docket_id)
+    if not templates:
+        st.info("No saved templates yet. Create one first.")
+        return
+    names = [row["name"] for row in templates]
+    pending = st.session_state.pop("org_template_pending", None)
+    index = names.index(pending) if pending in names else 0
+    selected = st.selectbox("Saved template", names, index=index, key=f"template_apply_pick_{docket_id}")
+    template = next(row for row in templates if row["name"] == selected)
+    template_id = template["id"]
+    template_labels: List[str] = json.loads(template["labels_json"])
+
+    labels = unique_labels(metadata)
+    current = approved_mappings(docket_id, template_id)
+    details = mapping_details(docket_id, template_id)
+    rejected = rejected_suggestions(docket_id, template_id)
+
+    exact_pairs: List[Tuple[str, str]] = []
+    manual_pairs: List[Tuple[str, str, str]] = []
+    fuzzy: Dict[str, List[Dict[str, Any]]] = {}
+    unmatched: List[str] = []
+
+    for source in labels:
+        exact_target = exact_template_label(source, template_labels)
+        if exact_target is not None:
+            if source not in current:
+                # Automatic, idempotent, no user interaction. A deliberate human
+                # mapping to a different target is respected and shown as such.
+                save_mapping(docket_id, template_id, source, exact_target, "exact")
+                current[source] = exact_target
+            if current[source] == exact_target:
+                exact_pairs.append((source, exact_target))
+            else:
+                manual_pairs.append((source, current[source], details.get(source, {}).get("method", "manual")))
+            continue
+        if source in current:
+            manual_pairs.append((source, current[source], details.get(source, {}).get("method", "manual")))
+            continue
+        options = [
+            match for match in fuzzy_suggestions(source, template_labels)
+            if (source, match["label"]) not in rejected
+        ]
+        if options:
+            fuzzy[source] = options
+        else:
+            unmatched.append(source)
+
+    st.caption(
+        f"{len(labels)} unique extracted label(s) compared against "
+        f"{len(template_labels)} template label(s)."
+    )
+
+    with st.container(border=True):
+        st.markdown("**Exact matches (mapped automatically)**")
+        if exact_pairs:
+            for source, target in exact_pairs:
+                st.success(f"`{source}` → `{target}`", icon="✅")
+        else:
+            st.caption("No exact matches yet.")
+
+    with st.container(border=True):
+        st.markdown(f"**Fuzzy suggestions (≥{FUZZY_MIN_SCORE}% similarity — approval required)**")
+        if fuzzy:
+            for source, options in fuzzy.items():
+                st.markdown(f"**{source}**")
+                for match in options:
+                    target = match["label"]
+                    pid = key_id(f"{source}\u241f{target}")
+                    approve_col, reject_col, info_col = st.columns([1, 1, 3], vertical_alignment="center")
+                    if approve_col.button("Approve", key=f"tpl_approve_{docket_id}_{template_id}_{pid}", width="stretch"):
+                        save_mapping(docket_id, template_id, source, target, "user-approved")
+                        st.rerun()
+                    if reject_col.button("Reject", key=f"tpl_reject_{docket_id}_{template_id}_{pid}", width="stretch"):
+                        reject_suggestion(docket_id, template_id, source, target)
+                        delete_mapping(docket_id, template_id, source, target)  # Reject also undoes an approval of this pair.
+                        st.rerun()
+                    info_col.caption(f"`{target}` · {match['score']:.0f}%")
+        else:
+            st.caption("No suggestions at or above the similarity threshold.")
+
+    with st.container(border=True):
+        st.markdown("**Unmatched labels**")
+        if unmatched:
+            st.caption("Map each label to a template label, or explicitly add it to the template. Nothing is discarded.")
+            for source in unmatched:
+                c1, c2, c3, c4 = st.columns([2, 2, 1, 1.4], vertical_alignment="center")
+                c1.markdown(f"`{source}`")
+                target = c2.selectbox(
+                    "Map to",
+                    template_labels,
+                    key=f"tpl_manual_t_{docket_id}_{template_id}_{key_id(source)}",
+                    label_visibility="collapsed",
+                )
+                if c3.button("Map", key=f"tpl_manual_b_{docket_id}_{template_id}_{key_id(source)}", width="stretch"):
+                    save_mapping(docket_id, template_id, source, target, "manual")
+                    st.rerun()
+                if c4.button("Add to template", key=f"tpl_add_{docket_id}_{template_id}_{key_id(source)}",
+                             help="Explicitly extend this template with the label; it will then match exactly.",
+                             width="stretch"):
+                    append_template_labels(docket_id, template_id, [source])
+                    queue_flash("success", f"“{source}” added to template “{template['name']}”.")
+                    st.rerun()
+        else:
+            st.caption("Every extracted label is exactly matched, mapped, or has a pending suggestion.")
+
+    with st.expander("All manual / fuzzy-approved mappings for this template"):
+        if manual_pairs:
+            for source, target, method in manual_pairs:
+                row_c, btn_c = st.columns([4, 1], vertical_alignment="center")
+                row_c.markdown(f"`{source}` → `{target}` · {method}")
+                if btn_c.button("Unmap", key=f"tpl_unmap_{docket_id}_{template_id}_{key_id(source)}", width="stretch"):
+                    delete_mapping(docket_id, template_id, source, target)
+                    st.rerun()
+        else:
+            st.caption("No manual or fuzzy-approved mappings yet.")
+
+
+def page_organize(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
+    page_header("Organize", "Create, edit or apply reusable client templates. "
+                "Main Metadata is never modified by template operations.", active["name"] if active else None)
+    if not need_docket(active):
+        return
+    metadata = metadata_records(active["id"])
+    if not metadata:
+        st.info("Process documents first. The Main Metadata File will appear here after extraction.")
+        return
+    st.metric("Unique extracted labels", len(unique_labels(metadata)))
+    pending_mode = st.session_state.pop("org_mode_pending", None)
+    if pending_mode is not None:
+        st.session_state["org_mode"] = pending_mode
+    mode = st.radio(
+        "Operation",
+        ["Create new template", "Edit existing template", "Apply existing template"],
+        horizontal=True,
+        key="org_mode",
+    )
+    if mode == "Create new template":
+        create_template_mode(active, metadata)
+    elif mode == "Edit existing template":
+        edit_template_mode(active, metadata)
+    else:
+        apply_template_mode(active, metadata)
 
 
 def page_viewer(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
