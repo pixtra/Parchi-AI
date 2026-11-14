@@ -65,14 +65,9 @@ def suggestions(
                 query, labels, scorer=fuzz.ratio, limit=limit, score_cutoff=min_score
             )
         ]
-    from difflib import SequenceMatcher
-    return sorted(
-        ({"label": label, "score": round(100 * SequenceMatcher(
-            None, query.casefold(), label.casefold()).ratio(), 1)}
-         for label in labels
-         if 100 * SequenceMatcher(None, query.casefold(), label.casefold()).ratio() >= min_score),
-        key=lambda item: item["score"], reverse=True,
-    )[:limit]
+    # Fuzzy matching is intentionally RapidFuzz-only. Do not silently substitute
+    # a different algorithm if the dependency is unavailable.
+    return []
 
 
 def json_bytes(payload: Any) -> bytes:

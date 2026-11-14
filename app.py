@@ -3189,13 +3189,20 @@ def page_organize(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> 
     with st.container(border=True):
         st.markdown("**Unmatched extracted labels**")
         if unmatched_labels:
-            st.pills(
-                "Labels not mapped",
-                unmatched_labels,
-                selection_mode="multi",
-                key=f"unmatched_labels_{active['id']}_{template['id']}",
-                label_visibility="collapsed",
-            )
+            st.caption("Choose a template label for each source label, or leave it unmatched.")
+            for source in unmatched_labels:
+                manual_key = f"manual_mapping_{active['id']}_{template['id']}_{key_id(source)}"
+                target = st.selectbox(
+                    f"Manual mapping for {source}",
+                    ["Do not map"] + template_labels,
+                    key=manual_key,
+                )
+                if target != "Do not map" and st.button(
+                    "Save manual mapping",
+                    key=f"{manual_key}_save",
+                ):
+                    save_mapping(active["id"], source, target, "manual")
+                    st.rerun()
         else:
             st.caption("All extracted labels are mapped or have reviewable suggestions.")
 
@@ -3338,7 +3345,7 @@ def page_export(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
             st.warning("No approved mapping for: " + ", ".join(missing), icon="⚠️")
         selected_format = st.selectbox("Format", formats, key=f"{prefix}_format")
         cache_key = f"{prefix}_export_cache"
-        if st.button("Build export", type="primary", key=f"{prefix}_build", **stretch()):
+        if         st.button("Export", type="primary", key=f"{prefix}_build", **stretch()):
             try:
                 if selected_format == "JSON":
                     data, count = build_metadata_export(records, title)
