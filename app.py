@@ -55,12 +55,6 @@ except ImportError:
     fitz = None
 
 try:
-    import keyring
-    import keyring.errors
-except ImportError:
-    keyring = None
-
-try:
     from google import genai
     from google.genai import types
 except ImportError:
@@ -79,13 +73,47 @@ WORKER_STATE = threading.local()
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("PARCHAI_DB", BASE_DIR / "parchai_v3.db"))
 STORAGE_DIR = Path(os.getenv("PARCHAI_STORAGE", BASE_DIR / "parchai_storage")).resolve()
+CONFIG_PATH = Path(os.getenv("PARCHAI_CONFIG", BASE_DIR / "parchai.config.json"))
+
+
+def load_config() -> Dict[str, Any]:
+    """Application configuration, e.g. {"gemini_api_keys": [...], "gemini_models": [...]}.
+
+    Read fresh on every call so API keys edited in the file take effect on the next
+    request without restarting the app. A malformed file is reported (never crashes
+    the app) via the "_error" key, which the Settings page surfaces.
+    """
+    try:
+        raw = CONFIG_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        return {"_error": f"Could not read {CONFIG_PATH.name} ({exc.__class__.__name__})."}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return {"_error": f"{CONFIG_PATH.name} is not valid JSON (line {exc.lineno}): {exc.msg}."}
+    if not isinstance(data, dict):
+        return {"_error": f"{CONFIG_PATH.name} must contain one JSON object."}
+    return data
+
+
+_STARTUP_CONFIG = load_config()
+_MODEL_CONFIG = _STARTUP_CONFIG.get("gemini_models")
+if isinstance(_MODEL_CONFIG, str):
+    _MODEL_CONFIG = [part.strip() for part in _MODEL_CONFIG.split(",")]
 GEMINI_MODELS = tuple(
     m.strip()
-    for m in os.getenv(
-        "PARCHAI_GEMINI_MODELS",
-        "gemini-3.8-flash,gemini-3.6-flash,gemini-3.1-flash-lite",
-    ).split(",")
-    if m.strip()
+    for m in (
+        os.getenv("PARCHAI_GEMINI_MODELS", "").split(",")
+        if os.getenv("PARCHAI_GEMINI_MODELS", "").strip()
+        else (
+            _MODEL_CONFIG
+            if isinstance(_MODEL_CONFIG, list) and any(str(m).strip() for m in _MODEL_CONFIG)
+            else "gemini-3.8-flash,gemini-3.6-flash,gemini-3.1-flash-lite".split(",")
+        )
+    )
+    if str(m).strip()
 )
 GEMINI_TIMEOUT_MS = 180_000
 MAX_OUTPUT_TOKENS = int(os.getenv("PARCHAI_MAX_OUTPUT_TOKENS", "32768"))
@@ -108,6 +136,30 @@ MIME_TYPES = {
 }
 BANDS = ("Green", "Yellow", "Red")
 REVIEW_STATUSES = ("pending", "approved", "rejected")
+# Document lifecycle: saved → queued → processing → completed / partial / failed.
+# "pending" documents exist only in pre-split databases and mean "saved, not processed".
+DOCUMENT_STATES = ("saved", "pending", "queued", "saving", "processing", "completed", "partial", "failed")
+PROCESSABLE_STATES = ("saved", "pending", "failed", "partial")
+DOCUMENT_STATE_META: Dict[str, Tuple[str, str]] = {
+    "saved": ("Saved", ""),
+    "pending": ("Saved", ""),
+    "queued": ("Queued", "accent"),
+    "saving": ("Saving…", "accent"),
+    "processing": ("Processing", "accent"),
+    "completed": ("Completed", "ok"),
+    "partial": ("Partial", "warn"),
+    "failed": ("Failed", "bad"),
+}
+
+
+def document_state_label(status: str) -> str:
+    label, _ = DOCUMENT_STATE_META.get(status, (status.capitalize(), ""))
+    return label
+
+
+def document_state_badge(status: str) -> str:
+    label, kind = DOCUMENT_STATE_META.get(status, (status.capitalize(), ""))
+    return badge(label, kind)
 PAGES = ["Dockets", "Workspace", "Review", "Organize", "Viewer", "Validation", "Export", "Settings"]
 PAGE_ICONS = {
     "Dockets": "▤", "Workspace": "⬆", "Review": "✎", "Organize": "⌘", "Viewer": "▣",
@@ -621,6 +673,13 @@ def init_db() -> bool:
         if "sheet_name" not in page_columns:
             connection.execute("ALTER TABLE pages ADD COLUMN sheet_name TEXT NOT NULL DEFAULT ''")
         _migrate_template_tables(connection)
+        # A previous process may have stopped mid-run; documents stuck in an in-flight
+        # status would otherwise never be processable again. Their originals and page
+        # rows are intact (facts are only written atomically at finalize), so they
+        # safely return to the "saved" state, ready to be queued again.
+        connection.execute(
+            "UPDATE documents SET status = 'saved' WHERE status IN ('queued', 'processing', 'saving')"
+        )
     return True
 
 
@@ -993,8 +1052,9 @@ def band_for(score: int) -> str:
 
 
 def clamp_confidence(score: Any, default: int = 50) -> int:
+    """Scores are always integers within 0–100 (0 allowed; the model guidance avoids it)."""
     try:
-        return max(1, min(100, round(float(score))))
+        return max(0, min(100, round(float(score))))
     except (TypeError, ValueError):
         return default
 
@@ -1152,6 +1212,33 @@ def _fact(
 KEY_RE = re.compile(r"(?:AQ\.[A-Za-z0-9._~-]{16,}|AIza[A-Za-z0-9._~-]{16,})")
 
 
+class _SecretRedactionFilter(logging.Filter):
+    """Never let an API key reach a log sink, even inside an exception message."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+            redacted = KEY_RE.sub("[redacted-key]", message)
+            if redacted != message:
+                record.msg, record.args = redacted, ()
+        except Exception:  # noqa: BLE001 - logging must never break the app
+            pass
+        return True
+
+
+def install_secret_redaction() -> None:
+    """Attach the redaction filter where it actually takes effect: on the logger that
+    emits our records and on every root handler (ancestor logger filters do not
+    apply to propagated records, so handler-level filtering is required)."""
+    redaction = _SecretRedactionFilter()
+    LOG.addFilter(redaction)
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(redaction)
+
+
+install_secret_redaction()
+
+
 class InvalidKeyError(Exception):
     """The API key is not shaped like a Gemini key."""
 
@@ -1160,17 +1247,7 @@ def valid_key(key: str) -> bool:
     return bool(key) and len(key) <= 256 and key.isascii() and bool(KEY_RE.fullmatch(key))
 
 
-def key_problem(raw: str) -> Optional[str]:
-    raw = (raw or "").strip()
-    if not raw:
-        return "Enter a key first."
-    if len(raw) > 256 or re.search(r"\s", raw):
-        return (f"That is not a single API key ({len(raw)} characters, with spaces or line breaks). "
-                "Paste only the key itself; current Gemini keys usually start with “AQ.”.")
-    if not raw.isascii() or not valid_key(raw):
-        return ("That does not look like a Gemini API key. Paste the complete key beginning with “AQ.” "
-                "(older keys may begin with “AIza”).")
-    return None
+
 
 
 def make_client(api_key: str) -> Any:
@@ -1221,75 +1298,31 @@ def set_cooldown(cooldown_id: str, seconds: int) -> None:
         st.session_state.setdefault("key_cooldowns", {})[cooldown_id] = time.time() + seconds
 
 
-KEYRING_SERVICE = "parchai-gemini-keys"
-KEYRING_INDEX_ACCOUNT = "__index__"
+def _config_gemini_keys() -> List[Tuple[str, str]]:
+    """Keys from the application configuration file (parchai.config.json).
 
-
-@functools.lru_cache(maxsize=1)
-def keyring_available() -> bool:
-    """True only if an OS credential store actually works here (not just importable)."""
-    if keyring is None:
-        return False
-    try:
-        probe = f"__probe__{uuid.uuid4().hex}"
-        keyring.set_password(KEYRING_SERVICE, probe, "x")
-        keyring.delete_password(KEYRING_SERVICE, probe)
-        return True
-    except Exception:  # noqa: BLE001 - any backend failure means "not available"
-        return False
-
-
-def _persisted_key_ids() -> List[str]:
-    if not keyring_available():
-        return []
-    raw = keyring.get_password(KEYRING_SERVICE, KEYRING_INDEX_ACCOUNT)
-    return json.loads(raw) if raw else []
-
-
-def persisted_keys() -> List[str]:
-    if not keyring_available():
-        return []
-    keys = []
-    for identifier in _persisted_key_ids():
-        value = keyring.get_password(KEYRING_SERVICE, identifier)
-        if value:
-            keys.append(value)
-    return keys
-
-
-def save_key_persistently(raw: str) -> None:
-    if not keyring_available():
-        raise RuntimeError("No OS credential store is available here, so the key cannot be saved "
-                            "securely. It will only be kept for this session.")
-    identifier = key_id(raw)
-    keyring.set_password(KEYRING_SERVICE, identifier, raw)
-    ids = _persisted_key_ids()
-    if identifier not in ids:
-        ids.append(identifier)
-        keyring.set_password(KEYRING_SERVICE, KEYRING_INDEX_ACCOUNT, json.dumps(ids))
-
-
-def remove_persisted_key(identifier: str) -> None:
-    if not keyring_available():
-        return
-    ids = _persisted_key_ids()
-    if identifier in ids:
-        try:
-            keyring.delete_password(KEYRING_SERVICE, identifier)
-        except keyring.errors.PasswordDeleteError:
-            pass
-        ids.remove(identifier)
-        keyring.set_password(KEYRING_SERVICE, KEYRING_INDEX_ACCOUNT, json.dumps(ids))
+    Supports "gemini_api_keys": ["key1", "key2"] and a single "gemini_api_key": "…".
+    Loaded fresh on every pool lookup, so editing the file needs no app restart.
+    """
+    config = load_config()
+    found: List[Tuple[str, str]] = []
+    raw_list = config.get("gemini_api_keys", [])
+    if isinstance(raw_list, str):
+        raw_list = re.split(r"[\n,;]+", raw_list)
+    if isinstance(raw_list, list):
+        found.extend((str(item).strip(), "config file") for item in raw_list)
+    single = str(config.get("gemini_api_key", "") or "").strip()
+    if single:
+        found.append((single, "config file"))
+    return found
 
 
 def _key_candidates() -> Iterator[Tuple[str, str]]:
     for raw in re.split(r"[\n,;]+", os.getenv("GEMINI_API_KEYS", "")):
         yield raw.strip(), "env pool"
     yield os.getenv("GEMINI_API_KEY", "").strip(), "env"
-    for raw in persisted_keys():
-        yield raw, "persisted"
-    for raw in st.session_state.get("session_keys", []):
-        yield str(raw).strip(), "session"
+    for raw, source in _config_gemini_keys():
+        yield raw, source
 
 
 def key_pool() -> List[Dict[str, str]]:
@@ -1308,6 +1341,41 @@ def key_pool() -> List[Dict[str, str]]:
 def rejected_keys() -> List[Dict[str, str]]:
     return [{"source": source, "masked": mask(key)}
             for key, source in _key_candidates() if key and not valid_key(key)]
+
+
+# Round-robin cursor shared by every worker thread. Each new batch starts on the key
+# after the one that served the previous successful request, spreading load across the
+# pool instead of hammering "Key 1" until it exhausts its quota.
+_KEY_ROTATION_LOCK = threading.Lock()
+_KEY_ROTATION_INDEX = 0
+
+
+def rotated_keys(keys: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Pool order for the next batch: starts after the last successful key."""
+    with _KEY_ROTATION_LOCK:
+        start = _KEY_ROTATION_INDEX % len(keys) if keys else 0
+    return keys[start:] + keys[:start]
+
+
+def record_key_success(keys: List[Dict[str, str]], used_id: str) -> None:
+    """Advance the rotation cursor past the key that just succeeded."""
+    global _KEY_ROTATION_INDEX
+    ids = [entry["id"] for entry in keys]
+    if used_id in ids:
+        with _KEY_ROTATION_LOCK:
+            _KEY_ROTATION_INDEX = (ids.index(used_id) + 1) % max(1, len(ids))
+
+
+def earliest_cooldown(keys: List[Dict[str, str]]) -> float:
+    """Seconds until the soonest-to-recover pooled key comes out of cooldown."""
+    waits: List[float] = []
+    for entry in keys:
+        wait = cooldown_remaining(entry["id"])
+        model_waits = [cooldown_remaining(f"{entry['id']}:{model}") for model in GEMINI_MODELS]
+        recover_at = max([wait, *model_waits], default=0.0)
+        if recover_at > 0:
+            waits.append(recover_at)
+    return min(waits) if waits else 0.0
 
 
 def finish_reason(response: Any) -> str:
@@ -1518,7 +1586,19 @@ def parse_batch_payload(text: str, labels: List[str]) -> Tuple[Dict[str, Dict[st
     return by_label, references
 
 
+MAX_COOLDOWN_WAIT = 75.0  # at most one per-minute quota window when the whole pool is busy
+MAX_POOL_PASSES = 3       # bounded so a genuinely dead pool never loops forever
+
+
 def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -> Tuple[Any, str]:
+    """Run one batched extraction request against the pooled keys.
+
+    Order of attempt: models x keys, with keys starting from the round-robin cursor.
+    A key (or key+model) in cooldown is skipped; if every candidate is cooling down,
+    wait for the soonest recovery and retry (bounded), so a burst of 429s rotates
+    through the pool instead of failing the batch. Invalid keys are parked for an
+    hour; quota errors park a key+model for a minute. Key material is never logged.
+    """
     if genai is None or types is None:
         raise RuntimeError("google-genai is not installed (pip install google-genai).")
     if not keys:
@@ -1528,61 +1608,77 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
     errors: List[str] = []
     uploads: Dict[str, Tuple[Any, List[Any]]] = {}
     try:
-        for model in GEMINI_MODELS:
-            for entry in keys:
-                masked = entry["masked"]
-                if cooldown_remaining(entry["id"]) > 0:
-                    errors.append(f"{masked}: cooling down")
-                    continue
-                if cooldown_remaining(f"{entry['id']}:{model}") > 0:
-                    errors.append(f"{masked} · {model}: cooling down")
-                    continue
-                if entry["id"] not in uploads:
-                    try:
-                        uploads[entry["id"]] = upload_parts(entry, batch)
-                    except Exception as exc:  # noqa: BLE001
-                        errors.append(f"{masked} upload: {scrub(exc, entry['key'])}")
-                        cooldown = classify_error(exc)
-                        if cooldown:
-                            set_cooldown(entry["id"], cooldown)
+        pool_pass = 0
+        while True:
+            pool_pass += 1
+            for model in GEMINI_MODELS:
+                for entry in rotated_keys(keys):
+                    masked = entry["masked"]
+                    if cooldown_remaining(entry["id"]) > 0:
+                        errors.append(f"{masked}: cooling down")
                         continue
-                client, handles = uploads[entry["id"]]
+                    if cooldown_remaining(f"{entry['id']}:{model}") > 0:
+                        errors.append(f"{masked} · {model}: cooling down")
+                        continue
+                    if entry["id"] not in uploads:
+                        try:
+                            uploads[entry["id"]] = upload_parts(entry, batch)
+                        except Exception as exc:  # noqa: BLE001
+                            errors.append(f"{masked} upload: {scrub(exc, entry['key'])}")
+                            cooldown = classify_error(exc)
+                            if cooldown:
+                                set_cooldown(entry["id"], cooldown)
+                            continue
+                    client, handles = uploads[entry["id"]]
 
-                contents: List[Any] = []
-                for number, (unit, handle) in enumerate(zip(batch, handles), start=1):
-                    contents.append(f"=== DOCUMENT: P{number} | {unit['label']} ===")
-                    contents.append(handle)
-                contents.append(BATCH_PROMPT)
-                set_gemini_activity(True, f"Gemini request in progress · {model}")
-                try:
-                    response = client.models.generate_content(
-                        model=model,
-                        contents=contents,
-                        config=types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            temperature=0.1,
-                            max_output_tokens=MAX_OUTPUT_TOKENS,
-                        ),
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    if is_size_error(exc):
-                        raise OversizedBatch(scrub(exc, entry["key"]))
-                    errors.append(f"{masked} · {model}: {scrub(exc, entry['key'])}")
-                    cooldown = classify_error(exc)
-                    if cooldown:
-                        set_cooldown(f"{entry['id']}:{model}", cooldown)
-                    continue
-                finally:
-                    set_gemini_activity(False)
+                    contents: List[Any] = []
+                    for number, (unit, handle) in enumerate(zip(batch, handles), start=1):
+                        contents.append(f"=== DOCUMENT: P{number} | {unit['label']} ===")
+                        contents.append(handle)
+                    contents.append(BATCH_PROMPT)
+                    set_gemini_activity(True, f"Gemini request in progress · {model}")
+                    try:
+                        response = client.models.generate_content(
+                            model=model,
+                            contents=contents,
+                            config=types.GenerateContentConfig(
+                                response_mime_type="application/json",
+                                temperature=0.1,
+                                max_output_tokens=MAX_OUTPUT_TOKENS,
+                            ),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        if is_size_error(exc):
+                            raise OversizedBatch(scrub(exc, entry["key"]))
+                        errors.append(f"{masked} · {model}: {scrub(exc, entry['key'])}")
+                        cooldown = classify_error(exc)
+                        if cooldown == AUTH_COOLDOWN_SECONDS:
+                            # A rejected/forbidden key is dead for every model, not just
+                            # this one: park the whole key for the hour.
+                            set_cooldown(entry["id"], cooldown)
+                        elif cooldown:
+                            set_cooldown(f"{entry['id']}:{model}", cooldown)
+                        continue
+                    finally:
+                        set_gemini_activity(False)
 
-                if "MAX_TOKENS" in finish_reason(response):
-                    raise OversizedBatch("response was truncated at the output token limit")
-                try:
-                    parsed = parse_batch_payload(response.text or "", labels)
-                except ValueError as exc:  # json.JSONDecodeError is a ValueError
-                    errors.append(f"{masked} · {model}: invalid JSON ({str(exc)[:120]})")
-                    continue
-                return parsed, f"{masked} · {model}"
+                    if "MAX_TOKENS" in finish_reason(response):
+                        raise OversizedBatch("response was truncated at the output token limit")
+                    try:
+                        parsed = parse_batch_payload(response.text or "", labels)
+                    except ValueError as exc:  # json.JSONDecodeError is a ValueError
+                        errors.append(f"{masked} · {model}: invalid JSON ({str(exc)[:120]})")
+                        continue
+                    record_key_success(keys, entry["id"])
+                    return parsed, f"{masked} · {model}"
+            # Full pool pass without a usable candidate: if keys are only rate- or
+            # quota-limited, wait for the soonest recovery and go around again.
+            wait = earliest_cooldown(keys)
+            if wait <= 0 or wait > MAX_COOLDOWN_WAIT or pool_pass >= MAX_POOL_PASSES:
+                break
+            set_gemini_activity(True, f"Every pooled key is cooling down; retrying in {int(wait)}s")
+            time.sleep(wait)
+            set_gemini_activity(False)
         raise RuntimeError("; ".join(errors[-6:]) or "every key and model failed")
     finally:
         for client, handles in uploads.values():
@@ -1791,8 +1887,12 @@ def _append_reason(raw: str, reason: str) -> str:
 
 
 def apply_extraction_integrity(docket_id: str) -> None:
-    """Auto-approve repeated facts and flag contradictory or ill-typed values.
+    """Flag contradictory, repeated or ill-typed values without inventing scores.
 
+    Every fact keeps the model-calibrated confidence it was assigned at extraction —
+    duplicate detection, repetition and conflicts only APPEND reasons, they never
+    overwrite the score or band. Identical duplicate extractions are still
+    auto-approved (workflow preserved), with their own per-occurrence scores intact.
     Only pending, uncorrected extraction results are changed. Human decisions remain
     authoritative and are never silently overwritten.
     """
@@ -1819,10 +1919,11 @@ def apply_extraction_integrity(docket_id: str) -> None:
                 for row in group:
                     if row["review_status"] != "pending" or row["corrected"]:
                         continue
+                    # Conflicting occurrences keep their own model scores; the reason
+                    # makes the conflict visible in Review and Validation instead.
                     reasons = _append_reason(row["confidence_reasons"], "LABEL_VALUE_CONFLICT")
                     connection.execute(
-                        """UPDATE facts SET confidence_band = 'Red', confidence_score = 1,
-                           confidence_reasons = ?, updated_at = ? WHERE id = ?""",
+                        "UPDATE facts SET confidence_reasons = ?, updated_at = ? WHERE id = ?",
                         (reasons, now, row["id"]),
                     )
                     changed = True
@@ -1850,8 +1951,8 @@ def apply_extraction_integrity(docket_id: str) -> None:
                          "Duplicate extraction matched another fact."),
                     )
                     connection.execute(
-                        """UPDATE facts SET confidence_band = 'Green', confidence_score = 100,
-                           confidence_reasons = ?, review_status = 'approved', updated_at = ?
+                        """UPDATE facts SET confidence_reasons = ?, review_status = 'approved',
+                           updated_at = ?
                            WHERE id = ?""",
                         (reasons, now, row["id"]),
                     )
@@ -1866,8 +1967,7 @@ def apply_extraction_integrity(docket_id: str) -> None:
                 continue
             reasons = _append_reason(row["confidence_reasons"], "LABEL_VALUE_MISMATCH")
             connection.execute(
-                """UPDATE facts SET confidence_band = 'Red', confidence_score = 1,
-                   confidence_reasons = ?, updated_at = ? WHERE id = ?""",
+                "UPDATE facts SET confidence_reasons = ?, updated_at = ? WHERE id = ?",
                 (reasons, now, row["id"]),
             )
             changed = True
@@ -1912,7 +2012,12 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
     results: List[Dict[str, Any]] = list(initial_results or [])
     documents: List[Dict[str, Any]] = []   # documents successfully stored, awaiting extraction
     finalized: set = set()                 # ids of documents whose facts were saved
-    total = len(uploads)
+
+    def mark_done() -> None:
+        with PROCESSING_LOCK:
+            job = PROCESSING_JOBS.get(job_id)
+            if job is not None:
+                job["done_docs"] = int(job.get("done_docs", 0)) + 1
 
     def save(
         doc: Dict[str, Any],
@@ -1955,7 +2060,7 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
     try:
         with PROCESSING_LOCK:
             PROCESSING_JOBS[job_id].update(status="running", phase="processing", gemini_active=False)
-        progress("Validating and storing uploaded documents…")
+        progress("Preparing the queued documents…")
         batch_digests: Dict[str, str] = {}  # sha256 -> filename, for duplicates inside this upload
         for upload in uploads:
             data = upload["data"]
@@ -1984,6 +2089,9 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
                 batch_digests[digest] = upload["filename"]
             else:
                 results.append(skipped)
+
+        with PROCESSING_LOCK:
+            PROCESSING_JOBS[job_id].update(total_docs=len(documents), done_docs=0)
 
         for document_index, doc in enumerate(documents, start=1):
             set_document_status(doc["id"], "processing")
@@ -2028,6 +2136,7 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
                     items,
                     " | ".join(messages),
                 ))
+                mark_done()
             except Exception as exc:  # noqa: BLE001
                 LOG.exception("document processing failed for %s", doc["filename"])
                 set_document_status(doc["id"], "failed")
@@ -2036,6 +2145,7 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
                     f"Processing failed ({clean_text(exc)[:200]}). "
                     "Completed documents were preserved; retry this document.",
                 ))
+                mark_done()
         with PROCESSING_LOCK:
             PROCESSING_JOBS[job_id].update(
                 status="complete", phase="complete", gemini_active=False,
@@ -2079,10 +2189,20 @@ def _render_processing_status(job: Optional[Dict[str, Any]]) -> None:
     if not job:
         return
     if job["status"] in {"queued", "running"}:
-        title = "Gemini is processing…" if job.get("gemini_active") else "Preparing processing…"
+        total = max(0, int(job.get("total_docs") or 0))
+        done = max(0, min(int(job.get("done_docs") or 0), total)) if total else 0
+        if job.get("gemini_active"):
+            title = "Gemini is processing…"
+        elif job["status"] == "queued":
+            title = "Queued for processing…"
+        else:
+            title = "Processing saved documents…"
         with st.status(title, state="running", expanded=True):
-            st.write(job["message"] or "Preparing the uploaded documents.")
-            st.caption("You can switch tabs safely; processing continues in the background.")
+            if total:
+                st.progress(done / total, text=f"{done} of {total} document(s) processed")
+            st.write(job.get("message") or "Preparing the saved documents.")
+            st.caption("You can switch tabs safely; processing continues in the background. "
+                       "Each document moves queued → processing → completed, partial or failed.")
     elif job["status"] == "error":
         st.error(job["message"], icon="🚫")
 
@@ -2092,72 +2212,115 @@ def render_processing_loader(docket_id: str) -> None:
     _render_processing_status(processing_job(docket_id))
 
 
-@st.fragment(run_every=1)
-def render_processing_controls(docket_id: str) -> None:
-    active_job = processing_job(docket_id)
-    if active_job and active_job.get("gemini_active"):
-        st.markdown(
-            """
-            <style>
-            .st-key-process_documents button:disabled {
-                background: #c7b9ff !important;
-                border-color: #c7b9ff !important;
-                color: #2b2350 !important;
-                opacity: 1 !important;
-            }
-                .st-key-process_documents button:disabled::before {
-                    content: "⟳";
-                    display: inline-block;
-                    margin-right: 0.45rem;
-                    animation: parchi-button-spin 0.9s linear infinite;
-                }
-                @keyframes parchi-button-spin {
-                    to { transform: rotate(360deg); }
-                }
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
+def processing_active(docket_id: Optional[str]) -> bool:
+    """True while a queued/running job exists for this docket: used to disable
+    duplicate submissions everywhere (requirement: no double submissions)."""
+    if not docket_id:
+        return False
+    job = processing_job(docket_id)
+    return bool(job and job["status"] in {"queued", "running"})
+
+
+# ---------------------------------------------------------------- save ≠ process
+def save_uploaded_document(docket_id: str, upload: Any) -> Dict[str, Any]:
+    """Store ONE uploaded file without processing it. Saving and extraction are
+    deliberately independent: the document lands in the Workspace as “saved”."""
+    filename = upload_name(upload)
+    data = upload_data(upload)
+    problem = validate_upload(filename, data)
+    if problem:
+        return job_result(filename, "failed", problem)
+    try:
+        doc, skipped = prepare_document(docket_id, filename, data, "Gemini")
+    except Exception as exc:  # noqa: BLE001
+        LOG.exception("could not store %s", filename)
+        return job_result(filename, "failed",
+                          f"Could not store the file ({clean_text(exc)[:200]}).")
+    if doc is None:
+        return skipped  # identical to an already-completed document
+    set_document_status(doc["id"], "saved")
+    return job_result(filename, "saved",
+                      f"Stored {doc['page_count']} page(s)/sheet(s). Not processed yet.")
+
+
+def render_upload_panel(docket_id: str) -> None:
+    """Workspace step 1: save uploads. No Gemini call ever happens here."""
     with st.container(border=True):
-        st.markdown("**Add documents**")
-        st.caption(
-            "Choose documents, click Save Documents to add them to the workspace, then "
-            "Gemini extraction continues in the background."
-        )
+        st.markdown("#### 1 · Upload and save documents")
+        st.caption("Saving only stores the original file in the workspace. "
+                   "Extraction runs only from step 2 below, on documents that were saved.")
+        nonce = st.session_state.get("upload_nonce", 0)
         uploads = st.file_uploader(
-            f"Drop PDF, PNG, JPG, TXT, CSV or XLSX files (up to {fmt_size(MAX_UPLOAD_BYTES)} each)",
+            f"Drop PDF, PNG, JPG, TXT, CSV or XLSX files here (up to {fmt_size(MAX_UPLOAD_BYTES)} each)",
             type=SUPPORTED_TYPES,
             accept_multiple_files=True,
-            key=f"uploads_{st.session_state.get('upload_nonce', 0)}",
-        )
-        is_active = bool(active_job and active_job["status"] in {"queued", "running"})
-        if active_job and active_job.get("gemini_active"):
-            label = "Saving and processing…"
-        elif is_active:
-            label = "Processing…"
-        else:
-            label = "Save Documents" if uploads else "Save Documents"
-        run = st.button(
-            label,
-            key="process_documents",
-            type="primary",
-            disabled=is_active or not uploads,
-            **stretch(),
+            key=f"uploads_{nonce}",
         )
         if not uploads:
-            st.caption("Choose one or more files to enable processing.")
-        if run and uploads:
-            prepared, initial_results = prepare_uploaded_documents(docket_id, uploads)
-            if prepared or initial_results:
-                process_uploads(
-                    docket_id,
-                    uploads,
-                    prepared_payload=prepared,
-                    initial_results=initial_results,
-                )
-            st.session_state["upload_nonce"] = st.session_state.get("upload_nonce", 0) + 1
+            st.caption("Choose one or more files to enable saving.")
+        if st.button("Save documents", key="save_documents", type="primary",
+                     disabled=not uploads, **stretch()):
+            if st.session_state.get("ws_saving"):
+                queue_flash("warning", "Already saving the current selection; wait for it to finish.")
+                return
+            st.session_state["ws_saving"] = True
+            try:
+                with st.spinner(f"Saving {len(uploads)} document(s) to the workspace…"):
+                    results = [save_uploaded_document(docket_id, upload) for upload in uploads]
+            finally:
+                st.session_state["ws_saving"] = False
+            st.session_state["upload_nonce"] = nonce + 1
+            saved = sum(result["status"] == "saved" for result in results)
+            for result in results:
+                if result["status"] == "failed":
+                    queue_flash("error", f"“{result['filename']}” was not saved: {result['message']}")
+                elif result["status"] == "skipped":
+                    queue_flash("warning", f"“{result['filename']}” skipped: {result['message']}")
+            if saved:
+                queue_flash("success", f"Saved {saved} document(s). Pick them in step 2 to run extraction.")
             st.rerun(scope="app")
-    _render_processing_status(processing_job(docket_id))
+
+
+def load_saved_document(docket_id: str, document_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Rebuild the worker's document payload from the STORED original and the saved
+    page rows — never from temporary session memory — after a checksum verification."""
+    with connect() as connection:
+        row = connection.execute(
+            """SELECT id, filename, mime_type, sha256, storage_path, page_count, status
+               FROM documents WHERE id = ? AND docket_id = ?""",
+            (document_id, docket_id),
+        ).fetchone()
+        if row is None:
+            return None, "That document no longer exists in this docket."
+        pages = connection.execute(
+            """SELECT page_number, sheet_name, text, readable FROM pages
+               WHERE document_id = ? ORDER BY page_number""",
+            (document_id,),
+        ).fetchall()
+    data, problem = read_verified(row["storage_path"], row["sha256"])
+    if problem:
+        return None, problem
+    page_list = [{"page_number": p["page_number"], "sheet_name": p["sheet_name"],
+                  "text": p["text"], "readable": bool(p["readable"])} for p in pages]
+    document = {
+        "id": row["id"], "filename": row["filename"], "mime": row["mime_type"],
+        "data": data, "pages": page_list, "page_count": row["page_count"],
+        "page_text": {p["page_number"]: (p["text"] if p["readable"] else None) for p in page_list},
+        "units": [],
+    }
+    return document, None
+
+
+def clear_document_facts(document_id: str) -> None:
+    """Re-processing replaces the document's earlier extraction: drop its facts
+    (fact_history cascades) and reset its completeness counters first."""
+    with connect() as connection:
+        connection.execute("DELETE FROM facts WHERE document_id = ?", (document_id,))
+        connection.execute(
+            """UPDATE documents SET processed_units = 0, failed_units = 0,
+               completeness_status = 'pending', completeness_message = '' WHERE id = ?""",
+            (document_id,),
+        )
 
 
 JOB_RETENTION_SECONDS = 3600
@@ -2173,76 +2336,124 @@ def _prune_finished_jobs() -> None:
             del PROCESSING_JOBS[stale_id]
 
 
-def prepare_uploaded_documents(
-    docket_id: str, uploads: List[Any]
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    payload: List[Dict[str, Any]] = []
-    results: List[Dict[str, Any]] = []
-    batch_digests: Dict[str, str] = {}
-    for upload in uploads:
-        filename = upload.name
-        data = upload.getvalue()
-        digest = hashlib.sha256(data).hexdigest()
-        problem = validate_upload(filename, data)
-        if not problem and digest in batch_digests:
-            results.append(job_result(
-                filename, "skipped",
-                f"Identical to “{batch_digests[digest]}” in this upload.",
-            ))
-            continue
-        if problem:
-            results.append(job_result(filename, "failed", problem))
-            continue
-        try:
-            doc, skipped = prepare_document(docket_id, filename, data, "Gemini")
-        except Exception as exc:  # noqa: BLE001
-            LOG.exception("prepare failed for %s", filename)
-            results.append(job_result(
-                filename, "failed",
-                f"Could not store the file ({clean_text(exc)[:200]}).",
-            ))
-            continue
-        if doc is None:
-            results.append(skipped)
-            continue
-        set_document_status(doc["id"], "queued")
-        batch_digests[digest] = filename
-        payload.append({"filename": filename, "data": data, "document": doc})
-    return payload, results
-
-
-def process_uploads(
-    docket_id: str,
-    uploads: List[Any],
-    prepared_payload: Optional[List[Dict[str, Any]]] = None,
-    initial_results: Optional[List[Dict[str, Any]]] = None,
-) -> None:
+def queue_saved_documents(docket_id: str, document_ids: List[str]) -> Tuple[int, List[Dict[str, Any]]]:
+    """Queue saved documents for background extraction, from stored bytes only.
+    Returns (count queued, immediate failure results) and flashes suitable messages."""
     keys = key_pool()
     if not keys:
-        queue_flash("error", "Gemini processing needs at least one valid API key. Add one in Settings.")
-        return
+        queue_flash(
+            "error",
+            f"No Gemini API keys are configured. Add 4–5 keys to “gemini_api_keys” in "
+            f"{CONFIG_PATH.name} (see Settings) before processing.",
+        )
+        return 0, []
     existing = processing_job(docket_id)
-    if existing and existing["status"] == "running":
+    if existing and existing["status"] in {"queued", "running"}:
         queue_flash("warning", "This docket is already being processed in the background.")
-        return
+        return 0, []
     _prune_finished_jobs()
+    wanted = set(document_ids)
+    payloads: List[Dict[str, Any]] = []
+    results: List[Dict[str, Any]] = []
+    for row in list_documents(docket_id):
+        if row["id"] not in wanted or row["status"] not in PROCESSABLE_STATES:
+            continue
+        document, problem = load_saved_document(docket_id, row["id"])
+        if problem:
+            set_document_status(row["id"], "failed")
+            results.append(job_result(row["filename"], "failed", problem))
+            continue
+        clear_document_facts(row["id"])
+        set_document_status(row["id"], "queued")
+        payloads.append({"filename": row["filename"], "data": document["data"], "document": document})
+    if not payloads:
+        queue_flash("info", "No queued documents to start on.")
+        return 0, results
     job_id = str(uuid.uuid4())
-    payload = (
-        prepared_payload
-        if prepared_payload is not None
-        else [{"filename": upload.name, "data": upload.getvalue()} for upload in uploads]
-    )
     with PROCESSING_LOCK:
         PROCESSING_JOBS[job_id] = {
             "id": job_id, "docket_id": docket_id, "status": "queued", "phase": "queued",
-            "gemini_active": False, "message": "Queued for Gemini extraction…", "results": [],
-            "finished_at": 0.0,
+            "gemini_active": False, "message": "Queued for Gemini extraction…",
+            "results": results, "total_docs": len(payloads), "done_docs": 0, "finished_at": 0.0,
         }
-    PROCESSING_EXECUTOR.submit(
-        _run_processing_job, job_id, docket_id, payload, keys, initial_results
-    )
-    queue_flash("success", "Processing started in the background. You can switch tabs safely.")
+    PROCESSING_EXECUTOR.submit(_run_processing_job, job_id, docket_id, payloads, keys, [])
+    queue_flash("success", f"Queued {len(payloads)} document(s) for Gemini extraction. "
+                           "Progress appears in step 2; you can switch tabs safely.")
+    return len(payloads), results
 
+
+@st.fragment(run_every=1)
+def render_process_panel(docket_id: str) -> None:
+    """Workspace step 2: choose saved documents and start extraction on them.
+    Reruns every second while idle too, so the state counts and progress stay live."""
+    job = processing_job(docket_id)
+    active = bool(job and job["status"] in {"queued", "running"})
+    # Surface a finished run into the main page exactly once, so the results panel
+    # and the stored-documents table refresh without waiting for a manual rerun.
+    if job and job["status"] in {"complete", "error"} \
+            and st.session_state.get("last_surfaced_job_id") != job["id"]:
+        st.session_state["last_results"] = job.get("results") or []
+        st.session_state["last_surfaced_job_id"] = job["id"]
+        st.rerun(scope="app")
+    with st.container(border=True):
+        st.markdown("#### 2 · Process saved documents")
+        documents = list_documents(docket_id)
+        if documents:
+            counts: Dict[str, int] = {}
+            for d in documents:
+                counts[d["status"]] = counts.get(d["status"], 0) + 1
+            st.markdown(
+                " ".join(
+                    badge(
+                        f"{document_state_label(status)}: {counts[status]}",
+                        DOCUMENT_STATE_META.get(status, ("", ""))[1],
+                    )
+                    for status in ("saved", "pending", "queued", "processing", "completed", "partial", "failed")
+                    if status in counts
+                ),
+                unsafe_allow_html=True,
+            )
+        st.caption("Extraction reads the stored original (checksum-verified) and sends it to the "
+                   "pooled Gemini keys. Saved, failed and partially processed documents are listed; "
+                   "re-running a partial document replaces its earlier results.")
+        processable = [d for d in documents if d["status"] in PROCESSABLE_STATES]
+        if not processable and not active:
+            st.info("No documents are waiting to be processed. Save files in step 1 above first.")
+        elif processable:
+            labels = {
+                d["id"]: (
+                    f"{d['filename']} · {d['page_count']} page(s)/sheet(s) · "
+                    f"{document_state_label(d['status'])}"
+                    + (" — re-run replaces earlier results" if d["status"] == "partial" else "")
+                )
+                for d in processable
+            }
+            chosen = st.multiselect(
+                "Documents to process",
+                list(labels),
+                format_func=lambda identifier: labels[identifier],
+                key="process_pick",
+                disabled=active,
+                help="Pick one or more; or use “Process all ready” for everything waiting.",
+            )
+            selected_col, all_col = st.columns(2)
+            start_selected = selected_col.button(
+                f"Process selected ({len(chosen)})",
+                type="primary", key="process_selected",
+                disabled=active or not chosen, **stretch(),
+            )
+            start_all = all_col.button(
+                f"Process all ready ({len(processable)})",
+                key="process_all", disabled=active, **stretch(),
+            )
+            if start_selected or start_all:
+                ids = list(chosen) if start_selected else list(labels)
+                queue_saved_documents(docket_id, ids)
+                st.session_state.pop("process_pick", None)
+                st.rerun(scope="app")
+        _render_processing_status(job)
+        if active:
+            st.caption("A run is active, so the process buttons are disabled to avoid duplicate submissions.")
 
 # ---------------------------------------------------------------- review operations
 def update_fact(fact_id: str, value: str, status: str, reason: str) -> None:
@@ -2266,10 +2477,14 @@ def update_fact(fact_id: str, value: str, status: str, reason: str) -> None:
                  row["review_status"], status, now, reason),
             )
         corrected = int(bool(row["corrected"]) or value != row["original_value"])
-        if status == "approved":
-            band, score, reasons = "Green", 100, ["HUMAN_APPROVED"]
-        elif status == "rejected":
-            band, score, reasons = "Red", 1, ["HUMAN_REJECTED"]
+        if status in ("approved", "rejected"):
+            # A human decision changes the review status only: the model's per-occurrence
+            # confidence score is preserved exactly as extracted (band follows the score).
+            score = clamp_confidence(row["confidence_score"], 50)
+            band = band_for(score)
+            reasons = [r for r in json.loads(row["confidence_reasons"] or "[]")
+                       if r not in {"HUMAN_APPROVED", "HUMAN_REJECTED"}]
+            reasons.append("HUMAN_APPROVED" if status == "approved" else "HUMAN_REJECTED")
         else:
             page_text = row["page_text"] if row["page_readable"] else None
             assessment = assess(value, row["source_evidence"], page_text)
@@ -2512,7 +2727,21 @@ def metadata_records(docket_id: str) -> List[dict]:
 
 
 def client_template_records(docket_id: str, template: sqlite3.Row) -> Tuple[List[dict], List[str]]:
-    labels = json.loads(template["labels_json"])
+    """All Main Metadata occurrences mapped under this template's labels.
+
+    - Approved mappings win first; a source label exactly equal (case-insensitively)
+      to a template label also maps — the same rule Organize/Exports apply — even if
+      the user has not visited those pages yet (this was hiding legitimate rows).
+    - Duplicates and conflicting values stay as separate rows; document names and
+      confidence scores come through unchanged.
+    - A damaged labels_json never takes the viewer down with it: it is treated as
+      an empty template and reported by the caller via the ``missing`` list.
+    """
+    try:
+        raw_labels = json.loads(template["labels_json"])
+        labels = [str(label) for label in raw_labels] if isinstance(raw_labels, list) else []
+    except (TypeError, ValueError):
+        labels = []
     records = metadata_records(docket_id)
     mappings = approved_mappings(docket_id, template["id"])
     output: List[dict] = []
@@ -2526,10 +2755,38 @@ def client_template_records(docket_id: str, template: sqlite3.Row) -> Tuple[List
     mapping_by_normalized = {normalize_label(source): target for source, target in mappings.items()}
     for record in records:
         target = mapping_by_normalized.get(normalize_label(record["label"]))
+        if target is None:
+            exact = exact_template_label(record["label"], labels)
+            if exact is not None:
+                target = exact
         if target in matched:
             output.append({**record, "label": target})
             matched[target] += 1
     return output, [label for label, count in matched.items() if count == 0]
+
+
+def ensure_exact_mappings(docket_id: str, template_id: str) -> None:
+    """Idempotently record exact label matches as mappings before rendering a client
+    template — identical semantics to the auto-exact step in Organize and Export, so
+    the Viewer shows every mapped record even when that step has not been visited.
+    Deliberate human mappings to a different target always win (checked first)."""
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT labels_json FROM templates WHERE id = ?", (template_id,)
+        ).fetchone()
+    if row is None:
+        return
+    try:
+        template_labels = [str(label) for label in json.loads(row["labels_json"])]
+    except (TypeError, ValueError):
+        return
+    approved = approved_mappings(docket_id, template_id)
+    for source in unique_labels(metadata_records(docket_id)):
+        if source in approved:
+            continue
+        exact = exact_template_label(source, template_labels)
+        if exact is not None:
+            save_mapping(docket_id, template_id, source, exact, "exact")
 
 
 def build_metadata_export(records: List[dict], description: str) -> Tuple[bytes, int]:
@@ -2683,6 +2940,23 @@ def inject_css() -> None:
         .empty h3 { color: var(--ink); margin: 6px 0; font-size:18px; }
         .kv { color:var(--muted); font-size:13px; }
 
+        /* colour-coded confidence filter pills (fixed option order: Green, Yellow, Red) */
+        .st-key-review_band div[data-testid="stPills"] button {
+            border-width: 1.5px !important; font-weight: 700 !important;
+        }
+        .st-key-review_band div[data-testid="stPills"] button:nth-child(1) {
+            border-color: rgba(79,214,168,.75) !important; color: var(--ok) !important; }
+        .st-key-review_band div[data-testid="stPills"] button:nth-child(2) {
+            border-color: rgba(242,196,109,.75) !important; color: var(--warn) !important; }
+        .st-key-review_band div[data-testid="stPills"] button:nth-child(3) {
+            border-color: rgba(255,133,133,.75) !important; color: var(--bad) !important; }
+        .st-key-review_band div[data-testid="stPills"] button:nth-child(1)[aria-pressed="true"] {
+            background: rgba(79,214,168,.18) !important; }
+        .st-key-review_band div[data-testid="stPills"] button:nth-child(2)[aria-pressed="true"] {
+            background: rgba(242,196,109,.18) !important; }
+        .st-key-review_band div[data-testid="stPills"] button:nth-child(3)[aria-pressed="true"] {
+            background: rgba(255,133,133,.18) !important; }
+
         /* responsive: let column rows wrap on narrow screens */
         @media (max-width: 900px) {
             div[data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; row-gap: .5rem; }
@@ -2755,6 +3029,7 @@ def render_topbar(dockets: List[sqlite3.Row]) -> Optional[sqlite3.Row]:
     keys = len(key_pool())
     cooling = sum(1 for until in st.session_state.get("key_cooldowns", {}).values() if until > time.time())
     rejected = len(rejected_keys())
+    current_docket = active_docket(dockets)
 
     brand, docket_col, chips_col = st.columns([3, 3, 3], vertical_alignment="center")
     with brand:
@@ -2765,10 +3040,16 @@ def render_topbar(dockets: List[sqlite3.Row]) -> Optional[sqlite3.Row]:
             unsafe_allow_html=True,
         )
     with docket_col:
-        if dockets:
-            names = {d["id"]: d["name"] for d in dockets}
-            st.selectbox("Active docket", ids, key="active_docket",
-                         format_func=lambda i: names[i], label_visibility="collapsed")
+        # No dropdown here (removed the stray one): the open docket is shown read-only,
+        # and switching dockets happens explicitly on the Dockets tab.
+        if current_docket is not None:
+            st.markdown(
+                '<div class="chips" style="justify-content:center">'
+                f'<span class="chip accent" role="status" '
+                f'title="Open docket — switch on the Dockets tab">▤ {esc(current_docket["name"])}</span>'
+                "</div>",
+                unsafe_allow_html=True,
+            )
         else:
             st.button("＋ Create your first docket", type="primary", on_click=go_to, args=("Dockets",),
                       **stretch())
@@ -2854,40 +3135,6 @@ def delete_document_callback(docket_id: str, document_id: str, filename: str) ->
         queue_flash("success", f"“{filename}” and its extracted facts were removed.")
     else:
         queue_flash("warning", "That document was already removed.")
-
-
-@guarded
-def add_key_callback() -> None:
-    raw = st.session_state.get("add_key_input", "").strip()
-    remember = bool(st.session_state.get("add_key_remember", False))
-    problem = key_problem(raw)
-    if problem:
-        queue_flash("error", problem)
-    elif any(e["key"] == raw for e in key_pool()):
-        queue_flash("warning", "That key is already in the pool.")
-    elif remember:
-        try:
-            save_key_persistently(raw)
-            queue_flash("success", "Key saved securely (OS credential store) and will still be "
-                                    "there next time you open Parchi AI.")
-        except RuntimeError as exc:
-            st.session_state.setdefault("session_keys", []).append(raw)
-            queue_flash("warning", f"{exc} Added for this session instead.")
-    else:
-        st.session_state.setdefault("session_keys", []).append(raw)
-        queue_flash("success", "Key added for this session. It is not saved to disk.")
-    st.session_state["add_key_input"] = ""
-
-
-@guarded
-def remove_key_callback(identifier: str) -> None:
-    before = len(st.session_state.get("session_keys", []))
-    st.session_state["session_keys"] = [
-        k for k in st.session_state.get("session_keys", []) if key_id(str(k).strip()) != identifier
-    ]
-    if len(st.session_state["session_keys"]) == before:
-        remove_persisted_key(identifier)
-    queue_flash("success", "Key removed.")
 
 
 @guarded
@@ -2978,7 +3225,9 @@ def page_dockets(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> N
 
 
 def page_workspace(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
-    page_header("Workspace", "Upload supplier documents, run extraction and manage the stored originals.",
+    page_header("Workspace",
+                "Keep this docket's supplier documents here: step 1 saves files without "
+                "processing them, step 2 runs Gemini extraction on saved documents.",
                 active["name"] if active else None)
     if not need_docket(active):
         return
@@ -2991,28 +3240,11 @@ def page_workspace(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) ->
     metrics[1].metric("Facts", len(facts))
     metrics[2].metric("Pending review", sum(f["review_status"] == "pending" for f in facts))
 
-    render_processing_controls(docket_id)
-    job = processing_job(docket_id)
-    if job and job["status"] in {"queued", "running"}:
-        st.info(f"Background processing is active: {job['message']}", icon="⏳")
-    elif (job and job["status"] in {"complete", "error"} and job.get("results")
-          and st.session_state.get("last_surfaced_job_id") != job["id"]):
-        st.session_state["last_results"] = job["results"]
-        st.session_state["last_surfaced_job_id"] = job["id"]
+    render_upload_panel(docket_id)
+    render_process_panel(docket_id)
 
     results = st.session_state.get("last_results")
     if results:
-        summary = st.session_state.get("last_run_summary", {})
-        if summary:
-            st.markdown("#### Latest processing summary")
-            summary_cols = st.columns(7)
-            summary_cols[0].metric("Uploaded", summary.get("total", 0))
-            summary_cols[1].metric("Completed", summary.get("completed", 0))
-            summary_cols[2].metric("Processing", 0)
-            summary_cols[3].metric("Failed", summary.get("failed", 0))
-            summary_cols[4].metric("Partial", summary.get("partial", 0))
-            summary_cols[5].metric("Pending", summary.get("pending", 0))
-            summary_cols[6].metric("Facts appended", summary.get("appended", 0))
         with st.expander("Latest processing run", expanded=True):
             for result in results:
                 text = (
@@ -3025,24 +3257,29 @@ def page_workspace(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) ->
                     st.warning(text, icon="⚠️")
                 else:
                     st.success(text, icon="✅")
-            st.button("Dismiss", key="dismiss_results", on_click=lambda: st.session_state.pop("last_results", None))
+            st.button("Dismiss", key="dismiss_results",
+                      help="Hide this summary. It reappears after the next run.",
+                      on_click=lambda: st.session_state.pop("last_results", None))
 
-    st.markdown("#### Stored documents")
+    st.markdown("#### 3 · Stored documents")
+    st.caption("Everything saved in this docket, processing state included. “Saved” documents "
+               "are stored but not extracted yet.")
     if not documents:
-        empty_state("No documents in this docket", "Upload files above. Originals are kept on disk until you remove them.")
+        empty_state("No documents in this docket",
+                    "Save files in step 1 above. They stay available here until you process or remove them.")
         return
 
     st.dataframe(
         [
             {
                 "Document": d["filename"],
+                "State": document_state_label(d["status"]),
                 "Type": d["document_type"],
                 "Pages": d["page_count"],
                 "Processed": f"{d['processed_units']}/{d['page_count']}",
                 "Completeness": d["completeness_status"],
                 "Size": fmt_size(d["size_bytes"]),
                 "Extraction": d["extraction_mode"],
-                "Status": d["status"],
                 "Added": display_time(d["created_at"]),
                 "File on disk": "✔" if resolve_stored_safe(d["storage_path"]) else "missing",
             }
@@ -3052,24 +3289,53 @@ def page_workspace(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) ->
         **stretch(),
     )
 
-    st.markdown("#### File actions")
+    st.markdown("#### 4 · Document actions")
     by_id = {d["id"]: d for d in documents}
-    chosen_id = st.selectbox("Document", list(by_id), format_func=lambda i: by_id[i]["filename"], key="file_pick")
+    chosen_id = st.selectbox(
+        "Choose a document",
+        list(by_id),
+        format_func=lambda i: f"{by_id[i]['filename']} — {document_state_label(by_id[i]['status'])}",
+        key="file_pick",
+        help="Select the document you want to inspect, download, process or remove.",
+    )
     chosen = by_id[chosen_id]
     with st.container(border=True):
-        info_col, download_col, remove_col = st.columns([3, 1, 2], vertical_alignment="center")
-        with info_col:
-            st.markdown(f"**{chosen['filename']}**")
-            st.caption(f"{chosen['mime_type']} · {chosen['page_count']} page(s) · "
-                       f"{fmt_size(chosen['size_bytes'])} · added {display_time(chosen['created_at'])}")
+        badge_col, hint_col = st.columns([3, 1])
+        badge_col.markdown(
+            f"**{chosen['filename']}** · {document_state_badge(chosen['status'])}",
+            unsafe_allow_html=True,
+        )
+        hint_col.caption(f"{document_state_label(chosen['status'])}")
+        st.caption(f"{chosen['mime_type']} · {chosen['page_count']} page(s)/sheet(s) · "
+                   f"{fmt_size(chosen['size_bytes'])} · added {display_time(chosen['created_at'])}")
         data, problem = read_verified(chosen["storage_path"], chosen["sha256"])
-        with download_col:
+        action_cols = st.columns([2, 1, 2], vertical_alignment="center")
+        with action_cols[0]:
+            if chosen["status"] in PROCESSABLE_STATES:
+                if st.button(
+                    "Process this document",
+                    type="primary",
+                    key=f"process_one_{chosen_id}",
+                    disabled=processing_active(docket_id),
+                    help="Run Gemini extraction on the stored original now.",
+                    **stretch(),
+                ):
+                    queue_saved_documents(docket_id, [chosen_id])
+                    st.rerun(scope="app")
+            elif chosen["status"] in ("queued", "processing", "saving"):
+                st.button("Process this document", disabled=True,
+                          help="This document is already queued or processing.", **stretch())
+            else:
+                st.button("Process this document", disabled=True,
+                          help="Already processed. Remove it and save it again to re-extract.",
+                          **stretch())
+        with action_cols[1]:
             if data is not None:
                 st.download_button("Download", data, file_name=chosen["filename"],
                                    mime=chosen["mime_type"], **stretch())
             else:
                 st.button("Unavailable", disabled=True, help=problem, **stretch())
-        with remove_col:
+        with action_cols[2]:
             with st.popover("Remove document", **stretch()):
                 st.markdown(f"Remove **{chosen['filename']}**?")
                 st.caption("Deletes the stored original, its pages and every fact extracted from it. "
@@ -3082,7 +3348,7 @@ def page_workspace(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) ->
         if problem:
             st.error(problem, icon="🚫")
 
-    with st.expander("Docket actions"):
+    with st.expander("5 · Docket actions"):
         st.caption("Rename or delete this docket. Deleting removes all of its documents and stored files.")
         rename_key = f"ws_rename_{docket_id}"
         rename_col, rename_btn = st.columns([4, 1], vertical_alignment="bottom")
@@ -3161,7 +3427,26 @@ def page_review(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
     documents = sorted({f["filename"] for f in facts})
     doc_col, band_col, status_col = st.columns(3)
     doc_filter = doc_col.selectbox("Document", ["All documents"] + documents, key="review_doc")
-    band_filter = band_col.multiselect("Confidence", list(BANDS), default=list(BANDS), key="review_band")
+    with band_col:
+        st.markdown(
+            "**Confidence band** "
+            + " ".join(
+                badge(f"{band} — {meaning}", kind, icon)
+                for band, (kind, icon), meaning in zip(
+                    BANDS, BAND_META.values(), ("high", "medium", "low")
+                )
+            ),
+            unsafe_allow_html=True,
+        )
+        band_filter = st.pills(
+            "Confidence band",
+            list(BANDS),
+            selection_mode="multi",
+            default=list(BANDS),
+            key="review_band",
+            label_visibility="collapsed",
+            help="Green = high confidence (score > 80), Yellow = medium (66–80), Red = low (≤ 65).",
+        ) or []
     status_filter = status_col.selectbox("Review status", ["All"] + list(REVIEW_STATUSES), key="review_status")
 
     visible = [
@@ -3172,7 +3457,13 @@ def page_review(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
     ]
     green_pending = sum(f["confidence_band"] == "Green" and f["review_status"] == "pending" for f in facts)
     summary_col, bulk_col = st.columns([3, 1], vertical_alignment="center")
-    summary_col.caption(f"{len(visible)} of {len(facts)} facts shown.")
+    band_counts = {band: sum(f["confidence_band"] == band for f in visible) for band in BANDS}
+    summary_col.markdown(
+        f"Showing **{len(visible)}** of {len(facts)} facts: "
+        + " ".join(badge(f"{band} {count}", BAND_META[band][0], BAND_META[band][1])
+                   for band, count in band_counts.items()),
+        unsafe_allow_html=True,
+    )
     bulk_col.button(f"Approve Green pending ({green_pending})", on_click=approve_green_callback,
                     args=(docket_id,), disabled=green_pending == 0, **stretch())
 
@@ -3308,7 +3599,8 @@ def _document_label_picker(docket_id: str, metadata: List[dict], sections: Dict[
     pills of another document or any submitted section."""
     document_names = sorted({record["document_name"] for record in metadata}, key=str.casefold)
     with st.container(border=True):
-        st.markdown("**1. Pick labels from one document**")
+        st.markdown("**1 · Pick labels from one document**")
+        st.caption(f"{len(document_names)} document(s) with extracted labels are available.")
         document_name = st.selectbox(
             "Uploaded document",
             ["Select a document", *document_names],
@@ -3326,11 +3618,13 @@ def _document_label_picker(docket_id: str, metadata: List[dict], sections: Dict[
         if not available:
             st.success("Every label from this document has already been submitted.", icon="✅")
             return
+        st.caption(f"{len(available)} unique label(s) available from “{document_name}”. "
+                   "Selected pills are highlighted; click again to unselect.")
         # The key embeds the submission count, so the widget starts fresh whenever
         # this document's section changes. st.pills renders selected pills in the
         # accent colour and unselected ones outlined, so selection state is visual.
         picked = st.pills(
-            f"Unique labels extracted from “{document_name}”",
+            f"Labels from “{document_name}”",
             available,
             selection_mode="multi",
             key=f"template_pills_{docket_id}_{scope}_{key_id(document_name)}_{len(sections.get(document_name, []))}",
@@ -3351,27 +3645,33 @@ def _document_label_picker(docket_id: str, metadata: List[dict], sections: Dict[
 
 def _submitted_sections_editor(docket_id: str, sections: Dict[str, List[str]], scope: str) -> None:
     """Step 2 (shared): one bordered section per submitted document, filename as
-    heading, selected labels as editable pills beneath it."""
-    st.markdown("#### 2. Submitted document sections")
+    heading, selected labels as editable pills beneath it. Selections stay visible
+    until explicitly removed."""
+    st.markdown("#### 2 · Submitted document sections")
     if not sections:
         st.info("Pick labels above and click Submit labels. Every submitted document gets its own section here.")
         return
+    total_labels = sum(len(section_labels) for section_labels in sections.values())
+    st.caption(f"{len(sections)} document section(s) · {total_labels} label(s) currently selected. "
+               "Click a highlighted pill to remove it from the section; remove a whole section "
+               "with its Remove section button.")
     for document, section_labels in list(sections.items()):
         with st.container(border=True):
             head_col, clear_col = st.columns([5, 1], vertical_alignment="center")
             head_col.markdown(f"**{document}**")
             head_col.caption(f"{len(section_labels)} label(s) selected")
-            if clear_col.button("Remove section", key=f"template_drop_{docket_id}_{scope}_{key_id(document)}", **stretch()):
+            if clear_col.button("Remove section", key=f"template_drop_{docket_id}_{scope}_{key_id(document)}",
+                                help=f"Remove the whole “{document}” section from this template.",
+                                **stretch()):
                 del sections[document]
                 st.session_state[template_sections_key(docket_id, scope)] = sections
                 st.rerun()
             kept = st.pills(
-                f"Labels for {document}",
+                f"Labels selected for {document}",
                 section_labels,
                 selection_mode="multi",
                 default=section_labels,
                 key=f"template_section_{docket_id}_{scope}_{key_id(document)}_{len(section_labels)}",
-                label_visibility="collapsed",
                 width="stretch",
             )
             kept = list(kept) if kept is not None else list(section_labels)
@@ -3396,7 +3696,7 @@ def create_template_mode(active: sqlite3.Row, metadata: List[dict]) -> None:
     sections: Dict[str, List[str]] = st.session_state.setdefault(template_sections_key(docket_id, scope), {})
     _document_label_picker(docket_id, metadata, sections, scope)
     _submitted_sections_editor(docket_id, sections, scope)
-    st.markdown("#### 3. Save template")
+    st.markdown("#### 3 · Save template")
     all_labels = _dedupe_labels(label for labels in sections.values() for label in labels)
     name = st.text_input("Template name", key=f"template_name_{docket_id}", max_chars=120)
     st.caption(f"{len(all_labels)} unique label(s) will be saved.")
@@ -3446,12 +3746,11 @@ def edit_template_mode(active: sqlite3.Row, metadata: List[dict]) -> None:
         st.markdown("**Current template labels**")
         st.caption("Deselect a pill to remove that label when you save. Labels are never renamed here.")
         kept = st.pills(
-            "Current labels",
+            "Current labels in this template — deselect a pill to drop it on save",
             state["labels"],
             selection_mode="multi",
             default=state["labels"],
             key=f"template_edit_labels_{docket_id}_{template_id}_{len(state['labels'])}",
-            label_visibility="collapsed",
             width="stretch",
         )
         kept = list(kept) if kept is not None else list(state["labels"])
@@ -3462,7 +3761,7 @@ def edit_template_mode(active: sqlite3.Row, metadata: List[dict]) -> None:
     _document_label_picker(docket_id, metadata, sections, scope)
     _submitted_sections_editor(docket_id, sections, scope)
 
-    st.markdown("#### 3. Save changes")
+    st.markdown("#### 3 · Save changes")
     combined = _dedupe_labels([*state["labels"], *(label for labels in sections.values() for label in labels)])
     name = st.text_input("Template name", value=template["name"], key=f"template_edit_name_{docket_id}", max_chars=120)
     st.caption(f"{len(combined)} unique label(s) will be saved.")
@@ -3560,9 +3859,33 @@ def apply_template_mode(active: sqlite3.Row, metadata: List[dict]) -> None:
             unmatched.append(source)
 
     st.caption(
-        f"{len(labels)} unique extracted label(s) compared against "
-        f"{len(template_labels)} template label(s)."
+        f"{len(labels)} unique extracted label(s) from {len(chosen_documents)} document(s), "
+        f"compared against {len(template_labels)} template label(s)."
     )
+
+    with st.container(border=True):
+        st.markdown("**Current mapping decisions**")
+        st.caption("Every approved mapping for this template stays in effect — across the "
+                   "Viewer, Export and future runs — until you unmap it here.")
+        if details:
+            st.dataframe(
+                [
+                    {
+                        "Extracted label": source,
+                        "Template label": info["target"],
+                        "Decided by": {
+                            "exact": "Exact match (automatic)",
+                            "user-approved": "Approved by you",
+                            "manual": "Mapped by you",
+                        }.get(info["method"], info["method"]),
+                    }
+                    for source, info in sorted(details.items(), key=lambda item: item[0].casefold())
+                ],
+                hide_index=True, **stretch(),
+            )
+        else:
+            st.caption("No mapping decisions yet — approve a fuzzy suggestion or map an "
+                       "unmatched label below to create one.")
 
     with st.container(border=True):
         st.markdown("**Exact matches (mapped automatically)**")
@@ -3600,10 +3923,9 @@ def apply_template_mode(active: sqlite3.Row, metadata: List[dict]) -> None:
                 c1, c2, c3, c4 = st.columns([2, 2, 1, 1.4], vertical_alignment="center")
                 c1.markdown(f"`{source}`")
                 target = c2.selectbox(
-                    "Map to",
+                    f"Map “{source}” to",
                     template_labels,
                     key=f"tpl_manual_t_{docket_id}_{template_id}_{key_id(source)}",
-                    label_visibility="collapsed",
                 )
                 if c3.button("Map", key=f"tpl_manual_b_{docket_id}_{template_id}_{key_id(source)}", width="stretch"):
                     save_mapping(docket_id, template_id, source, target, "manual")
@@ -3629,6 +3951,24 @@ def apply_template_mode(active: sqlite3.Row, metadata: List[dict]) -> None:
             st.caption("No manual or fuzzy-approved mappings yet.")
 
 
+ORGANIZE_MODES = ("Create new template", "Edit existing template", "Apply existing template")
+ORGANIZE_MODE_HELP = {
+    "Create new template": (
+        "Build a template purely from labels you pick document by document in steps 1–3 "
+        "below. Nothing is mapped yet and Main Metadata is never changed."
+    ),
+    "Edit existing template": (
+        "Add labels to (or drop labels from) a saved template. Approved mappings are kept; "
+        "only mappings to labels you drop are pruned."
+    ),
+    "Apply existing template": (
+        "Compare the extracted labels with a saved template. Exact matches map automatically, "
+        "fuzzy suggestions need your approval, and every mapping decision stays visible below. "
+        "Main Metadata values are never modified."
+    ),
+}
+
+
 def page_organize(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
     page_header("Organize", "Create, edit or apply reusable client templates. "
                 "Main Metadata is never modified by template operations.", active["name"] if active else None)
@@ -3636,63 +3976,136 @@ def page_organize(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> 
         return
     metadata = metadata_records(active["id"])
     if not metadata:
-        st.info("Process documents first. The Main Metadata File will appear here after extraction.")
+        st.info("Process documents first. Save files in Workspace step 1, run extraction in "
+                "step 2, then the Main Metadata File will be available here.")
         return
-    st.metric("Unique extracted labels", len(unique_labels(metadata)))
+    overview = st.columns(3)
+    overview[0].metric("Documents with labels", len({record["document_name"] for record in metadata}))
+    overview[1].metric("Unique extracted labels", len(unique_labels(metadata)))
+    overview[2].metric("Saved templates", len(list_templates(active["id"])))
+    st.caption("The three operations are separate: pick one, and only its controls appear below. "
+               "Your submitted selections and mapping decisions remain visible inside each mode.")
     mode = st.radio(
-        "Operation",
-        ["Create new template", "Edit existing template", "Apply existing template"],
+        "Choose an operation",
+        list(ORGANIZE_MODES),
         horizontal=True,
         key="org_mode",
     )
+    with st.container(border=True):
+        st.markdown(f"**{mode}**")
+        st.caption(ORGANIZE_MODE_HELP[mode])
     if mode == "Create new template":
         create_template_mode(active, metadata)
     elif mode == "Edit existing template":
         edit_template_mode(active, metadata)
     else:
         apply_template_mode(active, metadata)
+def confidence_score_style(value: object) -> str:
+    """Cell colouring for confidence scores — identical thresholds to the bands
+    used everywhere else (Green > 80, Yellow 66–80, Red <= 65)."""
+    score = clamp_confidence(value, 50)
+    if score > 80:
+        return "background-color: #1f7a4d; color: #f0fff7; font-weight: 700"
+    if score > 65:
+        return "background-color: #8a6d1d; color: #fff8d6; font-weight: 700"
+    return "background-color: #8c3540; color: #fff1f2; font-weight: 700"
+
+
+VIEWER_COLUMNS = ["Document Name", "Label", "Value", "Confidence Score"]
+
+
+def viewer_frame(rows: List[dict]) -> None:
+    """Render metadata records with stable, human-readable headers (never raw
+    snake_case keys) and colour-coded confidence cells."""
+    frame = pd.DataFrame(
+        [
+            {
+                "Document Name": record["document_name"],
+                "Label": record["label"],
+                "Value": record["value"],
+                "Confidence Score": clamp_confidence(record["confidence_score"], 50),
+            }
+            for record in rows
+        ],
+        columns=VIEWER_COLUMNS,
+    )
+    st.dataframe(
+        frame.style.map(confidence_score_style, subset=["Confidence Score"]),
+        hide_index=True,
+        width="stretch",
+        height=min(720, max(180, 44 + 36 * len(frame))),
+    )
+
+
 def page_viewer(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
     page_header(
         "Viewer",
-        "View the complete Main Metadata file or an approved Client Template as a table.",
+        "View the complete Main Metadata file or a Client Template as a table — duplicates, "
+        "conflicting values, document names and confidence scores are all preserved.",
         active["name"] if active else None,
     )
     if not need_docket(active):
         return
-    metadata = metadata_records(active["id"])
+    docket_id = active["id"]
+    try:
+        with st.spinner("Loading extracted metadata…"):
+            metadata = metadata_records(docket_id)
+            templates = list_templates(docket_id)
+    except Exception:  # noqa: BLE001
+        LOG.exception("viewer could not load metadata")
+        st.error("The extracted metadata could not be loaded. Your saved data has not been "
+                 "changed. Try again; if the problem persists, run the integrity check in "
+                 "Settings.", icon="🚫")
+        return
     if not metadata:
-        empty_state("No metadata available", "Process documents in the Workspace first.")
+        empty_state("No metadata available", "Save and process documents in the Workspace first.")
         return
 
     view_options = ["Main Metadata"]
-    templates = list_templates(active["id"])
     if templates:
         view_options.append("Client Template")
-    selected_view = st.selectbox("Table", view_options, key="viewer_table")
+    selected_view = st.selectbox(
+        "Table to view",
+        view_options,
+        key="viewer_table",
+        help="Main Metadata lists every extracted record. Client Template lists every record "
+             "mapped onto one saved template.",
+    )
 
     if selected_view == "Main Metadata":
         rows = metadata
-        st.caption(f"All extracted records · {len(rows)} row(s), including duplicates and conflicts.")
+        st.caption(f"All extracted records · {len(rows)} row(s), including duplicates and "
+                   "conflicting values.")
     else:
         template_names = [template["name"] for template in templates]
         selected_name = st.selectbox("Client template", template_names, key="viewer_template")
         template = next(row for row in templates if row["name"] == selected_name)
-        rows, missing = client_template_records(active["id"], template)
+        try:
+            raw_labels = json.loads(template["labels_json"])
+            if not isinstance(raw_labels, list):
+                raise ValueError("labels_json must be a list")
+        except ValueError:
+            st.error(f"The template “{template['name']}” could not be read (its label list is "
+                     "damaged). Other templates and the Main Metadata view still work.", icon="🚫")
+            return
+        ensure_exact_mappings(docket_id, template["id"])
+        with st.spinner("Applying template mappings…"):
+            rows, missing = client_template_records(docket_id, template)
         if missing:
             st.warning(
-                "No approved mapping for: " + ", ".join(missing),
+                "No extracted record mapped to: " + ", ".join(missing) + ". "
+                "If these values exist under a different spelling, approve the mapping in "
+                "Organize → Apply existing template.",
                 icon="⚠️",
             )
-        st.caption(
-            f"Approved mapped records only · {len(rows)} row(s), with duplicate values preserved."
-        )
+        if not rows:
+            st.info("No records to show for this template yet. Approve label mappings in "
+                    "Organize → Apply existing template; exact matches are applied automatically.",
+                    icon="ℹ️")
+        st.caption(f"Mapped records · {len(rows)} row(s); duplicate and conflicting values each "
+                   "remain a separate row with its own document name and confidence score.")
 
-    st.dataframe(
-        rows,
-        hide_index=True,
-        width="stretch",
-        height=min(720, max(180, 44 + 36 * len(rows))),
-    )
+    viewer_frame(rows)
 
 
 def page_psv_verify(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
@@ -3808,372 +4221,6 @@ def page_validation(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -
     )
 
 def page_export(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
-    page_header("Export", "Download the unchanged Main Metadata File or a mapped Client Template "
-                          "without additional AI processing.",
-                active["name"] if active else None)
-    if not need_docket(active):
-        return
-    if active["fact_count"] == 0:
-        empty_state("Nothing to export yet", "Process documents in the Workspace to extract facts first.")
-        return
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
-    slug = to_concept(active["name"]) or "docket"
-
-    formats = ["JSON", "PSV", "XLSX"]
-    mime_by_format = {"JSON": "application/json", "PSV": "text/plain; charset=utf-8", "XLSX": XLSX_MIME}
-
-    def export_panel(title: str, caption: str, records: List[dict], missing: List[str],
-                     prefix: str) -> None:
-        st.markdown(f"**{title}**")
-        st.caption(caption)
-        if missing:
-            st.warning("No approved mapping for: " + ", ".join(missing), icon="⚠️")
-        selected_format = st.selectbox("Format", formats, key=f"{prefix}_format")
-        cache_key = f"{prefix}_export_cache"
-        if st.button("Export", type="primary", key=f"{prefix}_build", **stretch()):
-            try:
-                if selected_format == "JSON":
-                    data, count = build_metadata_export(records, title)
-                    extension = "json"
-                elif selected_format == "PSV":
-                    data, count = build_metadata_psv(records, title)
-                    extension = "psv"
-                else:
-                    data, count = build_metadata_xlsx(records, title)
-                    extension = "xlsx"
-            except ExportError as exc:
-                st.session_state.pop(cache_key, None)
-                st.error(f"{title} export blocked: {exc}", icon="🚫")
-                return
-            except Exception as exc:  # noqa: BLE001
-                LOG.exception("export failed")
-                st.session_state.pop(cache_key, None)
-                st.error(f"{title} export failed: {clean_text(exc)[:200]}", icon="🚫")
-                return
-            st.session_state[cache_key] = {
-                "format": selected_format, "data": data, "count": count, "extension": extension,
-            }
-        cached = st.session_state.get(cache_key)
-        if cached and cached["format"] == selected_format:
-            st.success(f"Integrity verified · {cached['count']} row(s) · {fmt_size(len(cached['data']))}", icon="✅")
-            st.download_button(
-                "Download export", cached["data"],
-                file_name=f"parchai-{slug}-{prefix}-{stamp}.{cached['extension']}",
-                mime=mime_by_format[selected_format], key=f"{prefix}_download", **stretch(),
-            )
-
-    main_records = metadata_records(active["id"])
-    templates = list_templates(active["id"])
-    with st.container(border=True):
-        export_panel(
-            "Main Metadata",
-            "The unchanged exhaustive four-field ledger: document_name, label, value and confidence_score.",
-            main_records, [], "main_metadata",
-        )
-    with st.container(border=True):
-        if templates:
-            template_names = [row["name"] for row in templates]
-            selected_name = st.selectbox("Client template", template_names, key="export_template_choice")
-            selected_template = next(row for row in templates if row["name"] == selected_name)
-            template_id = selected_template["id"]
-            # Cache is per-format but not per-template; clear it whenever the user
-            # switches to a different template so Download cannot serve stale bytes.
-            if st.session_state.get("export_active_template_id") != template_id:
-                st.session_state.pop("client_template_export_cache", None)
-                st.session_state["export_active_template_id"] = template_id
-
-            template_labels = json.loads(selected_template["labels_json"])
-            extracted_labels = unique_labels(main_records)
-            current_mappings = approved_mappings(active["id"], template_id)
-            rejected = rejected_suggestions(active["id"], template_id)
-            exact_matches: list[tuple[str, str]] = []
-            manual_overrides: list[tuple[str, str]] = []
-            suggested_matches: list[tuple[str, list[dict[str, Any]]]] = []
-            unmatched_labels: list[str] = []
-
-            for source in extracted_labels:
-                exact = exact_template_label(source, template_labels)
-                existing_mapping = current_mappings.get(source)
-
-                # A human decision always wins over the exact-match rule and must
-                # be shown as an override — otherwise the display contradicts the
-                # actual export, which reads label_mappings verbatim.
-                if existing_mapping and existing_mapping in template_labels:
-                    if exact and existing_mapping == exact:
-                        exact_matches.append((source, exact))
-                    else:
-                        manual_overrides.append((source, existing_mapping))
-                    continue
-
-                if exact:
-                    save_mapping(active["id"], template_id, source, exact, "exact")
-                    exact_matches.append((source, exact))
-                    continue
-
-                matches = [
-                    match for match in fuzzy_suggestions(source, template_labels, limit=3, min_score=70)
-                    if (source, match["label"]) not in rejected
-                ]
-                if matches:
-                    suggested_matches.append((source, matches))
-                else:
-                    unmatched_labels.append(source)
-
-            with st.container(border=True):
-                st.markdown("**Template label matching**")
-                st.caption(
-                    "Matching runs only for this saved template during export. "
-                    "Exact matches are automatic; fuzzy matches require approval; "
-                    "human overrides are never silently replaced."
-                )
-                if exact_matches:
-                    st.markdown("**Exact matches**")
-                    for source, target in exact_matches:
-                        st.success(f"`{source}` → `{target}`", icon="✅")
-                if manual_overrides:
-                    st.markdown("**Manually mapped (override)**")
-                    for source, target in manual_overrides:
-                        st.info(f"`{source}` → `{target}` · human override preserved", icon="ℹ️")
-                if suggested_matches:
-                    st.markdown("**Suggested matches · 70%+ similarity**")
-                    for source, matches in suggested_matches:
-                        st.markdown(f"**{source}**")
-                        for match in matches:
-                            target = match["label"]
-                            pair_id = key_id(f"{source}\u241f{target}")
-                            accept_col, reject_col, score_col = st.columns(
-                                [1, 1, 3], vertical_alignment="center"
-                            )
-                            with accept_col:
-                                if st.button(
-                                    "Accept",
-                                    key=f"export_accept_{active['id']}_{template_id}_{pair_id}",
-                                    width="stretch",
-                                ):
-                                    save_mapping(active["id"], template_id, source, target, "user-approved")
-                                    st.rerun()
-                            with reject_col:
-                                if st.button(
-                                    "Reject",
-                                    key=f"export_reject_{active['id']}_{template_id}_{pair_id}",
-                                    width="stretch",
-                                ):
-                                    # Reject must also undo a previous approval of the
-                                    # same pair, matching apply_template_mode exactly.
-                                    reject_suggestion(active["id"], template_id, source, target)
-                                    delete_mapping(active["id"], template_id, source, target)
-                                    st.rerun()
-                            with score_col:
-                                st.caption(f"`{target}` · {match['score']:.0f}%")
-                if unmatched_labels:
-                    st.markdown("**Unmatched labels**")
-                    for source in unmatched_labels:
-                        manual_key = f"export_manual_{active['id']}_{template_id}_{key_id(source)}"
-                        target = st.selectbox(
-                            f"Manual mapping for {source}",
-                            ["Do not map"] + template_labels,
-                            key=manual_key,
-                        )
-                        if target != "Do not map" and st.button(
-                            "Save manual mapping",
-                            key=f"{manual_key}_save",
-                        ):
-                            save_mapping(active["id"], template_id, source, target, "manual")
-                            st.rerun()
-                if not (exact_matches or manual_overrides or suggested_matches or unmatched_labels):
-                    st.caption("All extracted labels are mapped.")
-            client_records, missing = client_template_records(active["id"], selected_template)
-            export_panel(
-                "Client Template",
-                "Mapped records only; duplicate and conflicting values remain separate and labels retain exact template spelling.",
-                client_records, missing, "client_template",
-            )
-        else:
-            st.markdown("**Client Template**")
-            st.info("Create and save a client template in Organize before exporting.")
-    page_header("Export", "Download the unchanged Main Metadata File or a mapped Client Template "
-                          "without additional AI processing.",
-                active["name"] if active else None)
-    if not need_docket(active):
-        return
-    if active["fact_count"] == 0:
-        empty_state("Nothing to export yet", "Process documents in the Workspace to extract facts first.")
-        return
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
-    slug = to_concept(active["name"]) or "docket"
-
-    formats = ["JSON", "PSV", "XLSX"]
-    mime_by_format = {"JSON": "application/json", "PSV": "text/plain; charset=utf-8", "XLSX": XLSX_MIME}
-
-    def export_panel(title: str, caption: str, records: List[dict], missing: List[str],
-                     prefix: str) -> None:
-        st.markdown(f"**{title}**")
-        st.caption(caption)
-        if missing:
-            st.warning("No approved mapping for: " + ", ".join(missing), icon="⚠️")
-        selected_format = st.selectbox("Format", formats, key=f"{prefix}_format")
-        cache_key = f"{prefix}_export_cache"
-        if st.button("Export", type="primary", key=f"{prefix}_build", **stretch()):
-            try:
-                if selected_format == "JSON":
-                    data, count = build_metadata_export(records, title)
-                    extension = "json"
-                elif selected_format == "PSV":
-                    data, count = build_metadata_psv(records, title)
-                    extension = "psv"
-                else:
-                    data, count = build_metadata_xlsx(records, title)
-                    extension = "xlsx"
-            except ExportError as exc:
-                st.session_state.pop(cache_key, None)
-                st.error(f"{title} export blocked: {exc}", icon="🚫")
-                return
-            except Exception as exc:  # noqa: BLE001
-                LOG.exception("export failed")
-                st.session_state.pop(cache_key, None)
-                st.error(f"{title} export failed: {clean_text(exc)[:200]}", icon="🚫")
-                return
-            st.session_state[cache_key] = {
-                "format": selected_format, "data": data, "count": count, "extension": extension,
-            }
-        cached = st.session_state.get(cache_key)
-        if cached and cached["format"] == selected_format:
-            st.success(f"Integrity verified · {cached['count']} row(s) · {fmt_size(len(cached['data']))}", icon="✅")
-            st.download_button(
-                "Download export", cached["data"],
-                file_name=f"parchai-{slug}-{prefix}-{stamp}.{cached['extension']}",
-                mime=mime_by_format[selected_format], key=f"{prefix}_download", **stretch(),
-            )
-
-    main_records = metadata_records(active["id"])
-    templates = list_templates(active["id"])
-    with st.container(border=True):
-        export_panel(
-            "Main Metadata",
-            "The unchanged exhaustive four-field ledger: document_name, label, value and confidence_score.",
-            main_records, [], "main_metadata",
-        )
-    with st.container(border=True):
-        if templates:
-            template_names = [row["name"] for row in templates]
-            selected_name = st.selectbox("Client template", template_names, key="export_template_choice")
-            selected_template = next(row for row in templates if row["name"] == selected_name)
-            template_id = selected_template["id"]
-            # Cache is per-format but not per-template; clear it whenever the user
-            # switches to a different template so Download cannot serve stale bytes.
-            if st.session_state.get("export_active_template_id") != template_id:
-                st.session_state.pop("client_template_export_cache", None)
-                st.session_state["export_active_template_id"] = template_id
-
-            template_labels = json.loads(selected_template["labels_json"])
-            extracted_labels = unique_labels(main_records)
-            current_mappings = approved_mappings(active["id"], template_id)
-            rejected = rejected_suggestions(active["id"], template_id)
-            exact_matches: list[tuple[str, str]] = []
-            manual_overrides: list[tuple[str, str]] = []
-            suggested_matches: list[tuple[str, list[dict[str, Any]]]] = []
-            unmatched_labels: list[str] = []
-
-            for source in extracted_labels:
-                exact = exact_template_label(source, template_labels)
-                existing_mapping = current_mappings.get(source)
-
-                # A human decision always wins over the exact-match rule and must
-                # be shown as an override — otherwise the display contradicts the
-                # actual export, which reads label_mappings verbatim.
-                if existing_mapping and existing_mapping in template_labels:
-                    if exact and existing_mapping == exact:
-                        exact_matches.append((source, exact))
-                    else:
-                        manual_overrides.append((source, existing_mapping))
-                    continue
-
-                if exact:
-                    save_mapping(active["id"], template_id, source, exact, "exact")
-                    exact_matches.append((source, exact))
-                    continue
-
-                matches = [
-                    match for match in fuzzy_suggestions(source, template_labels, limit=3, min_score=70)
-                    if (source, match["label"]) not in rejected
-                ]
-                if matches:
-                    suggested_matches.append((source, matches))
-                else:
-                    unmatched_labels.append(source)
-
-            with st.container(border=True):
-                st.markdown("**Template label matching**")
-                st.caption(
-                    "Matching runs only for this saved template during export. "
-                    "Exact matches are automatic; fuzzy matches require approval; "
-                    "human overrides are never silently replaced."
-                )
-                if exact_matches:
-                    st.markdown("**Exact matches**")
-                    for source, target in exact_matches:
-                        st.success(f"`{source}` → `{target}`", icon="✅")
-                if manual_overrides:
-                    st.markdown("**Manually mapped (override)**")
-                    for source, target in manual_overrides:
-                        st.info(f"`{source}` → `{target}` · human override preserved", icon="ℹ️")
-                if suggested_matches:
-                    st.markdown("**Suggested matches · 70%+ similarity**")
-                    for source, matches in suggested_matches:
-                        st.markdown(f"**{source}**")
-                        for match in matches:
-                            target = match["label"]
-                            pair_id = key_id(f"{source}\u241f{target}")
-                            accept_col, reject_col, score_col = st.columns(
-                                [1, 1, 3], vertical_alignment="center"
-                            )
-                            with accept_col:
-                                if st.button(
-                                    "Accept",
-                                    key=f"export_accept_{active['id']}_{template_id}_{pair_id}",
-                                    width="stretch",
-                                ):
-                                    save_mapping(active["id"], template_id, source, target, "user-approved")
-                                    st.rerun()
-                            with reject_col:
-                                if st.button(
-                                    "Reject",
-                                    key=f"export_reject_{active['id']}_{template_id}_{pair_id}",
-                                    width="stretch",
-                                ):
-                                    # Reject must also undo a previous approval of the
-                                    # same pair, matching apply_template_mode exactly.
-                                    reject_suggestion(active["id"], template_id, source, target)
-                                    delete_mapping(active["id"], template_id, source, target)
-                                    st.rerun()
-                            with score_col:
-                                st.caption(f"`{target}` · {match['score']:.0f}%")
-                if unmatched_labels:
-                    st.markdown("**Unmatched labels**")
-                    for source in unmatched_labels:
-                        manual_key = f"export_manual_{active['id']}_{template_id}_{key_id(source)}"
-                        target = st.selectbox(
-                            f"Manual mapping for {source}",
-                            ["Do not map"] + template_labels,
-                            key=manual_key,
-                        )
-                        if target != "Do not map" and st.button(
-                            "Save manual mapping",
-                            key=f"{manual_key}_save",
-                        ):
-                            save_mapping(active["id"], template_id, source, target, "manual")
-                            st.rerun()
-                if not (exact_matches or manual_overrides or suggested_matches or unmatched_labels):
-                    st.caption("All extracted labels are mapped.")
-            client_records, missing = client_template_records(active["id"], selected_template)
-            export_panel(
-                "Client Template",
-                "Mapped records only; duplicate and conflicting values remain separate and labels retain exact template spelling.",
-                client_records, missing, "client_template",
-            )
-        else:
-            st.markdown("**Client Template**")
-            st.info("Create and save a client template in Organize before exporting.")
     page_header("Export", "Download the unchanged Main Metadata File or a mapped Client Template "
                           "without additional AI processing.",
                 active["name"] if active else None)
@@ -4359,182 +4406,34 @@ def page_export(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
         else:
             st.markdown("**Client Template**")
             st.info("Create and save a client template in Organize before exporting.")
-    page_header("Export", "Download the unchanged Main Metadata File or a mapped Client Template "
-                          "without additional AI processing.",
-                active["name"] if active else None)
-    if not need_docket(active):
-        return
-    if active["fact_count"] == 0:
-        empty_state("Nothing to export yet", "Process documents in the Workspace to extract facts first.")
-        return
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
-    slug = to_concept(active["name"]) or "docket"
-
-    formats = ["JSON", "PSV", "XLSX"]
-    mime_by_format = {"JSON": "application/json", "PSV": "text/plain; charset=utf-8", "XLSX": XLSX_MIME}
-
-    def export_panel(title: str, caption: str, records: List[dict], missing: List[str],
-                     prefix: str) -> None:
-        st.markdown(f"**{title}**")
-        st.caption(caption)
-        if missing:
-            st.warning("No approved mapping for: " + ", ".join(missing), icon="⚠️")
-        selected_format = st.selectbox("Format", formats, key=f"{prefix}_format")
-        cache_key = f"{prefix}_export_cache"
-        if st.button("Export", type="primary", key=f"{prefix}_build", **stretch()):
-            try:
-                if selected_format == "JSON":
-                    data, count = build_metadata_export(records, title)
-                    extension = "json"
-                elif selected_format == "PSV":
-                    data, count = build_metadata_psv(records, title)
-                    extension = "psv"
-                else:
-                    data, count = build_metadata_xlsx(records, title)
-                    extension = "xlsx"
-            except ExportError as exc:
-                st.session_state.pop(cache_key, None)
-                st.error(f"{title} export blocked: {exc}", icon="🚫")
-                return
-            except Exception as exc:  # noqa: BLE001
-                LOG.exception("export failed")
-                st.session_state.pop(cache_key, None)
-                st.error(f"{title} export failed: {clean_text(exc)[:200]}", icon="🚫")
-                return
-            st.session_state[cache_key] = {
-                "format": selected_format, "data": data, "count": count, "extension": extension,
-            }
-        cached = st.session_state.get(cache_key)
-        if cached and cached["format"] == selected_format:
-            st.success(f"Integrity verified · {cached['count']} row(s) · {fmt_size(len(cached['data']))}", icon="✅")
-            st.download_button(
-                "Download export", cached["data"],
-                file_name=f"parchai-{slug}-{prefix}-{stamp}.{cached['extension']}",
-                mime=mime_by_format[selected_format], key=f"{prefix}_download", **stretch(),
-            )
-
-    main_records = metadata_records(active["id"])
-    templates = list_templates(active["id"])
-    with st.container(border=True):
-        export_panel(
-            "Main Metadata",
-            "The unchanged exhaustive four-field ledger: document_name, label, value and confidence_score.",
-            main_records, [], "main_metadata",
-        )
-    with st.container(border=True):
-        if templates:
-            template_names = [row["name"] for row in templates]
-            selected_name = st.selectbox("Client template", template_names, key="export_template_choice")
-            selected_template = next(row for row in templates if row["name"] == selected_name)
-            template_id = selected_template["id"]
-            template_labels = json.loads(selected_template["labels_json"])
-            extracted_labels = unique_labels(main_records)
-            current_mappings = approved_mappings(active["id"], template_id)
-            rejected = rejected_suggestions(active["id"], template_id)
-            exact_matches: list[tuple[str, str]] = []
-            suggested_matches: list[tuple[str, list[dict[str, Any]]]] = []
-            unmatched_labels: list[str] = []
-
-            for source in extracted_labels:
-                exact = exact_template_label(source, template_labels)
-                existing_mapping = current_mappings.get(source)
-                if exact:
-                    if existing_mapping is None:
-                        save_mapping(active["id"], template_id, source, exact, "exact")
-                    exact_matches.append((source, exact))
-                    continue
-                if existing_mapping and existing_mapping in template_labels:
-                    continue
-                matches = [
-                    match for match in fuzzy_suggestions(source, template_labels, limit=3, min_score=70)
-                    if (source, match["label"]) not in rejected
-                ]
-                if matches:
-                    suggested_matches.append((source, matches))
-                else:
-                    unmatched_labels.append(source)
-
-            with st.container(border=True):
-                st.markdown("**Template label matching**")
-                st.caption(
-                    "Matching runs only for this saved template during export. "
-                    "Exact matches are automatic; fuzzy matches require approval."
-                )
-                if exact_matches:
-                    st.markdown("**Exact matches**")
-                    for source, target in exact_matches:
-                        st.success(f"`{source}` → `{target}`", icon="✅")
-                if suggested_matches:
-                    st.markdown("**Suggested matches · 70%+ similarity**")
-                    for source, matches in suggested_matches:
-                        st.markdown(f"**{source}**")
-                        for match in matches:
-                            target = match["label"]
-                            pair_id = key_id(f"{source}\u241f{target}")
-                            accept_col, reject_col, score_col = st.columns(
-                                [1, 1, 3], vertical_alignment="center"
-                            )
-                            with accept_col:
-                                if st.button(
-                                    "Accept",
-                                    key=f"export_accept_{active['id']}_{template_id}_{pair_id}",
-                                    width="stretch",
-                                ):
-                                    save_mapping(active["id"], template_id, source, target, "user-approved")
-                                    st.rerun()
-                            with reject_col:
-                                if st.button(
-                                    "Reject",
-                                    key=f"export_reject_{active['id']}_{template_id}_{pair_id}",
-                                    width="stretch",
-                                ):
-                                    reject_suggestion(active["id"], template_id, source, target)
-                                    st.rerun()
-                            with score_col:
-                                st.caption(f"`{target}` · {match['score']:.0f}%")
-                if unmatched_labels:
-                    st.markdown("**Unmatched labels**")
-                    for source in unmatched_labels:
-                        manual_key = f"export_manual_{active['id']}_{template_id}_{key_id(source)}"
-                        target = st.selectbox(
-                            f"Manual mapping for {source}",
-                            ["Do not map"] + template_labels,
-                            key=manual_key,
-                        )
-                        if target != "Do not map" and st.button(
-                            "Save manual mapping",
-                            key=f"{manual_key}_save",
-                        ):
-                            save_mapping(active["id"], template_id, source, target, "manual")
-                            st.rerun()
-                if not exact_matches and not suggested_matches and not unmatched_labels:
-                    st.caption("All extracted labels are mapped.")
-            client_records, missing = client_template_records(active["id"], selected_template)
-            export_panel(
-                "Client Template",
-                "Mapped records only; duplicate and conflicting values remain separate and labels retain exact template spelling.",
-                client_records, missing, "client_template",
-            )
-        else:
-            st.markdown("**Client Template**")
-            st.info("Create and save a client template in Organize before exporting.")
-
 def page_settings(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
     page_header("Settings", "Gemini key pool, model fallback, storage and integrity checks.", None)
     if active:
         render_processing_loader(active["id"])
     entries = key_pool()
+    config = load_config()
 
     st.markdown("#### Gemini API key pool")
-    st.caption("Keys are masked. Env keys come from GEMINI_API_KEYS or GEMINI_API_KEY. Session keys live "
-               "in memory only. A quota error pauses a key for one model for a minute; an invalid key "
-               "is paused for an hour.")
+    st.caption(
+        "Keys come from the application configuration — the “gemini_api_keys” list in "
+        f"`{CONFIG_PATH.name}` — or the `GEMINI_API_KEYS`/`GEMINI_API_KEY` environment variables. "
+        "Keys are always masked here, rotated round-robin while processing, and never appear "
+        "in logs. A quota or rate-limit error pauses the affected key and model for a minute; "
+        "an invalid or rejected key is parked for an hour. Editing the config file takes "
+        "effect on the next request; no restart is needed."
+    )
+    if config.get("_error"):
+        st.error(f"Configuration problem: {config['_error']}", icon="🚫")
     for bad in rejected_keys():
         st.error(f"A key from “{bad['source']}” ending {bad['masked']} was ignored because it is not a valid "
                  "API key (it must be a complete ASCII key beginning with “AQ.” or “AIza”, with no spaces). "
-                 "Check the GEMINI_API_KEY(S) value.", icon="🚫")
+                 f"Check the value in `{CONFIG_PATH.name}` or the GEMINI_API_KEY(S) variable.", icon="🚫")
     if not entries:
-        st.warning("No valid Gemini keys configured. Add a key before processing documents.", icon="⚠️")
+        st.warning(
+            "No valid Gemini keys configured. Add 4–5 keys to “gemini_api_keys” in "
+            f"`{CONFIG_PATH.name}` before processing documents.",
+            icon="⚠️",
+        )
     else:
         rows = []
         for entry in entries:
@@ -4547,31 +4446,6 @@ def page_settings(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> 
                 "Status": "✔ Ready" if cooling == 0 else f"▲ Cooling down ({int(cooling)}s)",
             })
         st.dataframe(rows, hide_index=True, **stretch())
-
-    removable_entries = [e for e in entries if e["source"] in ("session", "persisted")]
-    if removable_entries:
-        st.markdown("**Remove keys**")
-        for entry in removable_entries:
-            col_key, col_btn = st.columns([4, 1], vertical_alignment="center")
-            tag = " · saved securely" if entry["source"] == "persisted" else " · this session only"
-            col_key.code(entry["masked"] + tag, language=None)
-            col_btn.button("Remove", key=f"remove_{entry['id']}", on_click=remove_key_callback,
-                           args=(entry["id"],))
-
-    with st.container(border=True):
-        st.markdown("**Add a key**")
-        key_col, add_col = st.columns([4, 1], vertical_alignment="bottom")
-        key_col.text_input("Gemini API key", type="password", key="add_key_input",
-                           help="Paste only the complete key. Current Gemini keys start with “AQ.”.")
-        add_col.button("Add key", on_click=add_key_callback, **stretch())
-        if keyring_available():
-            st.checkbox(
-                "Remember this key securely (OS credential store) so it survives a restart",
-                key="add_key_remember",
-            )
-        else:
-            st.caption("No OS credential store is available here, so keys can only be kept for this "
-                       "session; they are never written to disk in plain text.")
 
     if entries:
         options = [f"{e['label']} ({e['masked']})" for e in entries]
@@ -4595,7 +4469,9 @@ def page_settings(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> 
 
     st.markdown("#### Model fallback order")
     st.code("\n".join(f"{i}. {m}" for i, m in enumerate(GEMINI_MODELS, start=1)), language=None)
-    st.caption("Override with PARCHAI_GEMINI_MODELS (comma-separated). Use “List models” above to see valid names.")
+    st.caption("Override with “gemini_models” in the config file or the PARCHAI_GEMINI_MODELS "
+               "environment variable (comma-separated; restart required). Use “List models” above "
+               "to see valid names.")
 
     st.markdown("#### Storage and integrity")
     st.caption(f"Database: `{DB_PATH}`")
