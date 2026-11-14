@@ -734,10 +734,13 @@ def fetch_metadata(docket_id: str) -> List[sqlite3.Row]:
         ).fetchall()
 
 
-def list_templates(docket_id: str) -> List[sqlite3.Row]:
+def list_templates(docket_id: Optional[str] = None) -> List[sqlite3.Row]:
+    """Every saved template in the workspace. Templates are reusable client templates,
+    so they are NOT limited to the docket where they were created; `docket_id` is kept
+    only for call-site compatibility and records nothing here."""
     with connect() as connection:
         return connection.execute(
-            "SELECT * FROM templates WHERE docket_id = ? ORDER BY updated_at DESC", (docket_id,)
+            "SELECT * FROM templates ORDER BY name COLLATE NOCASE"
         ).fetchall()
 
 
@@ -761,8 +764,8 @@ def save_template(docket_id: str, name: str, labels: List[str], template_id: Opt
         existing = None
         if template_id:
             existing = connection.execute(
-                "SELECT id, labels_json FROM templates WHERE docket_id = ? AND id = ?",
-                (docket_id, template_id),
+                "SELECT id, labels_json FROM templates WHERE id = ?",
+                (template_id,),
             ).fetchone()
             if existing is None:
                 raise ValueError("That template no longer exists.")
@@ -783,8 +786,8 @@ def save_template(docket_id: str, name: str, labels: List[str], template_id: Opt
             ]
         else:
             clash = connection.execute(
-                "SELECT id FROM templates WHERE docket_id = ? AND name = ?",
-                (docket_id, clean_name),
+                "SELECT id FROM templates WHERE name = ?",
+                (clean_name,),
             ).fetchone()
             if clash:
                 raise ValueError(
@@ -806,7 +809,7 @@ def delete_template(docket_id: str, template_id: str) -> None:
     """Delete a template; its mappings and rejected suggestions cascade with it."""
     with connect() as connection:
         connection.execute(
-            "DELETE FROM templates WHERE docket_id = ? AND id = ?", (docket_id, template_id)
+            "DELETE FROM templates WHERE id = ?", (template_id,)
         )
 
 
@@ -817,8 +820,8 @@ def append_template_labels(docket_id: str, template_id: str, labels: List[str]) 
     added: List[str] = []
     with connect() as connection:
         row = connection.execute(
-            "SELECT labels_json FROM templates WHERE docket_id = ? AND id = ?",
-            (docket_id, template_id),
+            "SELECT labels_json FROM templates WHERE id = ?",
+            (template_id,),
         ).fetchone()
         if row is None:
             raise ValueError("That template no longer exists.")
@@ -880,14 +883,15 @@ def mapping_details(docket_id: str, template_id: str) -> Dict[str, Dict[str, str
 
 
 def delete_mappings_to_labels(docket_id: str, template_id: str, labels: Iterable[str]) -> None:
-    """Remove this template's mappings pointing at labels it no longer offers."""
+    """Remove mappings pointing at labels this template no longer offers, in EVERY docket
+    that uses the template, since the template itself is workspace-wide."""
     labels = [str(label) for label in labels if str(label).strip()]
     if not labels:
         return
     with connect() as connection:
         connection.executemany(
-            "DELETE FROM label_mappings WHERE docket_id = ? AND template_id = ? AND requested_label = ?",
-            [(docket_id, template_id, label) for label in labels],
+            "DELETE FROM label_mappings WHERE template_id = ? AND requested_label = ?",
+            [(template_id, label) for label in labels],
         )
 
 
@@ -2995,19 +2999,6 @@ def page_workspace(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) ->
           and st.session_state.get("last_surfaced_job_id") != job["id"]):
         st.session_state["last_results"] = job["results"]
         st.session_state["last_surfaced_job_id"] = job["id"]
-        results = job["results"]
-        st.session_state["last_run_summary"] = {
-            "total": len(results),
-            "completed": sum(result["status"] == "completed" for result in results),
-            "failed": sum(result["status"] == "failed" for result in results),
-            "partial": sum(result["status"] == "partial" for result in results),
-            "pending": sum(result["status"] in {"queued", "processing"} for result in results),
-            "extracted": sum(result.get("extracted_count", 0) for result in results),
-            "appended": sum(result.get("appended_count", 0) for result in results),
-        }
-        # Refresh the page-level document query so completed extraction statuses
-        # and fact counts are visible immediately after the worker finishes.
-        st.rerun(scope="app")
 
     results = st.session_state.get("last_results")
     if results:
