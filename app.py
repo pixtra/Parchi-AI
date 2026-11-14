@@ -2732,6 +2732,8 @@ def build_metadata_export(records: List[dict], description: str) -> Tuple[bytes,
         raise ExportError(f"{description} integrity check failed after re-reading.")
     return data, len(records)
 
+METADATA_HEADERS = ["Document Name", "Label", "Value", "Confidence Score"]
+METADATA_FIELDS = ["document_name", "label", "value", "confidence_score"]
 
 def build_metadata_psv(records: List[dict], description: str) -> Tuple[bytes, int]:
     expected = [METADATA_HEADERS] + [
