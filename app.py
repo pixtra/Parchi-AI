@@ -1784,10 +1784,11 @@ def job_result(filename: str, status: str, message: str,
 
 
 def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any]],
-                        keys: List[Dict[str, str]]) -> None:
+                        keys: List[Dict[str, str]],
+                        initial_results: Optional[List[Dict[str, Any]]] = None) -> None:
     WORKER_STATE.job_id = job_id
     WORKER_STATE.state = {"key_cooldowns": {}}
-    results: List[Dict[str, Any]] = []
+    results: List[Dict[str, Any]] = list(initial_results or [])
     documents: List[Dict[str, Any]] = []   # documents successfully stored, awaiting extraction
     finalized: set = set()                 # ids of documents whose facts were saved
     total = len(uploads)
@@ -1837,6 +1838,10 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
         batch_digests: Dict[str, str] = {}  # sha256 -> filename, for duplicates inside this upload
         for upload in uploads:
             data = upload["data"]
+            if upload.get("document") is not None:
+                documents.append(upload["document"])
+                batch_digests[hashlib.sha256(data).hexdigest()] = upload["filename"]
+                continue
             problem = validate_upload(upload["filename"], data)
             digest = hashlib.sha256(data).hexdigest()
             if not problem and digest in batch_digests:
@@ -1960,7 +1965,10 @@ def render_processing_controls(docket_id: str) -> None:
         )
     with st.container(border=True):
         st.markdown("**Add documents**")
-        st.caption("Documents are processed with Gemini in the background. You can switch tabs or open Settings while processing continues.")
+        st.caption(
+            "Choose documents, click Save Documents to add them to the workspace, then "
+            "Gemini extraction continues in the background."
+        )
         uploads = st.file_uploader(
             f"Drop PDF, PNG, JPG, TXT, CSV or XLSX files (up to {fmt_size(MAX_UPLOAD_BYTES)} each)",
             type=SUPPORTED_TYPES,
@@ -1969,11 +1977,11 @@ def render_processing_controls(docket_id: str) -> None:
         )
         is_active = bool(active_job and active_job["status"] in {"queued", "running"})
         if active_job and active_job.get("gemini_active"):
-            label = "Gemini processing…"
+            label = "Saving and processing…"
         elif is_active:
-            label = "Preparing…"
+            label = "Processing…"
         else:
-            label = f"Process {len(uploads)} document(s)" if uploads else "Process documents"
+            label = "Save Documents" if uploads else "Save Documents"
         run = st.button(
             label,
             key="process_documents",
@@ -1984,7 +1992,14 @@ def render_processing_controls(docket_id: str) -> None:
         if not uploads:
             st.caption("Choose one or more files to enable processing.")
         if run and uploads:
-            process_uploads(docket_id, uploads)
+            prepared, initial_results = prepare_uploaded_documents(docket_id, uploads)
+            if prepared or initial_results:
+                process_uploads(
+                    docket_id,
+                    uploads,
+                    prepared_payload=prepared,
+                    initial_results=initial_results,
+                )
             st.session_state["upload_nonce"] = st.session_state.get("upload_nonce", 0) + 1
             st.rerun(scope="app")
     _render_processing_status(processing_job(docket_id))
@@ -2003,7 +2018,49 @@ def _prune_finished_jobs() -> None:
             del PROCESSING_JOBS[stale_id]
 
 
-def process_uploads(docket_id: str, uploads: List[Any]) -> None:
+def prepare_uploaded_documents(
+    docket_id: str, uploads: List[Any]
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    payload: List[Dict[str, Any]] = []
+    results: List[Dict[str, Any]] = []
+    batch_digests: Dict[str, str] = {}
+    for upload in uploads:
+        filename = upload.name
+        data = upload.getvalue()
+        digest = hashlib.sha256(data).hexdigest()
+        problem = validate_upload(filename, data)
+        if not problem and digest in batch_digests:
+            results.append(job_result(
+                filename, "skipped",
+                f"Identical to “{batch_digests[digest]}” in this upload.",
+            ))
+            continue
+        if problem:
+            results.append(job_result(filename, "failed", problem))
+            continue
+        try:
+            doc, skipped = prepare_document(docket_id, filename, data, "Gemini")
+        except Exception as exc:  # noqa: BLE001
+            LOG.exception("prepare failed for %s", filename)
+            results.append(job_result(
+                filename, "failed",
+                f"Could not store the file ({clean_text(exc)[:200]}).",
+            ))
+            continue
+        if doc is None:
+            results.append(skipped)
+            continue
+        batch_digests[digest] = filename
+        payload.append({"filename": filename, "data": data, "document": doc})
+    return payload, results
+
+
+def process_uploads(
+    docket_id: str,
+    uploads: List[Any],
+    prepared_payload: Optional[List[Dict[str, Any]]] = None,
+    initial_results: Optional[List[Dict[str, Any]]] = None,
+) -> None:
     keys = key_pool()
     if not keys:
         queue_flash("error", "Gemini processing needs at least one valid API key. Add one in Settings.")
@@ -2014,14 +2071,20 @@ def process_uploads(docket_id: str, uploads: List[Any]) -> None:
         return
     _prune_finished_jobs()
     job_id = str(uuid.uuid4())
-    payload = [{"filename": upload.name, "data": upload.getvalue()} for upload in uploads]
+    payload = (
+        prepared_payload
+        if prepared_payload is not None
+        else [{"filename": upload.name, "data": upload.getvalue()} for upload in uploads]
+    )
     with PROCESSING_LOCK:
         PROCESSING_JOBS[job_id] = {
             "id": job_id, "docket_id": docket_id, "status": "queued", "phase": "queued",
             "gemini_active": False, "message": "Queued for Gemini extraction…", "results": [],
             "finished_at": 0.0,
         }
-    PROCESSING_EXECUTOR.submit(_run_processing_job, job_id, docket_id, payload, keys)
+    PROCESSING_EXECUTOR.submit(
+        _run_processing_job, job_id, docket_id, payload, keys, initial_results
+    )
     queue_flash("success", "Processing started in the background. You can switch tabs safely.")
 
 
@@ -3011,49 +3074,99 @@ def page_organize(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> 
 
     templates = list_templates(active["id"])
     template_names = [row["name"] for row in templates]
-    # Apply any pending default BEFORE the selectbox below is instantiated. Setting
-    # st.session_state["organize_template_choice"] AFTER that selectbox has already been
-    # created in this same script run raises StreamlitAPIException, so a save/rename
-    # schedules its pending selection here rather than writing the widget key directly.
     pending_select = st.session_state.pop("organize_template_pending_select", None)
     if pending_select is not None and pending_select in ("New template", *template_names):
         st.session_state["organize_template_choice"] = pending_select
     with st.container(border=True):
-        st.markdown("**Create or update a client template**")
-        selected = st.selectbox("Saved template", ["New template", *template_names],
-                                key="organize_template_choice")
+        st.markdown("**Choose labels by document**")
+        selected = st.selectbox(
+            "Template",
+            ["New template", *template_names],
+            key="organize_template_choice",
+        )
         existing = next((row for row in templates if row["name"] == selected), None)
-        default_name = existing["name"] if existing else ""
-        default_labels = json.loads(existing["labels_json"]) if existing else []
-        default_normalized = {normalize_label(label) for label in default_labels}
-        template_pill_options = [
-            *default_labels,
-            *[label for label in labels if normalize_label(label) not in default_normalized],
-        ]
-        name = st.text_input("Template name", value=default_name, key="template_name")
-        selected_labels = st.pills(
-            "Select template labels",
-            template_pill_options,
+        document_names = sorted(
+            {record["document_name"] for record in metadata},
+            key=str.casefold,
+        )
+        sections_key = f"template_sections_{active['id']}_{selected}"
+        submitted_sections = st.session_state.setdefault(sections_key, {})
+        document_name = st.selectbox(
+            "Uploaded document",
+            document_names,
+            key=f"template_document_{active['id']}_{selected}",
+        )
+        document_labels = unique_labels(
+            [record for record in metadata if record["document_name"] == document_name]
+        )
+        selected_for_document = st.pills(
+            "Labels from this document",
+            document_labels,
             selection_mode="multi",
-            default=default_labels,
-            key=f"create_template_labels_{active['id']}_{selected}",
-            help="Select the extracted labels to include. Labels are kept exactly as displayed.",
+            default=submitted_sections.get(document_name, []),
+            key=f"template_document_labels_{active['id']}_{selected}_{key_id(document_name)}",
+            help="Select the labels required for this document, then submit the section.",
             width="stretch",
         )
-        if st.button("Save template", type="primary", disabled=not selected_labels):
-            try:
-                save_template(active["id"], name, selected_labels,
-                               template_id=existing["id"] if existing else None)
-                removed_labels = [label for label in default_labels if label not in selected_labels]
-                delete_mappings_to_labels(active["id"], removed_labels)
-                st.success("Template saved.", icon="✅")
-                st.session_state["organize_template_pending_select"] = name.strip()
-                st.rerun()
-            except ValueError as exc:
-                st.error(str(exc), icon="🚫")
+        if st.button(
+            "Submit",
+            type="primary",
+            key=f"submit_document_labels_{active['id']}_{selected}",
+            disabled=not selected_for_document,
+            **stretch(),
+        ):
+            submitted_sections[document_name] = list(selected_for_document)
+            st.session_state[sections_key] = submitted_sections
+            st.rerun()
+
+    st.markdown("#### Submitted document sections")
+    if submitted_sections:
+        for document, section_labels in submitted_sections.items():
+            with st.container(border=True):
+                st.markdown(f"**{document}**")
+                st.pills(
+                    f"Selected labels for {document}",
+                    section_labels,
+                    selection_mode="multi",
+                    default=section_labels,
+                    key=f"submitted_section_{active['id']}_{selected}_{key_id(document)}",
+                    disabled=True,
+                    label_visibility="collapsed",
+                )
+    else:
+        st.info("Select labels for a document and click Submit. Submitted sections stay visible here.")
+
+    all_selected_labels = list(dict.fromkeys(
+        label for section in submitted_sections.values() for label in section
+    ))
+    default_name = existing["name"] if existing else ""
+    name = st.text_input(
+        "Template name",
+        value=default_name,
+        key=f"template_name_{active['id']}_{selected}",
+    )
+    if st.button(
+        "Save Template",
+        type="primary",
+        key=f"save_template_{active['id']}_{selected}",
+        disabled=not all_selected_labels,
+        **stretch(),
+    ):
+        try:
+            save_template(
+                active["id"],
+                name,
+                all_selected_labels,
+                template_id=existing["id"] if existing else None,
+            )
+            st.session_state["organize_template_pending_select"] = name.strip()
+            st.success("Template saved.", icon="✅")
+            st.rerun()
+        except ValueError as exc:
+            st.error(str(exc), icon="🚫")
 
     if selected == "New template":
-        st.info("Save the new template to enable matching against Main Metadata.")
+        st.info("Save the template to enable exact and fuzzy mapping review.")
         return
     if not templates:
         return
