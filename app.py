@@ -41,7 +41,6 @@ from metadata_workflow import (
     unique_labels,
 )
 
-from mapping_workflow import plan_template_matches
 try:
     from metadata_workflow import exact_template_label, normalize_label
 except ImportError:
@@ -247,20 +246,6 @@ CREATE TABLE IF NOT EXISTS fact_history (
     changed_at TEXT NOT NULL,
     reason TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS template_mappings (
-    template_id TEXT NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
-    source_label TEXT NOT NULL,
-    target_label TEXT,
-    method TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (template_id, source_label)
-);
-CREATE TABLE IF NOT EXISTS template_rejections (
-    template_id TEXT NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
-    source_label TEXT NOT NULL,
-    target_label TEXT NOT NULL,
-    PRIMARY KEY (template_id, source_label, target_label)
-);
 CREATE INDEX IF NOT EXISTS idx_facts_docket ON facts(docket_id);
 CREATE INDEX IF NOT EXISTS idx_documents_docket ON documents(docket_id);
 CREATE INDEX IF NOT EXISTS idx_metadata_docket ON metadata(docket_id);
@@ -346,10 +331,12 @@ def deep_clean(obj: Any) -> Any:
     return obj
 
 
-def psv_cell(value: Any) -> str:
-    """Text for one PSV field. PSV is plain text, not a spreadsheet, so the value is written
-    exactly as stored. Formula protection is applied only where a workbook is written."""
-    return clean_text(value)
+def safe_cell(value: Any) -> str:
+    """Neutralise spreadsheet formula injection without touching genuine numbers."""
+    text = clean_text(value)
+    if text[:1] in ("=", "+", "-", "@", "\t", "\r") and not _NUMERIC_RE.match(text):
+        return "'" + text
+    return text
 
 
 def esc(value: Any) -> str:
@@ -581,9 +568,6 @@ def init_db() -> bool:
         page_columns = {row["name"] for row in connection.execute("PRAGMA table_info(pages)")}
         if "sheet_name" not in page_columns:
             connection.execute("ALTER TABLE pages ADD COLUMN sheet_name TEXT NOT NULL DEFAULT ''")
-        template_columns = {row["name"] for row in connection.execute("PRAGMA table_info(templates)")}
-        if "examples_json" not in template_columns:
-            connection.execute("ALTER TABLE templates ADD COLUMN examples_json TEXT NOT NULL DEFAULT '{}'")
     return True
 
 
@@ -631,7 +615,6 @@ def delete_document(docket_id: str, document_id: str) -> Optional[str]:
         connection.execute("DELETE FROM documents WHERE id = ?", (document_id,))
         connection.execute("UPDATE dockets SET updated_at = ? WHERE id = ?", (utc_now(), docket_id))
     remove_stored_document(row["storage_path"])
-    apply_extraction_integrity(docket_id)
     return row["storage_path"]
 
 
@@ -697,9 +680,10 @@ def list_templates(docket_id: str) -> List[sqlite3.Row]:
         ).fetchall()
 
 
-def save_template(docket_id: str, name: str, labels: List[str], template_id: Optional[str] = None) -> str:
-    """Create a template, or update one by its own id. A name already used by another template
-    is refused rather than overwritten. Returns the template id."""
+def save_template(docket_id: str, name: str, labels: List[str], template_id: Optional[str] = None) -> None:
+    """Create a template, or update one. Pass the template's own id (not just its name) to
+    update an EXISTING template, including renaming it - looking it up by name only meant a
+    rename always created a duplicate row instead of updating the original."""
     clean_name = clean_text(name).strip()
     clean_labels: List[str] = []
     seen_labels: set[str] = set()
@@ -710,85 +694,37 @@ def save_template(docket_id: str, name: str, labels: List[str], template_id: Opt
             clean_labels.append(clean_label)
             seen_labels.add(normalized)
     if not clean_name or not clean_labels:
-        raise ValueError("A template name and at least one label are required.")
+        raise ValueError("A template name and at least one requested label are required.")
     now = utc_now()
-    labels_json = json.dumps(clean_labels, ensure_ascii=False)
     with connect() as connection:
         existing = None
         if template_id:
             existing = connection.execute(
                 "SELECT id FROM templates WHERE docket_id = ? AND id = ?", (docket_id, template_id)
             ).fetchone()
-        identifier = existing["id"] if existing else str(uuid.uuid4())
-        try:
-            if existing:
+        if existing is None:
+            existing = connection.execute(
+                "SELECT id FROM templates WHERE docket_id = ? AND name = ?", (docket_id, clean_name)
+            ).fetchone()
+        if existing:
+            try:
                 connection.execute(
                     "UPDATE templates SET name = ?, labels_json = ?, updated_at = ? WHERE id = ?",
-                    (clean_name, labels_json, now, identifier),
+                    (clean_name, json.dumps(clean_labels, ensure_ascii=False), now, existing["id"]),
                 )
-            else:
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(f"A template named “{clean_name}” already exists.") from exc
+        else:
+            try:
                 connection.execute(
-                    """INSERT INTO templates (id, docket_id, name, labels_json, created_at, updated_at)
+                    """INSERT INTO templates
+                       (id, docket_id, name, labels_json, created_at, updated_at)
                        VALUES (?, ?, ?, ?, ?, ?)""",
-                    (identifier, docket_id, clean_name, labels_json, now, now),
+                    (str(uuid.uuid4()), docket_id, clean_name,
+                     json.dumps(clean_labels, ensure_ascii=False), now, now),
                 )
-        except sqlite3.IntegrityError as exc:
-            raise ValueError(f"A template named “{clean_name}” already exists.") from exc
-    return identifier
-
-
-def add_template_label(docket_id: str, template_id: str, label: str) -> None:
-    with connect() as connection:
-        row = connection.execute(
-            "SELECT labels_json FROM templates WHERE docket_id = ? AND id = ?", (docket_id, template_id)
-        ).fetchone()
-        if row is None:
-            raise ValueError("That template no longer exists.")
-        labels = json.loads(row["labels_json"])
-        if normalize_label(label) not in {normalize_label(existing) for existing in labels}:
-            labels.append(label)
-            connection.execute(
-                "UPDATE templates SET labels_json = ?, updated_at = ? WHERE id = ?",
-                (json.dumps(labels, ensure_ascii=False), utc_now(), template_id),
-            )
-
-
-def template_decisions(template_id: str) -> Dict[str, Tuple[Optional[str], str]]:
-    """source label -> (target label or None for 'deliberately not mapped', method)."""
-    with connect() as connection:
-        rows = connection.execute(
-            "SELECT source_label, target_label, method FROM template_mappings WHERE template_id = ?",
-            (template_id,),
-        ).fetchall()
-    return {row["source_label"]: (row["target_label"], row["method"]) for row in rows}
-
-
-def set_template_decision(template_id: str, source_label: str, target_label: Optional[str], method: str) -> None:
-    with connect() as connection:
-        connection.execute(
-            """INSERT INTO template_mappings (template_id, source_label, target_label, method, updated_at)
-               VALUES (?, ?, ?, ?, ?)
-               ON CONFLICT(template_id, source_label) DO UPDATE SET
-                   target_label = excluded.target_label, method = excluded.method,
-                   updated_at = excluded.updated_at""",
-            (template_id, source_label, target_label, method, utc_now()),
-        )
-
-
-def template_rejections(template_id: str) -> set:
-    with connect() as connection:
-        rows = connection.execute(
-            "SELECT source_label, target_label FROM template_rejections WHERE template_id = ?", (template_id,)
-        ).fetchall()
-    return {(row["source_label"], row["target_label"]) for row in rows}
-
-
-def reject_template_suggestion(template_id: str, source_label: str, target_label: str) -> None:
-    with connect() as connection:
-        connection.execute(
-            "INSERT OR IGNORE INTO template_rejections (template_id, source_label, target_label) VALUES (?, ?, ?)",
-            (template_id, source_label, target_label),
-        )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(f"A template named “{clean_name}” already exists.") from exc
 
 
 def save_mapping(docket_id: str, source_label: str, requested_label: str, method: str) -> None:
@@ -803,14 +739,6 @@ def save_mapping(docket_id: str, source_label: str, requested_label: str, method
                ON CONFLICT(docket_id, source_label, requested_label)
                DO UPDATE SET method = excluded.method, approved = 1""",
             (str(uuid.uuid4()), docket_id, source_label, requested_label, method, utc_now()),
-        )
-
-
-def delete_mapping(docket_id: str, source_label: str, requested_label: str) -> None:
-    with connect() as connection:
-        connection.execute(
-            "DELETE FROM label_mappings WHERE docket_id = ? AND source_label = ? AND requested_label = ?",
-            (docket_id, source_label, requested_label),
         )
 
 
@@ -918,23 +846,11 @@ def split_pdf(data: bytes, pages_per_part: int) -> List[Tuple[int, int, bytes]]:
 
 
 def classify_local(pages: List[Dict[str, Any]]) -> str:
-    """Pick the document type from keyword hits. Keywords in the first lines (the heading)
-    count three times as much as body text, so an invoice that quotes a PO number is still
-    an Invoice. Ties keep the order of DOCUMENT_KEYWORDS."""
-    lines = [normalise(line) for page in pages for line in page["text"].splitlines() if line.strip()]
-    if not lines:
-        return "Unclassified"
-    header = " ".join(lines[:15])
-    body = " ".join(lines[15:])
-    best_label, best_score = "Unclassified", 0
+    text = normalise(" ".join(p["text"] for p in pages))
     for label, keywords in DOCUMENT_KEYWORDS:
-        score = 0
-        for keyword in keywords:
-            pattern = rf"\b{re.escape(keyword)}\b"
-            score += 3 * len(re.findall(pattern, header)) + len(re.findall(pattern, body))
-        if score > best_score:
-            best_label, best_score = label, score
-    return best_label
+        if any(keyword in text for keyword in keywords):
+            return label
+    return "Unclassified"
 
 
 # ---------------------------------------------------------------- confidence
@@ -975,7 +891,7 @@ def local_extract(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for page in pages:
         number = page["page_number"]
         if not page["readable"]:
-            facts.append(_fact(number, "Page processing status", "page_processing_status", "", ""))
+            facts.append(_fact(number, "Page readability", "page_status", "", ""))
             continue
         structured = 0
         for raw_line in page["text"].splitlines():
@@ -1069,30 +985,19 @@ def is_size_error(exc: Exception) -> bool:
     return "too large" in text or ("token" in text and ("exceed" in text or "limit" in text))
 
 
-SHARED_COOLDOWNS: Dict[str, float] = {}
-COOLDOWN_LOCK = threading.Lock()
-
-
 def cooldown_remaining(cooldown_id: str) -> float:
-    with COOLDOWN_LOCK:
-        until = SHARED_COOLDOWNS.get(cooldown_id, 0.0)
+    state = getattr(WORKER_STATE, "state", None)
+    cooldowns = state["key_cooldowns"] if state is not None else st.session_state.get("key_cooldowns", {})
+    until = cooldowns.get(cooldown_id, 0.0)
     return max(0.0, until - time.time())
 
 
 def set_cooldown(cooldown_id: str, seconds: int) -> None:
-    with COOLDOWN_LOCK:
-        SHARED_COOLDOWNS[cooldown_id] = time.time() + seconds
-
-
-def active_cooldown_count() -> int:
-    now = time.time()
-    with COOLDOWN_LOCK:
-        return sum(1 for until in SHARED_COOLDOWNS.values() if until > now)
-
-
-def clear_all_cooldowns() -> None:
-    with COOLDOWN_LOCK:
-        SHARED_COOLDOWNS.clear()
+    state = getattr(WORKER_STATE, "state", None)
+    if state is not None:
+        state.setdefault("key_cooldowns", {})[cooldown_id] = time.time() + seconds
+    else:
+        st.session_state.setdefault("key_cooldowns", {})[cooldown_id] = time.time() + seconds
 
 
 KEYRING_SERVICE = "parchai-gemini-keys"
@@ -1212,23 +1117,11 @@ class OversizedBatch(Exception):
     """Output was truncated or input was too large; the batch must be split."""
 
 
-def spreadsheet_as_text(pages: List[Dict[str, Any]]) -> str:
-    """Every readable worksheet (hidden ones included) as plain text, one labelled page each."""
-    return "\n\n".join(
-        f"=== PAGE {page['page_number']} · SHEET {page['sheet_name'] or 'unnamed'} ===\n{page['text']}"
-        for page in pages if page["readable"]
-    )
-
-
 def make_units(doc: Dict[str, Any]) -> List[Dict[str, Any]]:
     if extension_of(doc["filename"]) == "pdf" and fitz is not None:
         parts = split_pdf(doc["data"], CHUNK_PAGES)
     else:
         parts = [(0, doc["page_count"], doc["data"])]
-    mime, suffix = doc["mime"], "." + extension_of(doc["filename"])
-    if extension_of(doc["filename"]) == "xlsx":
-        parts = [(0, doc["page_count"], spreadsheet_as_text(doc["pages"]).encode("utf-8"))]
-        mime, suffix = "text/plain", ".txt"
     units = []
     for start, count, blob in parts:
         label = doc["filename"]
@@ -1236,7 +1129,7 @@ def make_units(doc: Dict[str, Any]) -> List[Dict[str, Any]]:
             label = f"{doc['filename']} [pages {start + 1}-{start + count}]"
         unit = {
             "label": label, "doc": doc, "offset": start, "pages": count, "data": blob,
-            "mime": mime, "suffix": suffix,
+            "mime": doc["mime"], "suffix": "." + extension_of(doc["filename"]),
             "pages_slice": doc["pages"][start:start + count],
             "items": None, "status": None, "message": "", "doc_type": None,
         }
@@ -1567,91 +1460,85 @@ def _append_reason(raw: str, reason: str) -> str:
     return json.dumps(reasons)
 
 
-INTEGRITY_REASONS = ("LABEL_VALUE_CONFLICT", "LABEL_VALUE_MISMATCH", "DUPLICATE_EXTRACTION_AUTO_APPROVED")
-
-
 def apply_extraction_integrity(docket_id: str) -> None:
-    """Recompute the system-managed review state of every pending, uncorrected fact.
+    """Auto-approve repeated facts and flag contradictory or ill-typed values.
 
-    Applied from scratch on every run, so flags disappear when their cause does:
-    - a label whose non-rejected values differ between DIFFERENT documents is a conflict;
-      every such fact is Red and kept for review. Repeated line items inside one document
-      are not conflicts;
-    - a label/value type mismatch is Red (and is never auto-approved);
-    - a value shared by at least two non-rejected facts is auto-approved (Green);
-    - anything else gets the normal evidence assessment.
-    Human decisions (approved, rejected, corrected) are never changed. An automatic approval
-    is withdrawn when it no longer applies.
+    Only pending, uncorrected extraction results are changed. Human decisions remain
+    authoritative and are never silently overwritten.
     """
     with connect() as connection:
         rows = connection.execute(
-            """SELECT f.id, f.document_id, f.label, f.concept, f.value, f.source_evidence,
-                      f.review_status, f.corrected, f.confidence_band, f.confidence_score,
-                      f.confidence_reasons, p.text AS page_text, p.readable AS page_readable
-               FROM facts f LEFT JOIN pages p
-                 ON p.document_id = f.document_id AND p.page_number = f.page_number
-               WHERE f.docket_id = ? ORDER BY f.created_at, f.id""",
+            """SELECT id, label, concept, value, review_status, corrected, confidence_band,
+                      confidence_score, confidence_reasons
+               FROM facts WHERE docket_id = ? ORDER BY created_at, id""",
             (docket_id,),
         ).fetchall()
-
-        counted = [row for row in rows if row["review_status"] != "rejected" and normalise(row["value"])]
         groups: Dict[str, List[sqlite3.Row]] = {}
-        for row in counted:
-            groups.setdefault(_fact_group_key(row["label"], row["concept"]), []).append(row)
-        conflict_groups = set()
-        for key, group in groups.items():
-            values = {normalise(row["value"]) for row in group}
-            documents = {row["document_id"] for row in group}
-            if len(values) > 1 and len(documents) > 1:
-                conflict_groups.add(key)
+        for row in rows:
+            if row["value"].strip():
+                groups.setdefault(_fact_group_key(row["label"], row["concept"]), []).append(row)
 
+        conflict_groups = {
+            key for key, group in groups.items()
+            if len({normalise(row["value"]) for row in group if normalise(row["value"])}) > 1
+        }
         now = utc_now()
         changed = False
+        for key, group in groups.items():
+            if key in conflict_groups:
+                for row in group:
+                    if row["review_status"] != "pending" or row["corrected"]:
+                        continue
+                    reasons = _append_reason(row["confidence_reasons"], "LABEL_VALUE_CONFLICT")
+                    connection.execute(
+                        """UPDATE facts SET confidence_band = 'Red', confidence_score = 0,
+                           confidence_reasons = ?, updated_at = ? WHERE id = ?""",
+                        (reasons, now, row["id"]),
+                    )
+                    changed = True
+                continue
+
+            duplicate_values: Dict[str, List[sqlite3.Row]] = {}
+            for row in group:
+                duplicate_values.setdefault(normalise(row["value"]), []).append(row)
+            for value_rows in duplicate_values.values():
+                if len(value_rows) < 2:
+                    continue
+                for row in value_rows:
+                    if row["review_status"] != "pending" or row["corrected"]:
+                        continue
+                    reasons = _append_reason(
+                        row["confidence_reasons"], "DUPLICATE_EXTRACTION_AUTO_APPROVED"
+                    )
+                    connection.execute(
+                        """INSERT INTO fact_history
+                           (id, fact_id, old_value, new_value, old_status, new_status,
+                            changed_at, reason)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (str(uuid.uuid4()), row["id"], row["value"], row["value"],
+                         row["review_status"], "approved", now,
+                         "Duplicate extraction matched another fact."),
+                    )
+                    connection.execute(
+                        """UPDATE facts SET confidence_band = 'Green', confidence_score = 100,
+                           confidence_reasons = ?, review_status = 'approved', updated_at = ?
+                           WHERE id = ?""",
+                        (reasons, now, row["id"]),
+                    )
+                    changed = True
+
         for row in rows:
-            if row["corrected"] or row["review_status"] == "rejected":
+            if row["review_status"] != "pending" or row["corrected"]:
                 continue
-            reasons = json.loads(row["confidence_reasons"] or "[]")
-            system_approved = (row["review_status"] == "approved"
-                               and "DUPLICATE_EXTRACTION_AUTO_APPROVED" in reasons)
-            if row["review_status"] != "pending" and not system_approved:
-                continue  # a human approval stays authoritative
-            base = [reason for reason in reasons if reason not in INTEGRITY_REASONS]
-            key = _fact_group_key(row["label"], row["concept"])
-            value_key = normalise(row["value"])
-            duplicates = (sum(1 for other in groups.get(key, []) if normalise(other["value"]) == value_key)
-                          if value_key else 0)
-            if key in conflict_groups and value_key:
-                status, band, score = "pending", "Red", 0
-                new_reasons = base + ["LABEL_VALUE_CONFLICT"]
-            elif label_value_mismatch(row["label"], row["value"]):
-                status, band, score = "pending", "Red", 0
-                new_reasons = base + ["LABEL_VALUE_MISMATCH"]
-            elif duplicates >= 2:
-                status, band, score = "approved", "Green", 100
-                new_reasons = base + ["DUPLICATE_EXTRACTION_AUTO_APPROVED"]
-            else:
-                page_text = row["page_text"] if row["page_readable"] else None
-                assessment = assess(row["value"], row["source_evidence"], page_text)
-                status, band, score = "pending", assessment["band"], assessment["score"]
-                new_reasons = assessment["reasons"]
-            new_reasons = list(dict.fromkeys(new_reasons))
-            if (status, band, score, new_reasons) == (row["review_status"], row["confidence_band"],
-                                                      row["confidence_score"], reasons):
+            if _fact_group_key(row["label"], row["concept"]) in conflict_groups:
                 continue
-            if status != row["review_status"]:
-                connection.execute(
-                    """INSERT INTO fact_history
-                       (id, fact_id, old_value, new_value, old_status, new_status, changed_at, reason)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (str(uuid.uuid4()), row["id"], row["value"], row["value"],
-                     row["review_status"], status, now,
-                     "Duplicate extraction matched another fact." if status == "approved"
-                     else "Automatic approval withdrawn by the integrity check."),
-                )
+            if not label_value_mismatch(row["label"], row["value"]):
+                continue
+            reasons = _append_reason(row["confidence_reasons"], "LABEL_VALUE_MISMATCH")
             connection.execute(
-                """UPDATE facts SET review_status = ?, confidence_band = ?, confidence_score = ?,
+                """UPDATE facts SET confidence_band = 'Red', confidence_score = 0,
                    confidence_reasons = ?, updated_at = ? WHERE id = ?""",
-                (status, band, score, json.dumps(new_reasons), now, row["id"]),
+                (reasons, now, row["id"]),
             )
             changed = True
         if changed:
@@ -1683,6 +1570,7 @@ def set_gemini_activity(active: bool, message: str = "") -> None:
 def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any]],
                         keys: List[Dict[str, str]]) -> None:
     WORKER_STATE.job_id = job_id
+    WORKER_STATE.state = {"key_cooldowns": {}}
     results: List[Dict[str, Any]] = []
     documents: List[Dict[str, Any]] = []
     finalized: set = set()
@@ -1767,6 +1655,7 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
             )
     finally:
         WORKER_STATE.job_id = None
+        WORKER_STATE.state = None
 
 
 def processing_job(docket_id: str) -> Optional[Dict[str, Any]]:
@@ -1845,9 +1734,8 @@ def render_processing_controls(docket_id: str) -> None:
         if not uploads:
             st.caption("Choose one or more files to enable processing.")
         if run and uploads:
-            started = process_uploads(docket_id, uploads)
-            if started:
-                st.session_state["upload_nonce"] = st.session_state.get("upload_nonce", 0) + 1
+            process_uploads(docket_id, uploads)
+            st.session_state["upload_nonce"] = st.session_state.get("upload_nonce", 0) + 1
             st.rerun(scope="app")
     _render_processing_status(processing_job(docket_id))
 
@@ -1865,17 +1753,15 @@ def _prune_finished_jobs() -> None:
             del PROCESSING_JOBS[stale_id]
 
 
-def process_uploads(docket_id: str, uploads: List[Any]) -> bool:
-    """Queue background processing. Returns True only when a job was actually started, so the
-    caller clears the uploader only for files that were accepted."""
+def process_uploads(docket_id: str, uploads: List[Any]) -> None:
     keys = key_pool()
     if not keys:
         queue_flash("error", "Gemini processing needs at least one valid API key. Add one in Settings.")
-        return False
+        return
     existing = processing_job(docket_id)
-    if existing and existing["status"] in {"queued", "running"}:
+    if existing and existing["status"] == "running":
         queue_flash("warning", "This docket is already being processed in the background.")
-        return False
+        return
     _prune_finished_jobs()
     job_id = str(uuid.uuid4())
     payload = [{"filename": upload.name, "data": upload.getvalue()} for upload in uploads]
@@ -1887,7 +1773,6 @@ def process_uploads(docket_id: str, uploads: List[Any]) -> bool:
         }
     PROCESSING_EXECUTOR.submit(_run_processing_job, job_id, docket_id, payload, keys)
     queue_flash("success", "Processing started in the background. You can switch tabs safely.")
-    return True
 
 
 # ---------------------------------------------------------------- review operations
@@ -1928,7 +1813,6 @@ def update_fact(fact_id: str, value: str, status: str, reason: str) -> None:
             (value, corrected, band, score, json.dumps(reasons), status, now, fact_id),
         )
         connection.execute("UPDATE dockets SET updated_at = ? WHERE id = ?", (now, row["docket_id"]))
-    apply_extraction_integrity(row["docket_id"])
 
 
 def approve_green(docket_id: str) -> int:
@@ -2064,7 +1948,7 @@ def build_psv(docket_id: str) -> Tuple[bytes, int]:
         record["fact_id"] = row["id"]
         record["confidence_reasons"] = ", ".join(json.loads(row["confidence_reasons"]))
         record["corrected"] = "true" if row["corrected"] else "false"
-        expected.append([psv_cell(record[field]) for field in PSV_FIELDS])
+        expected.append([safe_cell(record[field]) for field in PSV_FIELDS])
 
     buffer = io.StringIO(newline="")
     csv.writer(buffer, delimiter="|", quotechar='"', quoting=csv.QUOTE_MINIMAL,
@@ -2157,18 +2041,16 @@ def metadata_records(docket_id: str) -> List[dict]:
 
 
 def client_template_records(docket_id: str, template: sqlite3.Row) -> Tuple[List[dict], List[str]]:
-    """Records for one template, using that template's own mapping decisions. Every occurrence
-    is kept. Labels with no mapped records are reported as missing, never filled in."""
     labels = json.loads(template["labels_json"])
-    decisions = template_decisions(template["id"])
-    matched = {label: 0 for label in labels}
+    records = metadata_records(docket_id)
+    mappings = approved_mappings(docket_id)
     output: List[dict] = []
-    for record in metadata_records(docket_id):
-        decision = decisions.get(record["label"])
-        target = decision[0] if decision else None
-        if target in matched:
-            output.append({**record, "label": target})
-            matched[target] += 1
+    matched = {label: 0 for label in labels}
+    for record in records:
+        for target in mappings.get(record["label"], []):
+            if target in matched:
+                output.append({**record, "label": target})
+                matched[target] += 1
     return output, [label for label, count in matched.items() if count == 0]
 
 
@@ -2181,7 +2063,7 @@ def build_metadata_export(records: List[dict], description: str) -> Tuple[bytes,
 
 def build_metadata_psv(records: List[dict], description: str) -> Tuple[bytes, int]:
     expected = [METADATA_HEADERS] + [
-        [psv_cell(record[field]) for field in METADATA_HEADERS] for record in records
+        [safe_cell(record[field]) for field in METADATA_HEADERS] for record in records
     ]
     buffer = io.StringIO(newline="")
     csv.writer(buffer, delimiter="|", quotechar='"', quoting=csv.QUOTE_MINIMAL,
@@ -2373,7 +2255,7 @@ def render_topbar(dockets: List[sqlite3.Row]) -> Optional[sqlite3.Row]:
         if st.session_state.get("active_docket") not in ids:
             st.session_state["active_docket"] = ids[0]
     keys = len(key_pool())
-    cooling = active_cooldown_count()
+    cooling = sum(1 for until in st.session_state.get("key_cooldowns", {}).values() if until > time.time())
     rejected = len(rejected_keys())
 
     brand, docket_col, chips_col = st.columns([3, 3, 3], vertical_alignment="center")
@@ -2512,7 +2394,7 @@ def remove_key_callback(identifier: str) -> None:
 
 @guarded
 def clear_cooldowns_callback() -> None:
-    clear_all_cooldowns()
+    st.session_state["key_cooldowns"] = {}
     queue_flash("success", "Cooldowns cleared.")
 
 
@@ -2828,234 +2710,208 @@ def page_review(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
             st.caption("No changes recorded yet.")
 
 
-NOT_MAPPED = "— Not mapped —"
-ADD_AS_NEW = "＋ Add as a new field"
-CREATE_MODE = "Create new template"
-APPLY_MODE = "Apply existing template"
-METHOD_TEXT = {
-    "exact": "Exact name match",
-    "approved": "Approved suggestion",
-    "manual": "Set by you",
-    "direct": "From your labels",
-}
-
-
-def _labels_by_document(docket_id: str) -> Dict[str, List[str]]:
-    grouped: Dict[str, List[str]] = {}
-    for row in fetch_metadata(docket_id):
-        bucket = grouped.setdefault(row["document_name"], [])
-        if row["label"] not in bucket:
-            bucket.append(row["label"])
-    return grouped
-
-
-def _union(groups: Iterable[Iterable[str]]) -> List[str]:
-    seen: set[str] = set()
-    out: List[str] = []
-    for group in groups:
-        for label in group:
-            key = normalize_label(label)
-            if key and key not in seen:
-                seen.add(key)
-                out.append(label)
-    return out
-
-
-@guarded
-def submit_create_labels_callback(document: str) -> None:
-    key = f"create_pick_{document}"
-    picks = [str(pick) for pick in (st.session_state.get(key) or [])]
-    st.session_state[key] = []
-    if not picks:
-        return
-    submissions = st.session_state.setdefault("create_submissions", {})
-    submissions[document] = _union([submissions.get(document, []), picks])
-
-
-@guarded
-def edit_submission_callback(document: str, key: str) -> None:
-    picked = [str(pick) for pick in (st.session_state.get(key) or [])]
-    submissions = st.session_state.setdefault("create_submissions", {})
-    if picked:
-        submissions[document] = picked
-    else:
-        submissions.pop(document, None)
-
-
-@guarded
-def save_new_template_callback(docket_id: str, name: str) -> None:
-    labels = _union(st.session_state.get("create_submissions", {}).values())
-    if not labels:
-        raise ValueError("Submit at least one label first.")
-    template_id = save_template(docket_id, name, labels)
-    for label in labels:
-        set_template_decision(template_id, label, label, "direct")
-    st.session_state["create_submissions"] = {}
-    st.session_state["create_name"] = ""
-    queue_flash("success", f"Template “{name.strip()}” saved with {len(labels)} label(s).")
-
-
-@guarded
-def set_row_choice_callback(docket_id: str, template_id: str, source: str, key: str) -> None:
-    choice = st.session_state.get(key)
-    if choice == ADD_AS_NEW:
-        add_template_label(docket_id, template_id, source)
-        set_template_decision(template_id, source, source, "manual")
-    elif not choice or choice == NOT_MAPPED:
-        set_template_decision(template_id, source, None, "manual")
-    else:
-        set_template_decision(template_id, source, choice, "manual")
-
-
-@guarded
-def accept_suggestions_callback(template_id: str, pairs: List[Tuple[str, str]]) -> None:
-    for source, target in pairs:
-        set_template_decision(template_id, source, target, "approved")
-    queue_flash("success", f"Accepted {len(pairs)} suggestion(s).")
-
-
-@guarded
-def reject_suggestion_callback(template_id: str, source: str, target: str) -> None:
-    reject_template_suggestion(template_id, source, target)
-    queue_flash("success", "Suggestion dismissed.")
-
-
-def _mapping_row(docket_id: str, template_id: str, template_labels: List[str], source: str,
-                 current: Optional[str], status: str, suggestion: bool = False) -> None:
-    options = [NOT_MAPPED, *template_labels, ADD_AS_NEW]
-    shown = current if current in template_labels else NOT_MAPPED
-    key = f"map_{template_id}_{key_id(source)}_{key_id(str(current))}"
-    label_col, status_col, pick_col, action_col = st.columns([3, 2, 3, 2], vertical_alignment="center")
-    label_col.markdown(f"`{source}`")
-    status_col.caption(status)
-    pick_col.selectbox("Template field", options, index=options.index(shown), key=key,
-                       label_visibility="collapsed", on_change=set_row_choice_callback,
-                       args=(docket_id, template_id, source, key))
-    if suggestion and current:
-        accept_col, reject_col = action_col.columns(2)
-        accept_col.button("Accept", key=f"accept_{key}", type="primary",
-                          on_click=accept_suggestions_callback, args=(template_id, [(source, current)]),
-                          **stretch())
-        reject_col.button("Reject", key=f"reject_{key}",
-                          on_click=reject_suggestion_callback, args=(template_id, source, current),
-                          **stretch())
-
-
-def _render_create(docket_id: str, labels_by_doc: Dict[str, List[str]]) -> None:
-    st.markdown("**New template**")
-    st.text_input("Template name", key="create_name", placeholder="e.g. Acme purchase summary", max_chars=120)
-    documents = list(labels_by_doc)
-    st.markdown("**1 · Pick labels from a document**")
-    document = st.selectbox("Document", documents, key="create_document")
-    st.pills("Labels in this document", labels_by_doc[document], selection_mode="multi",
-             key=f"create_pick_{document}")
-    st.button("Submit labels", key="create_submit", on_click=submit_create_labels_callback, args=(document,))
-
-    submissions = st.session_state.get("create_submissions", {})
-    st.markdown("**2 · Submitted labels, by document**")
-    if not submissions:
-        st.caption("Nothing submitted yet.")
-    for doc, items in list(submissions.items()):
-        key = f"create_edit_{doc}_{key_id('|'.join(items))}"
-        with st.container(border=True):
-            st.markdown(f"**{doc}**")
-            st.pills("Deselect a label to remove it", labels_by_doc.get(doc, items), selection_mode="multi",
-                     default=items, key=key, on_change=edit_submission_callback, args=(doc, key))
-
-    total = _union(submissions.values())
-    st.markdown(f"**3 · Save · {len(total)} unique label(s)**")
-    name = st.session_state.get("create_name", "")
-    st.button("Save template", type="primary", disabled=not name.strip() or not total,
-              key="create_save", on_click=save_new_template_callback, args=(docket_id, name))
-
-
-def _render_apply(docket_id: str, labels_by_doc: Dict[str, List[str]]) -> None:
-    templates = list_templates(docket_id)
-    if not templates:
-        st.info("No saved templates yet. Create one first.")
-        return
-    chosen = st.selectbox("Saved template", [row["name"] for row in templates], key="apply_template")
-    template = next(row for row in templates if row["name"] == chosen)
-    template_id = template["id"]
-    template_labels = json.loads(template["labels_json"])
-    documents = st.multiselect("Documents to match", list(labels_by_doc), default=list(labels_by_doc),
-                               key=f"apply_docs_{template_id}")
-    if not documents:
-        st.info("Choose at least one document.")
-        return
-
-    source_labels = _union(labels_by_doc[name] for name in documents)
-    decisions = template_decisions(template_id)
-    plan = plan_template_matches(
-        source_labels, template_labels,
-        {source: target for source, (target, _method) in decisions.items()},
-        template_rejections(template_id),
-    )
-    for source, target in plan["auto"]:
-        set_template_decision(template_id, source, target, "exact")
-    decisions = template_decisions(template_id)
-
-    top_review: Dict[str, Dict[str, Any]] = {}
-    for item in plan["review"]:
-        top_review.setdefault(item["source"], item)
-    st.caption("Exact name matches are applied automatically. Close names are suggestions. "
-               "Nothing else is mapped without you.")
-
-    with st.container(border=True):
-        st.markdown(f"**Needs your decision · {len(top_review)}**")
-        if top_review:
-            st.button(f"Accept all {len(top_review)} suggestion(s)", key=f"accept_all_{template_id}",
-                      on_click=accept_suggestions_callback,
-                      args=(template_id, [(item["source"], item["target"]) for item in top_review.values()]),
-                      **stretch())
-            for item in top_review.values():
-                _mapping_row(docket_id, template_id, template_labels, item["source"], item["target"],
-                             f"Suggested · {item['score']:.0f}% similar", suggestion=True)
-        else:
-            st.caption("No suggestions need a decision.")
-
-    with st.container(border=True):
-        st.markdown(f"**No close match · {len(plan['unmatched'])}**")
-        st.caption("Pick a template field, or add the label as a new field.")
-        for source in plan["unmatched"]:
-            _mapping_row(docket_id, template_id, template_labels, source, None, "No close match")
-
-    mapped = [s for s in source_labels if s in decisions and decisions[s][0] is not None]
-    unmapped = [s for s in source_labels if s in decisions and decisions[s][0] is None]
-    with st.container(border=True):
-        st.markdown(f"**Mapped · {len(mapped)}**")
-        if not mapped:
-            st.caption("Nothing mapped yet.")
-        for source in mapped:
-            target, method = decisions[source]
-            _mapping_row(docket_id, template_id, template_labels, source, target,
-                         METHOD_TEXT.get(method, method))
-        if unmapped:
-            st.markdown(f"**Left unmapped · {len(unmapped)}**")
-            for source in unmapped:
-                _mapping_row(docket_id, template_id, template_labels, source, None, "Left unmapped by you")
-    st.caption("When the mapping is complete, open Export and download the Client Template.")
-
-
 def page_organize(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
-    page_header("Organize", "Create a new template from labels you pick, or apply an existing template to new "
-                "documents. The two workflows are separate.", active["name"] if active else None)
+    page_header("Organize", "Select exact client labels, save reusable templates, and approve label mappings.",
+                active["name"] if active else None)
     if not need_docket(active):
         return
-    docket_id = active["id"]
-    labels_by_doc = _labels_by_document(docket_id)
-    if not labels_by_doc:
-        st.info("Process documents first. Extracted labels appear here after processing.")
+    metadata = [dict(row) for row in fetch_metadata(active["id"])]
+    if not metadata:
+        st.info("Process documents first. The Main Metadata File will appear here after extraction.")
         return
+    labels = unique_labels(metadata)
+    st.metric("Unique extracted labels", len(labels))
     with st.expander("Main Metadata File preview", expanded=False):
-        st.dataframe([dict(row) for row in fetch_metadata(docket_id)], hide_index=True, **stretch())
-    mode = st.radio("What would you like to do?", [CREATE_MODE, APPLY_MODE], horizontal=True,
-                    key="organize_mode")
+        st.dataframe(metadata, hide_index=True, width="stretch")
+
+    templates = list_templates(active["id"])
+    template_names = [row["name"] for row in templates]
+    # Apply any pending default BEFORE the selectbox below is instantiated. Setting
+    # st.session_state["organize_template_choice"] AFTER that selectbox has already been
+    # created in this same script run raises StreamlitAPIException, so a save/rename
+    # schedules its pending selection here rather than writing the widget key directly.
+    pending_select = st.session_state.pop("organize_template_pending_select", None)
+    if pending_select is not None and pending_select in ("New template", *template_names):
+        st.session_state["organize_template_choice"] = pending_select
     with st.container(border=True):
-        if mode == CREATE_MODE:
-            _render_create(docket_id, labels_by_doc)
+        st.markdown("**Create or update a client template**")
+        selected = st.selectbox("Saved template", ["New template", *template_names],
+                                key="organize_template_choice")
+        existing = next((row for row in templates if row["name"] == selected), None)
+        default_name = existing["name"] if existing else ""
+        default_labels = json.loads(existing["labels_json"]) if existing else []
+        default_normalized = {normalize_label(label) for label in default_labels}
+        template_pill_options = [
+            *default_labels,
+            *[label for label in labels if normalize_label(label) not in default_normalized],
+        ]
+        name = st.text_input("Template name", value=default_name, key="template_name")
+        selected_labels = st.pills(
+            "Select template labels",
+            template_pill_options,
+            selection_mode="multi",
+            default=default_labels,
+            key=f"create_template_labels_{active['id']}_{selected}",
+            help="Select the extracted labels to include. Labels are kept exactly as displayed.",
+            width="stretch",
+        )
+        if st.button("Save template", type="primary", disabled=not selected_labels):
+            try:
+                save_template(active["id"], name, selected_labels,
+                               template_id=existing["id"] if existing else None)
+                removed_labels = [label for label in default_labels if label not in selected_labels]
+                delete_mappings_to_labels(active["id"], removed_labels)
+                st.success("Template saved.", icon="✅")
+                st.session_state["organize_template_pending_select"] = name.strip()
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc), icon="🚫")
+
+    if not templates:
+        return
+    template = existing or templates[0]
+    template_labels = json.loads(template["labels_json"])
+    st.markdown(f"#### Label matching · {template['name']}")
+    st.caption("Exact matches are mapped automatically. Suggestions require explicit approval.")
+
+    add_key = f"add_template_labels_{active['id']}_{template['id']}"
+
+    def add_selected_labels() -> None:
+        selected_labels = st.session_state.get(add_key, [])
+        existing_normalized = {normalize_label(label) for label in template_labels}
+        additions = [
+            label for label in selected_labels
+            if normalize_label(label) not in existing_normalized
+        ]
+        if additions:
+            save_template(active["id"], template["name"], [*template_labels, *additions],
+                           template_id=template["id"])
+        st.session_state[add_key] = []
+
+    template_normalized = {normalize_label(label) for label in template_labels}
+    available_labels = [
+        label for label in labels if normalize_label(label) not in template_normalized
+    ]
+    with st.container(border=True):
+        st.markdown("**Add extracted labels to this template**")
+        if available_labels:
+            st.pills(
+                "Available extracted labels",
+                available_labels,
+                selection_mode="multi",
+                key=add_key,
+                on_change=add_selected_labels,
+                help="Select one or more labels. They are added immediately without changing their spelling.",
+            )
         else:
-            _render_apply(docket_id, labels_by_doc)
+            st.caption("All extracted labels are already present in this template.")
+
+    remove_key = f"remove_template_labels_{active['id']}_{template['id']}"
+
+    def remove_selected_labels() -> None:
+        selected_labels = st.session_state.get(remove_key, [])
+        remaining = [label for label in template_labels if label not in selected_labels]
+        if remaining:
+            save_template(active["id"], template["name"], remaining, template_id=template["id"])
+            delete_mappings_to_labels(active["id"], selected_labels)
+
+    selected_for_removal = st.pills(
+        "Selected template labels",
+        template_labels,
+        selection_mode="multi",
+        key=remove_key,
+        help="Select labels to remove from this template.",
+    )
+    if selected_for_removal and st.button(
+        "Remove selected labels",
+        key=f"remove_selected_{active['id']}_{template['id']}",
+        on_click=remove_selected_labels,
+    ):
+        st.rerun()
+    if selected_for_removal and len(selected_for_removal) == len(template_labels):
+        st.warning("Keep at least one template label; templates cannot be empty.", icon="⚠️")
+
+    current_mappings = approved_mappings(active["id"])
+    exact_matches: list[tuple[str, str]] = []
+    suggested_matches: list[tuple[str, list[dict[str, Any]]]] = []
+    unmatched_labels: list[str] = []
+    rejected = rejected_suggestions(active["id"])
+
+    for source in labels:
+        exact = exact_template_label(source, template_labels)
+        # A source label may already be approved for OTHER templates; what matters here
+        # is only whether it already has an approved target inside THIS template.
+        mapped_for_this_template = [
+            target for target in current_mappings.get(source, []) if target in template_labels
+        ]
+        if exact:
+            if exact not in mapped_for_this_template:
+                save_mapping(active["id"], source, exact, "exact")
+            exact_matches.append((source, exact))
+            continue
+        if mapped_for_this_template:
+            continue
+        matches = [
+            match for match in suggestions(source, template_labels, limit=3, min_score=70)
+            if (source, match["label"]) not in rejected
+        ]
+        if matches:
+            suggested_matches.append((source, matches))
+        else:
+            unmatched_labels.append(source)
+
+    with st.container(border=True):
+        st.markdown("**Automatically matched**")
+        if exact_matches:
+            for source, target in exact_matches:
+                st.success(f"`{source}` → `{target}`", icon="✅")
+        else:
+            st.caption("No new exact matches.")
+
+    with st.container(border=True):
+        st.markdown("**Suggested matches · 70%+ similarity**")
+        if suggested_matches:
+            for source, matches in suggested_matches:
+                st.markdown(f"**{source}**")
+                for match in matches:
+                    target = match["label"]
+                    pair_id = key_id(f"{source}\u241f{target}")
+                    accept_col, reject_col, score_col = st.columns([1, 1, 3], vertical_alignment="center")
+                    with accept_col:
+                        if st.button(
+                            "Accept",
+                            key=f"accept_suggestion_{active['id']}_{template['id']}_{pair_id}",
+                            width="stretch",
+                        ):
+                            save_mapping(active["id"], source, target, "user-approved")
+                            st.rerun()
+                    with reject_col:
+                        if st.button(
+                            "Reject",
+                            key=f"reject_suggestion_{active['id']}_{template['id']}_{pair_id}",
+                            width="stretch",
+                        ):
+                            reject_suggestion(active["id"], source, target)
+                            st.rerun()
+                    with score_col:
+                        st.caption(f"`{target}` · {match['score']:.0f}%")
+        else:
+            st.caption("No suggestions meet the 70% threshold.")
+
+    with st.container(border=True):
+        st.markdown("**Unmatched extracted labels**")
+        if unmatched_labels:
+            st.pills(
+                "Labels not mapped",
+                unmatched_labels,
+                selection_mode="multi",
+                key=f"unmatched_labels_{active['id']}_{template['id']}",
+                label_visibility="collapsed",
+            )
+        else:
+            st.caption("All extracted labels are mapped or have reviewable suggestions.")
+
+    st.caption("Approve mappings, then use the Client Template export in the Export page.")
 
 
 def page_psv_verify(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
@@ -3143,7 +2999,7 @@ def page_psv_verify(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -
         lambda value: color_map.get(str(value), ""),
         subset=["Confidence Level"],
     )
-    st.dataframe(styled_frame, hide_index=True, **stretch())
+    st.dataframe(styled_frame, hide_index=True, width="stretch")
 
 
 def page_validation(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
@@ -3168,7 +3024,8 @@ def page_validation(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -
 
 
 def page_export(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
-    page_header("Export", "Choose a format and download. Each file is generated and checked when you open it.",
+    page_header("Export", "Download the unchanged Main Metadata File or a mapped Client Template "
+                          "without additional AI processing.",
                 active["name"] if active else None)
     if not need_docket(active):
         return
@@ -3177,55 +3034,72 @@ def page_export(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
         return
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
     slug = to_concept(active["name"]) or "docket"
+
     formats = ["JSON", "PSV", "XLSX"]
     mime_by_format = {"JSON": "application/json", "PSV": "text/plain; charset=utf-8", "XLSX": XLSX_MIME}
 
-    def export_panel(title: str, caption: str, records: List[dict], missing: List[str], prefix: str) -> None:
+    def export_panel(title: str, caption: str, records: List[dict], missing: List[str],
+                     prefix: str) -> None:
         st.markdown(f"**{title}**")
         st.caption(caption)
         if missing:
-            st.warning("Nothing mapped to: " + ", ".join(missing), icon="⚠️")
-        chosen = st.selectbox("Format", formats, key=f"{prefix}_format")
-        try:
-            if chosen == "JSON":
-                data, count = build_metadata_export(records, title)
-                extension = "json"
-            elif chosen == "PSV":
-                data, count = build_metadata_psv(records, title)
-                extension = "psv"
-            else:
-                data, count = build_metadata_xlsx(records, title)
-                extension = "xlsx"
-        except ExportError as exc:
-            st.error(f"{title} export blocked: {exc}", icon="🚫")
-            return
-        except Exception as exc:  # noqa: BLE001
-            LOG.exception("export failed")
-            st.error(f"{title} export failed: {clean_text(exc)[:200]}", icon="🚫")
-            return
-        st.caption(f"{count} row(s) · {fmt_size(len(data))} · integrity checked")
-        st.download_button(
-            f"Download {title} ({chosen})", data,
-            file_name=f"parchai-{slug}-{prefix}-{stamp}.{extension}",
-            mime=mime_by_format[chosen], key=f"{prefix}_download", **stretch(),
-        )
+            st.warning("No approved mapping for: " + ", ".join(missing), icon="⚠️")
+        selected_format = st.selectbox("Format", formats, key=f"{prefix}_format")
+        cache_key = f"{prefix}_export_cache"
+        if st.button("Build export", type="primary", key=f"{prefix}_build", **stretch()):
+            try:
+                if selected_format == "JSON":
+                    data, count = build_metadata_export(records, title)
+                    extension = "json"
+                elif selected_format == "PSV":
+                    data, count = build_metadata_psv(records, title)
+                    extension = "psv"
+                else:
+                    data, count = build_metadata_xlsx(records, title)
+                    extension = "xlsx"
+            except ExportError as exc:
+                st.session_state.pop(cache_key, None)
+                st.error(f"{title} export blocked: {exc}", icon="🚫")
+                return
+            except Exception as exc:  # noqa: BLE001
+                LOG.exception("export failed")
+                st.session_state.pop(cache_key, None)
+                st.error(f"{title} export failed: {clean_text(exc)[:200]}", icon="🚫")
+                return
+            st.session_state[cache_key] = {
+                "format": selected_format, "data": data, "count": count, "extension": extension,
+            }
+        cached = st.session_state.get(cache_key)
+        if cached and cached["format"] == selected_format:
+            st.success(f"Integrity verified · {cached['count']} row(s) · {fmt_size(len(cached['data']))}", icon="✅")
+            st.download_button(
+                "Download export", cached["data"],
+                file_name=f"parchai-{slug}-{prefix}-{stamp}.{cached['extension']}",
+                mime=mime_by_format[selected_format], key=f"{prefix}_download", **stretch(),
+            )
 
-    with st.container(border=True):
-        export_panel("Main Metadata", "The complete, unfiltered four-field record set.",
-                     metadata_records(active["id"]), [], "main_metadata")
+    main_records = metadata_records(active["id"])
     templates = list_templates(active["id"])
     with st.container(border=True):
+        export_panel(
+            "Main Metadata",
+            "The unchanged exhaustive four-field ledger: document_name, label, value and confidence_score.",
+            main_records, [], "main_metadata",
+        )
+    with st.container(border=True):
         if templates:
-            names = [row["name"] for row in templates]
-            chosen_name = st.selectbox("Client template", names, key="export_template_choice")
-            template = next(row for row in templates if row["name"] == chosen_name)
-            records, missing = client_template_records(active["id"], template)
-            export_panel(f"Client Template · {template['name']}",
-                         "Only the labels mapped for this template, under its exact labels.",
-                         records, missing, "client_template")
+            template_names = [row["name"] for row in templates]
+            selected_name = st.selectbox("Client template", template_names, key="export_template_choice")
+            selected_template = next(row for row in templates if row["name"] == selected_name)
+            client_records, missing = client_template_records(active["id"], selected_template)
+            export_panel(
+                "Client Template",
+                "Mapped records only; duplicate and conflicting values remain separate and labels retain exact template spelling.",
+                client_records, missing, "client_template",
+            )
         else:
             st.markdown("**Client Template**")
-            st.info("Create a template in Organize first.")
+            st.info("Create and save a client template in Organize before exporting.")
 
 
 def page_settings(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
