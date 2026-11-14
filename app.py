@@ -248,7 +248,8 @@ CREATE INDEX IF NOT EXISTS idx_documents_docket ON documents(docket_id);
 CREATE INDEX IF NOT EXISTS idx_metadata_docket ON metadata(docket_id);
 """
 
-BATCH_PROMPT = """You are an exhaustive document transcription and extraction engine.
+BATCH_PROMPT = """You are an exhaustive document transcription and extraction engine for ONE
+supplier document part in this request.
 Each document part is preceded by a line "=== DOCUMENT: <id> | <label> ===". Use that <id>
 (for example P2) EXACTLY as the "document" value. Page numbers restart at 1 for every labelled part. Spreadsheet
 parts contain every worksheet, including hidden worksheets, represented as a page with a
@@ -1864,30 +1865,57 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
             else:
                 results.append(skipped)
 
-        units: List[Dict[str, Any]] = []
-        for doc in documents:
+        for document_index, doc in enumerate(documents, start=1):
+            set_document_status(doc["id"], "processing")
+            progress(
+                f"Processing document {document_index}/{len(documents)}: "
+                f"{doc['filename']}"
+            )
             try:
-                units.extend(make_units(doc))
+                try:
+                    units = make_units(doc)
+                except Exception as exc:  # noqa: BLE001
+                    doc["units"] = [{
+                        "label": doc["filename"], "doc": doc, "offset": 0,
+                        "pages": doc["page_count"], "data": doc["data"],
+                        "mime": doc["mime"], "suffix": "",
+                        "pages_slice": doc["pages"], "items": None, "status": None,
+                        "message": "", "doc_type": None,
+                    }]
+                    units = doc["units"]
+                    LOG.warning(
+                        "could not split %s; sending this document whole: %s",
+                        doc["filename"], exc,
+                    )
+
+                # The batch boundary is deliberately inside this document loop.
+                # A Gemini request can therefore never contain units from another
+                # uploaded document.
+                batches = pack_batches([u for u in units if u["status"] is None])
+                for request_index, batch in enumerate(batches, start=1):
+                    progress(
+                        f"{doc['filename']}: request {request_index}/{len(batches)}"
+                    )
+                    process_units(batch, keys)
+
+                items = [item for unit in units for item in (unit["items"] or [])]
+                doc_type = next((u["doc_type"] for u in units if u["doc_type"]), "")
+                messages = sorted({u["message"] for u in units if u["message"]})
+                results.append(save(
+                    doc,
+                    gemini_document_status({"units": units}),
+                    doc_type or "Unclassified",
+                    items,
+                    " | ".join(messages),
+                ))
             except Exception as exc:  # noqa: BLE001
-                doc["units"] = [{
-                    "label": doc["filename"], "doc": doc, "offset": 0, "pages": doc["page_count"],
-                    "data": doc["data"], "mime": doc["mime"], "suffix": "",
-                    "pages_slice": doc["pages"], "items": None, "status": None,
-                    "message": "", "doc_type": None,
-                }]
-                units.append(doc["units"][0])  # send the whole document to Gemini as one part
-                LOG.warning("could not split %s into parts; sending it whole: %s", doc["filename"], exc)
-        batches = pack_batches([u for u in units if u["status"] is None])
-        for index, batch in enumerate(batches, start=1):
-            progress(f"Gemini request {index}/{len(batches)}…")
-            process_units(batch, keys)
-        for doc in documents:
-            items = [item for unit in doc["units"] for item in (unit["items"] or [])]
-            doc_type = next((u["doc_type"] for u in doc["units"] if u["doc_type"]), "")
-            messages = sorted({u["message"] for u in doc["units"] if u["message"]})
-            results.append(save(doc, gemini_document_status(doc),
-                                doc_type or "Unclassified",
-                                items, " | ".join(messages)))
+                LOG.exception("document processing failed for %s", doc["filename"])
+                set_document_status(doc["id"], "failed")
+                results.append(job_result(
+                    doc["filename"], "failed",
+                    f"Processing failed ({clean_text(exc)[:200]}). "
+                    "Completed documents were preserved; retry this document.",
+                ))
         with PROCESSING_LOCK:
             PROCESSING_JOBS[job_id].update(
                 status="complete", phase="complete", gemini_active=False,
@@ -1897,11 +1925,18 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
         LOG.exception("processing run failed")
         for doc in documents:
             if doc["id"] not in finalized:
-                delete_document(docket_id, doc["id"])
+                set_document_status(doc["id"], "failed")
+                already_reported = any(
+                    result["filename"] == doc["filename"]
+                    and result["status"] == "failed"
+                    for result in results
+                )
+                if already_reported:
+                    continue
                 results.append(job_result(
                     doc["filename"], "failed",
                     f"Processing was interrupted ({clean_text(exc)[:150]}). "
-                    "The file was removed so you can retry."))
+                    "Completed documents were preserved; retry this document."))
         with PROCESSING_LOCK:
             PROCESSING_JOBS[job_id].update(
                 status="error", phase="error", gemini_active=False,
@@ -2050,6 +2085,7 @@ def prepare_uploaded_documents(
         if doc is None:
             results.append(skipped)
             continue
+        set_document_status(doc["id"], "queued")
         batch_digests[digest] = filename
         payload.append({"filename": filename, "data": data, "document": doc})
     return payload, results
