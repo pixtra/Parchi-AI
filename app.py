@@ -2859,11 +2859,10 @@ def page_workspace(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) ->
     facts = fetch_facts(docket_id)
     documents = list_documents(docket_id)
 
-    metrics = st.columns(4)
+    metrics = st.columns(3)
     metrics[0].metric("Documents", len(documents))
     metrics[1].metric("Facts", len(facts))
     metrics[2].metric("Pending review", sum(f["review_status"] == "pending" for f in facts))
-    metrics[3].metric("Red confidence", sum(f["confidence_band"] == "Red" for f in facts))
 
     render_processing_controls(docket_id)
     job = processing_job(docket_id)
@@ -3229,19 +3228,6 @@ def page_organize(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> 
     available_labels = [
         label for label in labels if normalize_label(label) not in template_normalized
     ]
-    with st.container(border=True):
-        st.markdown("**Add extracted labels to this template**")
-        if available_labels:
-            st.pills(
-                "Available extracted labels",
-                available_labels,
-                selection_mode="multi",
-                key=add_key,
-                on_change=add_selected_labels,
-                help="Select one or more labels. They are added immediately without changing their spelling.",
-            )
-        else:
-            st.caption("All extracted labels are already present in this template.")
 
     remove_key = f"remove_template_labels_{active['id']}_{template['id']}"
 
@@ -3267,95 +3253,6 @@ def page_organize(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> 
         st.rerun()
     if selected_for_removal and len(selected_for_removal) == len(template_labels):
         st.warning("Keep at least one template label; templates cannot be empty.", icon="⚠️")
-
-    current_mappings = approved_mappings(active["id"])
-    exact_matches: list[tuple[str, str]] = []
-    suggested_matches: list[tuple[str, list[dict[str, Any]]]] = []
-    unmatched_labels: list[str] = []
-    rejected = rejected_suggestions(active["id"])
-
-    for source in labels:
-        exact = exact_template_label(source, template_labels)
-        # A source label may already be approved for OTHER templates; what matters here
-        # is only whether it already has an approved target inside THIS template.
-        mapped_for_this_template = [
-            target for target in current_mappings.get(source, []) if target in template_labels
-        ]
-        if exact:
-            if exact not in mapped_for_this_template:
-                save_mapping(active["id"], source, exact, "exact")
-            exact_matches.append((source, exact))
-            continue
-        if mapped_for_this_template:
-            continue
-        matches = [
-            match for match in suggestions(source, template_labels, limit=3, min_score=70)
-            if (source, match["label"]) not in rejected
-        ]
-        if matches:
-            suggested_matches.append((source, matches))
-        else:
-            unmatched_labels.append(source)
-
-    with st.container(border=True):
-        st.markdown("**Automatically matched**")
-        if exact_matches:
-            for source, target in exact_matches:
-                st.success(f"`{source}` → `{target}`", icon="✅")
-        else:
-            st.caption("No new exact matches.")
-
-    with st.container(border=True):
-        st.markdown("**Suggested matches · 70%+ similarity**")
-        if suggested_matches:
-            for source, matches in suggested_matches:
-                st.markdown(f"**{source}**")
-                for match in matches:
-                    target = match["label"]
-                    pair_id = key_id(f"{source}\u241f{target}")
-                    accept_col, reject_col, score_col = st.columns([1, 1, 3], vertical_alignment="center")
-                    with accept_col:
-                        if st.button(
-                            "Accept",
-                            key=f"accept_suggestion_{active['id']}_{template['id']}_{pair_id}",
-                            width="stretch",
-                        ):
-                            save_mapping(active["id"], source, target, "user-approved")
-                            st.rerun()
-                    with reject_col:
-                        if st.button(
-                            "Reject",
-                            key=f"reject_suggestion_{active['id']}_{template['id']}_{pair_id}",
-                            width="stretch",
-                        ):
-                            reject_suggestion(active["id"], source, target)
-                            st.rerun()
-                    with score_col:
-                        st.caption(f"`{target}` · {match['score']:.0f}%")
-        else:
-            st.caption("No suggestions meet the 70% threshold.")
-
-    with st.container(border=True):
-        st.markdown("**Unmatched extracted labels**")
-        if unmatched_labels:
-            st.caption("Choose a template label for each source label, or leave it unmatched.")
-            for source in unmatched_labels:
-                manual_key = f"manual_mapping_{active['id']}_{template['id']}_{key_id(source)}"
-                target = st.selectbox(
-                    f"Manual mapping for {source}",
-                    ["Do not map"] + template_labels,
-                    key=manual_key,
-                )
-                if target != "Do not map" and st.button(
-                    "Save manual mapping",
-                    key=f"{manual_key}_save",
-                ):
-                    save_mapping(active["id"], source, target, "manual")
-                    st.rerun()
-        else:
-            st.caption("All extracted labels are mapped or have reviewable suggestions.")
-
-    st.caption("Approve mappings, then use the Client Template export in the Export page.")
 
 
 def page_viewer(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
