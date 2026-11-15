@@ -4,46 +4,62 @@
 <meta charset="utf-8">
 <script src="sortable.min.js"></script>
 <style>
-  :root { color-scheme: dark; }
+  /* Design tokens copied from the app's inject_css so the board reads as one surface,
+     not a second style merged into the page. */
+  :root {
+    color-scheme: dark;
+    --bg:#10141b; --panel:#171c25; --panel2:#1e2430; --line:#2c3545;
+    --ink:#eef2f8; --muted:#a4afc1; --accent:#6c8cff; --accent-strong:#4f71f0;
+    --warn:#f2c46d; --ok:#4fd6a8; --bad:#ff8585;
+  }
   html, body { margin: 0; }
-  body { font: 13px/1.4 system-ui, -apple-system, Segoe UI, sans-serif; color: #e5e7eb; background: transparent; }
-  /* The board scrolls INSIDE the frame (max-height below), so the Group Values dock can
-     stay pinned at the bottom of the visible area no matter how far down the page its
-     natural position is. setHeight() reports the capped height so the iframe never grows
-     taller than the viewport it gives us. */
-  #root { max-height: 640px; overflow-y: auto; padding: 12px 14px 16px; box-sizing: border-box;
-          scrollbar-width: thin; scrollbar-color: #4b5563 transparent; }
-  h4 { margin: 12px 0 6px; font-size: 13px; font-weight: 600; color: #cbd5e1; }
-  .doc { border: 1px solid #374151; border-radius: 14px; padding: 14px 16px; margin-bottom: 10px; }
-  .doc-title { font-size: 12px; color: #9ca3af; margin-bottom: 8px; overflow-wrap: anywhere; }
+  body { font: 14px/1.45 "Source Sans Pro", -apple-system, "Segoe UI", system-ui, sans-serif;
+         color: var(--ink); background: transparent; }
+  #root { padding: 2px 2px 6px; box-sizing: border-box; }
+  /* The document list scrolls INSIDE a capped area; the Group Values dock is a sibling
+     below it (never sticky, never scrolls), so it is reachable and visible from every
+     document, and labels slide behind it as they scroll up. */
+  .scroll { max-height: 470px; overflow-y: auto; padding: 0 2px 4px;
+            scrollbar-width: thin; scrollbar-color: var(--line) transparent;
+            -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 22px), transparent);
+            mask-image: linear-gradient(to bottom, #000 calc(100% - 22px), transparent); }
+  h4 { margin: 12px 0 8px; font-size: 13px; font-weight: 700; color: var(--ink); letter-spacing: .01em; }
+  .doc { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-bottom: 10px;
+         background: rgba(23, 28, 37, .45); }
+  .doc-title { font-size: 12px; color: var(--muted); margin-bottom: 8px; overflow-wrap: anywhere; }
   .zone { display: flex; flex-wrap: wrap; gap: 8px; min-height: 48px; align-items: flex-start;
-          border: 1.5px dashed #4b5563; border-radius: 12px; padding: 10px 12px;
+          border: 1.5px dashed #3a465c; border-radius: 10px; padding: 10px 12px;
+          background: rgba(16, 20, 27, .35);
           transition: border-color .12s, background .12s, box-shadow .12s; }
-  .zone.drag-target { border-color: #818cf8; background: rgba(129, 140, 248, 0.10); }
-  .zone.drag-over { border-color: #fbbf24; background: rgba(251, 191, 36, 0.15);
-                    box-shadow: inset 0 0 0 1px #fbbf24; }
-  .dock { position: sticky; bottom: 4px; z-index: 5; margin-top: 14px;
-          background: #141922; border-radius: 14px; padding: 8px 10px 10px;
-          box-shadow: 0 6px 22px rgba(0, 0, 0, .5); }
-  .dock h4 { margin-top: 2px; }
-  .zone.draft { border-color: #f59e0b; background: rgba(245, 158, 11, 0.06); min-height: 76px; }
+  .zone.drag-target { border-color: var(--accent); background: rgba(108, 140, 255, .08); }
+  .zone.drag-over { border-color: var(--warn); background: rgba(242, 196, 109, .13);
+                    box-shadow: inset 0 0 0 1px var(--warn); }
+  .dock { position: relative; z-index: 5; margin: -14px 6px 12px;
+          background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+          padding: 10px 12px 12px; box-shadow: 0 -10px 22px rgba(0, 0, 0, .5), 0 6px 18px rgba(0, 0, 0, .35); }
+  .dock h4 { margin-top: 0; }
+  .zone.draft { border-color: var(--warn); background: rgba(242, 196, 109, .05); min-height: 76px; }
   .pill { display: inline-flex; align-items: center; gap: 7px; max-width: 100%; box-sizing: border-box;
-          border: 1px solid #6366f1; border-radius: 999px; padding: 7px 12px; min-height: 30px;
-          background: #1f2937; cursor: grab; user-select: none; touch-action: none; }
+          border: 1px solid var(--accent); border-radius: 999px; padding: 7px 12px; min-height: 30px;
+          background: var(--panel2); color: var(--ink); cursor: grab; user-select: none; touch-action: none; }
   .pill:active { cursor: grabbing; }
   .pill .lbl { font-weight: 600; white-space: nowrap; }
-  .pill .val { color: #9ca3af; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 240px; }
-  .pill .score { font-size: 11px; color: #a5b4fc; white-space: nowrap; }
-  .draft .pill { border-color: #f59e0b; }
+  .pill .val { color: var(--muted); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis;
+               white-space: nowrap; max-width: 240px; }
+  .pill .score { font-size: 11px; color: #9db4ff; white-space: nowrap; }
+  .draft .pill { border-color: var(--warn); }
   .sortable-ghost { opacity: 0.35; }
-  .empty { color: #6b7280; font-size: 12px; padding: 6px 4px; width: 100%; }
+  .empty { color: var(--muted); font-size: 12.5px; padding: 6px 4px; width: 100%; }
+  .groups-list { max-height: 175px; overflow-y: auto; padding-right: 2px;
+                 scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
   .group { margin-bottom: 6px; }
   .group summary { list-style: none; cursor: pointer; display: inline-block; max-width: 100%;
                    border-radius: 999px; padding: 7px 13px; color: #fff; font-weight: 600; }
   .group summary::-webkit-details-marker { display: none; }
   .members { margin: 6px 0 4px 4px; display: grid; gap: 4px; }
-  .member { border-left: 3px solid #6b7280; padding: 4px 8px; background: #111827; border-radius: 6px; overflow-wrap: anywhere; }
-  .member small { color: #9ca3af; }
+  .member { border-left: 3px solid var(--muted); padding: 4px 8px; background: var(--panel2);
+            border-radius: 6px; overflow-wrap: anywhere; }
+  .member small { color: var(--muted); }
 </style>
 </head>
 <body>
@@ -64,9 +80,9 @@
     window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data), "*");
   }
   function setHeight() {
-    // The board scrolls internally (#root max-height), so report the capped height:
-    // the iframe must never grow with the content.
-    send("streamlit:setFrameHeight", { height: Math.min(document.documentElement.scrollHeight, 660) });
+    // The frame grows with the groups section but is capped; the document list scrolls
+    // internally (.scroll max-height), so the iframe height stays stable while working.
+    send("streamlit:setFrameHeight", { height: Math.min(document.documentElement.scrollHeight, 680) });
   }
   function el(tag, cls, text) {
     const node = document.createElement(tag);
@@ -122,8 +138,8 @@
       draggable: ".pill",
       animation: 150,
       ghostClass: "sortable-ghost",
-      // AutoScroll (bundled in sortable.min.js) lets a drag near the edge of a long board
-      // scroll the board — this is what makes first-row-to-dock drags reachable.
+      // AutoScroll (bundled in sortable.min.js) lets a drag near the edge of a long
+      // document list scroll it — first-row-to-dock drags stay reachable.
       scroll: true,
       bubbleScroll: true,
       scrollSensitivity: 90,
@@ -169,9 +185,10 @@
     if (args.reset !== lastReset) { lastReset = args.reset; draft = []; }
     draft = draft.filter(id => all[id]);
 
-    root.appendChild(el("h4", null, "Documents"));
+    const scroll = el("div", "scroll");
+    scroll.appendChild(el("h4", null, "Documents"));
     const names = Object.keys(docs).sort((a, b) => a.localeCompare(b));
-    if (names.length === 0) root.appendChild(el("div", "empty", "No ungrouped records. Everything is in a group."));
+    if (names.length === 0) scroll.appendChild(el("div", "empty", "No ungrouped records. Everything is in a group."));
     names.forEach(name => {
       const box = el("div", "doc");
       box.appendChild(el("div", "doc-title", name));
@@ -180,9 +197,10 @@
       docs[name].forEach(item => { if (!draft.includes(item.id)) zone.appendChild(pill(item)); });
       syncZone(zone);
       box.appendChild(zone);
-      root.appendChild(box);
+      scroll.appendChild(box);
       sortable(zone);
     });
+    root.appendChild(scroll);
 
     const dock = el("div", "dock");
     dock.appendChild(el("h4", null, "Group Values"));
@@ -195,24 +213,28 @@
     root.appendChild(dock);
     sortable(drop);
 
-    root.appendChild(el("h4", null, "Grouped Values"));
+    const groupsWrap = el("div", null);
+    groupsWrap.appendChild(el("h4", null, "Grouped Values"));
     const groups = args.groups || [];
-    if (!groups.length) root.appendChild(el("div", "empty", "No saved groups yet."));
+    if (!groups.length) groupsWrap.appendChild(el("div", "empty", "No saved groups yet."));
+    const list = el("div", "groups-list");
     groups.forEach(group => {
       const details = el("details", "group");
       const summary = el("summary", null, group.name + "  ·  primary: " + (group.primary || "—"));
       summary.style.background = colour(group.id);
       details.appendChild(summary);
-      const list = el("div", "members");
+      const members = el("div", "members");
       group.members.forEach(m => {
         const row = el("div", "member");
         row.appendChild(el("div", null, m.label + "  =  " + m.value));
         row.appendChild(el("small", null, m.document + "  ·  confidence " + m.score + "%"));
-        list.appendChild(row);
+        members.appendChild(row);
       });
-      details.appendChild(list);
-      root.appendChild(details);
+      details.appendChild(members);
+      list.appendChild(details);
     });
+    groupsWrap.appendChild(list);
+    root.appendChild(groupsWrap);
     setHeight();
   }
 

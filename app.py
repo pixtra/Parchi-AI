@@ -1527,19 +1527,28 @@ def finish_reason(response: Any) -> str:
 
 
 def check_key(key: str) -> str:
+    client = None
     try:
-        models = list(islice(make_client(key).models.list(), 1))
+        client = make_client(key)
+        models = list(islice(client.models.list(), 1))
         return "Key accepted." if models else "Key accepted (no models listed)."
     except Exception as exc:  # noqa: BLE001
         return f"Failed: {scrub(exc, key)}"
+    finally:
+        if client is not None:
+            client.close()
 
 
 def list_models(key: str) -> List[str]:
+    client = make_client(key)
     names = []
-    for model in make_client(key).models.list():
-        actions = getattr(model, "supported_actions", None) or []
-        if not actions or "generateContent" in actions:
-            names.append(model.name.removeprefix("models/"))
+    try:
+        for model in client.models.list():
+            actions = getattr(model, "supported_actions", None) or []
+            if not actions or "generateContent" in actions:
+                names.append(model.name.removeprefix("models/"))
+    finally:
+        client.close()
     return sorted(names)
 
 
@@ -1894,16 +1903,15 @@ def prepare_document(docket_id: str, filename: str, data: bytes, mode: str) -> T
             (docket_id, digest),
         ).fetchone()
     if duplicate:
-        if duplicate["status"] == "completed":
-            return None, {
-                "filename": filename,
-                "status": "skipped",
-                "fact_count": 0,
-                "extracted_count": 0,
-                "appended_count": 0,
-                "message": f"Identical to “{duplicate['filename']}” already completed in this docket.",
-            }
-        delete_document(docket_id, duplicate["id"])
+        return None, {
+            "filename": filename,
+            "status": "skipped",
+            "fact_count": 0,
+            "extracted_count": 0,
+            "appended_count": 0,
+            "message": f"Identical to “{duplicate['filename']}” already exists in this docket "
+                       f"with status {document_state_label(duplicate['status'])}.",
+        }
     try:
         pages = read_pages(filename, data)
     except Exception as exc:  # noqa: BLE001
@@ -1955,6 +1963,27 @@ def finalize_document(docket_id: str, doc: Dict[str, Any], status: str,
     same transaction, so a failed save rolls back and leaves the previous extraction —
     and its review history — untouched."""
     now = utc_now()
+    extracted_items = [
+        item for item in items if item.get("concept") != "page_processing_status"
+    ]
+    if status == "failed" and not extracted_items:
+        # A failed retry must not erase a previously successful extraction. Keep the old
+        # facts available for review/export while recording that the latest attempt failed.
+        with connect() as connection:
+            connection.execute(
+                """UPDATE documents SET status = ?, document_type = ?, processed_units = 0,
+                   failed_units = ?, completeness_status = ?, completeness_message = ?
+                   WHERE id = ?""",
+                (status, clean_text(document_type or "Unclassified")[:80], doc["page_count"],
+                 "complete_with_warnings", "Gemini did not return usable values; previous "
+                 "extraction was retained. Retry this document.", doc["id"]),
+            )
+            connection.execute("UPDATE dockets SET updated_at = ? WHERE id = ?", (now, docket_id))
+            return int(connection.execute(
+                "SELECT COUNT(*) FROM facts WHERE document_id = ? "
+                "AND concept != 'page_processing_status'", (doc["id"],)
+            ).fetchone()[0])
+
     # Pages/sheets the extractor actually returned at least one fact for. A page with no
     # text layer (e.g. an image, vision-only) can still land here once Gemini reads it -
     # "no text layer" and "nothing came back" are NOT the same thing.
@@ -2044,7 +2073,8 @@ def finalize_document(docket_id: str, doc: Dict[str, Any], status: str,
         LOG.exception("consistency pass failed for docket %s", docket_id)
     with connect() as connection:
         return int(connection.execute(
-            "SELECT COUNT(*) FROM facts WHERE document_id = ?", (doc["id"],)
+            "SELECT COUNT(*) FROM facts WHERE document_id = ? "
+            "AND concept != 'page_processing_status'", (doc["id"],)
         ).fetchone()[0])
 
 
@@ -2177,6 +2207,23 @@ def job_result(filename: str, status: str, message: str,
             "extracted_count": extracted, "appended_count": appended, "message": message}
 
 
+def _job_doc_update(job_id: str, document_id: str, **fields: Any) -> None:
+    """Update one document's live entry in a job's queue (created on demand).
+
+    The queue is what the processing panel renders per file: name, live status and
+    fact count. Called from the worker thread only; every mutation takes the lock."""
+    with PROCESSING_LOCK:
+        job = PROCESSING_JOBS.get(job_id)
+        if job is None:
+            return
+        docs = job.setdefault("docs", [])
+        for entry in docs:
+            if entry["id"] == document_id:
+                entry.update(fields)
+                return
+        docs.append({"id": document_id, **fields})
+
+
 def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any]],
                         keys: List[Dict[str, str]],
                         initial_results: Optional[List[Dict[str, Any]]] = None) -> None:
@@ -2200,7 +2247,16 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
     ) -> Dict[str, Any]:
         set_document_status(doc["id"], "saving")
         try:
+            extracted_count = sum(
+                item.get("concept") != "page_processing_status" for item in items
+            )
             fact_count = finalize_document(docket_id, doc, status, doc_type, items)
+            if status in {"failed", "partial"} and message:
+                with connect() as connection:
+                    connection.execute(
+                        "UPDATE documents SET completeness_message = ? WHERE id = ?",
+                        (message[:500], doc["id"]),
+                    )
             # Decisions captured when the document was queued are restored onto the fresh
             # extraction where label and value still match; unmatched decisions lapse.
             carried = reapply_review_decisions(doc["id"], doc.get("previous_decisions") or [])
@@ -2212,7 +2268,7 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
                 "filename": doc["filename"],
                 "status": status,
                 "fact_count": fact_count,
-                "extracted_count": len(items),
+                "extracted_count": extracted_count,
                 "appended_count": fact_count,
                 "message": message,
             }
@@ -2269,10 +2325,16 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
                 results.append(skipped)
 
         with PROCESSING_LOCK:
-            PROCESSING_JOBS[job_id].update(total_docs=len(documents), done_docs=0)
+            # Include files rejected before extraction in the denominator so the
+            # overall percentage describes every file selected for this run.
+            PROCESSING_JOBS[job_id].update(
+                total_docs=len(documents) + len(results), done_docs=len(results)
+            )
 
         for document_index, doc in enumerate(documents, start=1):
             set_document_status(doc["id"], "processing")
+            _job_doc_update(job_id, doc["id"], filename=doc["filename"], status="processing",
+                            facts=0, message="Sending to Gemini…")
             progress(
                 f"Processing document {document_index}/{len(documents)}: "
                 f"{doc['filename']}"
@@ -2307,22 +2369,24 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
                 items = [item for unit in units for item in (unit["items"] or [])]
                 doc_type = next((u["doc_type"] for u in units if u["doc_type"]), "")
                 messages = sorted({u["message"] for u in units if u["message"]})
-                results.append(save(
+                outcome = save(
                     doc,
                     gemini_document_status({"units": units}),
                     doc_type or "Unclassified",
                     items,
                     " | ".join(messages),
-                ))
+                )
+                results.append(outcome)
+                _job_doc_update(job_id, doc["id"], status=outcome["status"],
+                                facts=outcome["appended_count"], message=outcome["message"])
                 mark_done()
             except Exception as exc:  # noqa: BLE001
                 LOG.exception("document processing failed for %s", doc["filename"])
                 set_document_status(doc["id"], "failed")
-                results.append(job_result(
-                    doc["filename"], "failed",
-                    f"Processing failed ({clean_text(exc)[:200]}). "
-                    "Completed documents were preserved; retry this document.",
-                ))
+                message = (f"Processing failed ({clean_text(exc)[:200]}). "
+                           "Completed documents were preserved; retry this document.")
+                results.append(job_result(doc["filename"], "failed", message))
+                _job_doc_update(job_id, doc["id"], status="failed", facts=0, message=message)
                 mark_done()
         with PROCESSING_LOCK:
             PROCESSING_JOBS[job_id].update(
@@ -2341,10 +2405,10 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
                 )
                 if already_reported:
                     continue
-                results.append(job_result(
-                    doc["filename"], "failed",
-                    f"Processing was interrupted ({clean_text(exc)[:150]}). "
-                    "Completed documents were preserved; retry this document."))
+                message = (f"Processing was interrupted ({clean_text(exc)[:150]}). "
+                           "Completed documents were preserved; retry this document.")
+                results.append(job_result(doc["filename"], "failed", message))
+                _job_doc_update(job_id, doc["id"], status="failed", facts=0, message=message)
         with PROCESSING_LOCK:
             PROCESSING_JOBS[job_id].update(
                 status="error", phase="error", gemini_active=False,
@@ -2367,6 +2431,9 @@ _LOADER_CSS = """
 <style>
 .pp-loader{display:flex;gap:1rem;align-items:center;padding:.9rem 1rem;border-radius:12px;
   border:1px solid rgba(128,128,128,.25);background:rgba(128,128,128,.06);margin:.5rem 0 1rem}
+.pp-spinner{width:24px;height:24px;flex:0 0 24px;border:3px solid rgba(128,128,128,.28);
+  border-top-color:#60a5fa;border-right-color:#2563eb;border-radius:50%;
+  animation:pp-spin .8s linear infinite}
 .pp-ring{position:relative;width:64px;height:64px;flex:0 0 64px}
 .pp-ring svg{width:64px;height:64px;transform:rotate(-90deg)}
 .pp-track{fill:none;stroke:rgba(128,128,128,.25);stroke-width:6}
@@ -2378,10 +2445,52 @@ _LOADER_CSS = """
 .pp-title{font-weight:600;margin-bottom:.15rem}
 .pp-msg{font-size:.9rem;opacity:.9;word-break:break-word}
 .pp-sub{font-size:.8rem;opacity:.7;margin-top:.25rem}
+.pp-loader.error .pp-bar,.pp-loader.error .pp-orbit{stroke:#ff8585}
+.pp-loader.ok .pp-bar{stroke:#4fd6a8}
+.pp-docs{margin:.4rem 0 0 .5rem;display:grid;gap:.3rem;max-height:11.5rem;overflow-y:auto}
+.pp-doc{display:flex;gap:.55rem;align-items:baseline;font-size:.86rem;flex-wrap:wrap}
+.pp-doc-name{font-weight:600;overflow-wrap:anywhere}
+.pp-doc-facts{opacity:.75;font-size:.8rem}
+.pp-doc-msg{opacity:.7;font-size:.8rem;overflow-wrap:anywhere}
 @keyframes pp-spin{to{transform:rotate(360deg)}}
-@media (prefers-reduced-motion: reduce){.pp-orbit{animation:none;opacity:.5}}
+@media (prefers-reduced-motion: reduce){.pp-orbit,.pp-spinner{animation:none;opacity:.5}}
 </style>
 """
+
+
+PROCESSING_SUMMARY_SECONDS = 90
+
+
+def queue_rows(job: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Normalize a job's per-document queue for display.
+
+    Every row carries the file name, its live status, the fact count saved so far and a
+    short human message. Rows keep queue order (queued documents first, then failures
+    that never entered the queue)."""
+    rows = []
+    for entry in job.get("docs") or []:
+        rows.append({
+            "filename": entry.get("filename") or "",
+            "status": entry.get("status") or "queued",
+            "facts": int(entry.get("facts") or 0),
+            "message": entry.get("message") or "",
+        })
+    seen = {row["filename"] for row in rows}
+    for result in job.get("results") or []:
+        if result.get("filename") in seen:
+            continue
+        status = result.get("status") or "failed"
+        message = result.get("message") or ""
+        if status == "skipped":
+            status = "failed"
+            message = f"Skipped: {message}" if message else "Skipped before extraction."
+        rows.append({
+            "filename": result.get("filename") or "",
+            "status": status,
+            "facts": int(result.get("appended_count") or 0),
+            "message": message,
+        })
+    return rows
 
 
 def _render_processing_status(job: Optional[Dict[str, Any]]) -> None:
@@ -2398,32 +2507,112 @@ def _render_processing_status(job: Optional[Dict[str, Any]]) -> None:
         else:
             title = "Processing saved documents"
         message = esc(job.get("message") or "Preparing the saved documents.")
-        st.markdown(
-            _LOADER_CSS
-            + '<div class="pp-loader" role="status" aria-live="polite">'
-            + '<div class="pp-ring">'
-            + '<svg viewBox="0 0 64 64" aria-hidden="true">'
-            + '<circle class="pp-track" cx="32" cy="32" r="28" pathLength="100"/>'
-            + f'<circle class="pp-bar" cx="32" cy="32" r="28" pathLength="100" '
-            + f'style="stroke-dasharray:{percent} 100"/>'
-            + '<circle class="pp-orbit" cx="32" cy="32" r="28" pathLength="100" '
-            + 'style="stroke-dasharray:14 86"/>'
-            + '</svg>'
-            + f'<div class="pp-pct">{percent}%</div></div>'
-            + '<div><div class="pp-title">' + esc(title) + '…</div>'
-            + f'<div class="pp-msg">{message}</div>'
-            + f'<div class="pp-sub">{done} of {total} document(s) finished · '
-            + 'you can switch tabs safely; facts appear as each document completes.</div>'
-            + '</div></div>',
-            unsafe_allow_html=True,
+        _render_processing_panel(
+            job, title=f"{title}…", message=message, percent=percent,
+            sub=f"{done} of {total} document(s) finished · you can switch tabs safely; "
+                "facts appear as each document completes.",
         )
     elif job["status"] == "error":
-        st.error(job["message"], icon="🚫")
+        _render_processing_panel(
+            job, title="Processing stopped", message=esc(job.get("message") or ""),
+            percent=None, kind="error",
+        )
+    elif job["status"] == "complete" \
+            and time.time() - float(job.get("finished_at") or 0) <= PROCESSING_SUMMARY_SECONDS:
+        rows = queue_rows(job)
+        counts: Dict[str, int] = {}
+        for row in rows:
+            counts[row["status"]] = counts.get(row["status"], 0) + 1
+        facts = sum(row["facts"] for row in rows)
+        summary = " · ".join(
+            f"{document_state_label(status)}: {counts[status]}"
+            for status in ("completed", "partial", "failed") if status in counts
+        )
+        _render_processing_panel(
+            job, title="Processing complete", message=esc(summary or "No documents were processed."),
+            percent=100, kind="ok",
+            sub=f"{facts} extracted record(s) saved to Main Metadata." if facts else "",
+        )
+
+
+def _render_processing_panel(job: Dict[str, Any], title: str, message: str,
+                             percent: Optional[int], kind: str = "",
+                             sub: str = "") -> None:
+    """Throbber + overall progress + the live per-document queue, in the app's chip style."""
+    ring = ""
+    if percent is not None:
+        ring = (
+            '<div class="pp-ring">'
+            '<svg viewBox="0 0 64 64" aria-hidden="true">'
+            '<circle class="pp-track" cx="32" cy="32" r="28" pathLength="100"/>'
+            + (f'<circle class="pp-bar" cx="32" cy="32" r="28" pathLength="100" '
+               f'style="stroke-dasharray:{max(0, min(100, percent))} 100"/>'
+               if percent else '')
+            + ('<circle class="pp-orbit" cx="32" cy="32" r="28" pathLength="100" '
+               'style="stroke-dasharray:14 86"/>' if kind == "" else '')
+            + '</svg>'
+            + f'<div class="pp-pct">{max(0, min(100, percent))}%</div></div>'
+        )
+    queue_html = ""
+    rows = queue_rows(job)
+    if rows:
+        cells = []
+        for row in rows:
+            facts = f'<span class="pp-doc-facts">{row["facts"]} record(s)</span>' \
+                if row["status"] in {"completed", "partial"} else ""
+            note = f'<span class="pp-doc-msg">{esc(row["message"])}</span>' \
+                if row["message"] and row["status"] in {"failed", "partial"} else ""
+            cells.append(
+                '<div class="pp-doc">'
+                + f'<span class="pp-doc-name">{esc(row["filename"])}</span>'
+                + document_state_badge(row["status"])
+                + facts + note
+                + '</div>'
+            )
+        queue_html = ('<div class="pp-docs" aria-label="Document queue">' + "".join(cells) + '</div>')
+    st.markdown(
+        _LOADER_CSS
+        + f'<div class="pp-loader {esc(kind)}" role="status" aria-live="polite">'
+        + ('<div class="pp-spinner" aria-label="Processing"></div>' if kind == "" else '')
+        + ring
+        + f'<div><div class="pp-title">{esc(title)}</div>'
+        + f'<div class="pp-msg">{message}</div>'
+        + (f'<div class="pp-sub">{esc(sub)}</div>' if sub else '')
+        + '</div></div>'
+        + queue_html,
+        unsafe_allow_html=True,
+    )
+
+
+def _watch_processing_progress(job: Optional[Dict[str, Any]]) -> None:
+    """Rerun the whole app whenever a document finishes, so its facts appear in
+    Workspace, Review and Main Metadata without any manual refresh or tab change.
+
+    Shared by every auto-refreshing fragment that shows processing state; the
+    session-state keys make multiple fragments (banner + step-2 panel) dedupe to a
+    single rerun. The first sighting only seeds the baseline so opening a page
+    mid-run doesn't trigger a pointless rerun."""
+    if not job:
+        return
+    progress_mark = (job["id"], job.get("done_docs", 0))
+    if progress_mark == st.session_state.get("last_seen_progress"):
+        return
+    st.session_state["last_seen_progress"] = progress_mark
+    if st.session_state.get("last_seen_progress_seeded"):
+        st.rerun(scope="app")
+    st.session_state["last_seen_progress_seeded"] = True
 
 
 @st.fragment(run_every=1)
 def render_processing_loader(docket_id: str) -> None:
-    _render_processing_status(processing_job(docket_id))
+    """Live processing banner: throbber, overall progress and the per-document queue.
+    Rendered on every page for the active docket, so progress stays visible across
+    tab navigation; auto-refreshes every second while a run is active or just finished."""
+    job = processing_job(docket_id)
+    if job is None:
+        return
+    _watch_processing_progress(job)
+    _render_processing_status(job)
 
 
 def processing_active(docket_id: Optional[str]) -> bool:
@@ -2632,6 +2821,7 @@ def queue_saved_documents(docket_id: str, document_ids: List[str]) -> Tuple[int,
     wanted = set(document_ids)
     payloads: List[Dict[str, Any]] = []
     results: List[Dict[str, Any]] = []
+    docs: List[Dict[str, Any]] = []
     for row in list_documents(docket_id):
         if row["id"] not in wanted or row["status"] not in PROCESSABLE_STATES:
             continue
@@ -2639,8 +2829,12 @@ def queue_saved_documents(docket_id: str, document_ids: List[str]) -> Tuple[int,
         if problem:
             set_document_status(row["id"], "failed")
             results.append(job_result(row["filename"], "failed", problem))
+            docs.append({"id": row["id"], "filename": row["filename"], "status": "failed",
+                         "facts": 0, "message": problem})
             continue
         set_document_status(row["id"], "queued")
+        docs.append({"id": row["id"], "filename": row["filename"], "status": "queued",
+                     "facts": 0, "message": ""})
         # Snapshot review decisions now; the document's existing facts stay in place until
         # its new extraction succeeds (finalize_document replaces them transactionally).
         document["previous_decisions"] = capture_review_decisions(row["id"])
@@ -2654,8 +2848,9 @@ def queue_saved_documents(docket_id: str, document_ids: List[str]) -> Tuple[int,
             "id": job_id, "docket_id": docket_id, "status": "queued", "phase": "queued",
             "gemini_active": False, "message": "Queued for Gemini extraction…",
             "results": results, "total_docs": len(payloads), "done_docs": 0, "finished_at": 0.0,
+            "docs": docs,
         }
-    PROCESSING_EXECUTOR.submit(_run_processing_job, job_id, docket_id, payloads, keys, [])
+    PROCESSING_EXECUTOR.submit(_run_processing_job, job_id, docket_id, payloads, keys, results)
     queue_flash("success", f"Queued {len(payloads)} document(s) for Gemini extraction. "
                            "Progress appears in step 2; you can switch tabs safely.")
     return len(payloads), results
@@ -2678,14 +2873,9 @@ def render_process_panel(docket_id: str) -> None:
         st.session_state["last_results"] = job.get("results") or []
         st.session_state["last_surfaced_job_id"] = job["id"]
         st.rerun(scope="app")
-    # Live updates: each time a document finishes, refresh the whole app so its facts
-    # appear in Workspace, Review and Main Metadata straight away.
-    progress_mark = (job["id"], job.get("done_docs", 0)) if job else None
-    if progress_mark is not None and progress_mark != st.session_state.get("last_seen_progress"):
-        st.session_state["last_seen_progress"] = progress_mark
-        if st.session_state.get("last_seen_progress_seeded"):
-            st.rerun(scope="app")
-        st.session_state["last_seen_progress_seeded"] = True
+    # Live updates across the whole app (facts appearing as each document completes) are
+    # handled by _watch_processing_progress inside the processing banner fragment, which
+    # renders on every page above this panel.
     with st.container(border=True):
         st.markdown("#### 2 · Process saved documents")
         documents = list_documents(docket_id)
@@ -2739,9 +2929,12 @@ def render_process_panel(docket_id: str) -> None:
             )
             if start_selected or start_all:
                 ids = list(chosen) if start_selected else list(labels)
-                queue_saved_documents(docket_id, ids)
+                queued_count, immediate_results = queue_saved_documents(docket_id, ids)
+                if immediate_results:
+                    st.session_state["last_results"] = immediate_results
                 st.session_state["clear_process_pick"] = True
-                st.rerun(scope="app")
+                if queued_count or immediate_results:
+                    st.rerun(scope="app")
         _render_processing_status(job)
         for failed in [r for r in st.session_state.get("last_results") or [] if r["status"] == "failed"]:
             st.error(f"{failed['filename']}: {failed['message']}", icon="🚫")
@@ -4495,6 +4688,10 @@ def main() -> None:
         dockets = list_dockets()
         active = render_topbar(dockets)
         render_flash()
+        # Live processing banner on every page: throbber, overall progress and the
+        # per-document queue for the active docket's run (see render_processing_loader).
+        if active is not None:
+            render_processing_loader(active["id"])
         RENDERERS[page](dockets, active)
     except Exception as exc:  # noqa: BLE001  (error boundary)
         if is_control_flow(exc):
