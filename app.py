@@ -27,11 +27,23 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 from psv_workflow import band_for_score, label_value_mismatch
 from metadata_workflow import (
     json_bytes,
     sheet_text,
+)
+from value_groups import (
+    VALUE_GROUP_SCHEMA,
+    GroupError,
+    create_group,
+    delete_group,
+    load_groups,
+    merge_groups,
+    rename_group,
+    replace_members,
+    ungrouped_fact_ids,
 )
 try:
     import rapidfuzz
@@ -68,6 +80,14 @@ WORKER_STATE = threading.local()
 
 # ---------------------------------------------------------------- configuration
 BASE_DIR = Path(__file__).resolve().parent
+
+# Drag-and-drop board for manual value grouping (Organize tab). The static asset folder
+# ships with the app; declare it once so it is served by Streamlit's component route.
+_VALUE_GROUP_COMPONENT_DIR = BASE_DIR / "value_group_component"
+_value_groups_component = (
+    components.declare_component("parchi_value_groups", path=str(_VALUE_GROUP_COMPONENT_DIR))
+    if _VALUE_GROUP_COMPONENT_DIR.is_dir() else None
+)
 def _env(name: str, default: Any = "") -> Any:
     """Read PARCHI_<name>; fall back to the old PARCHAI_<name> so existing setups keep working."""
     for key in (f"PARCHI_{name}", f"PARCHAI_{name}"):
@@ -657,6 +677,7 @@ def init_db() -> bool:
     with connect() as connection:
         connection.execute("PRAGMA journal_mode = WAL")
         connection.executescript(SCHEMA)
+        connection.executescript(VALUE_GROUP_SCHEMA)
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(dockets)")}
         if "docket_type" not in columns:
             connection.execute(
@@ -3633,6 +3654,190 @@ def _norm_set(labels: Iterable[str]) -> set:
     return {normalize_label(label) for label in labels}
 
 
+def _grouping_facts(active: sqlite3.Row) -> Tuple[Dict[str, List[Dict[str, Any]]], List[dict]]:
+    """Ungrouped, non-rejected facts for the grouping board.
+
+    Returns (records grouped by document name for the drag zones, flat fact rows for the
+    add-members picker). Grouping membership itself comes from value_groups.load_groups;
+    a fact that already belongs to a group never appears in a drag zone."""
+    docket_id = active["id"]
+    with connect() as connection:
+        allowed = ungrouped_fact_ids(connection, docket_id)
+    documents: Dict[str, List[Dict[str, Any]]] = {}
+    flat: List[dict] = []
+    for row in fetch_facts(docket_id):
+        if row["id"] not in allowed:
+            continue
+        item = {
+            "id": row["id"],
+            "label": row["label"],
+            "value": row["value"],
+            "score": int(row["confidence_score"]),
+            "document": row["filename"],
+        }
+        documents.setdefault(row["filename"], []).append(item)
+        flat.append(item)
+    return documents, flat
+
+
+def _render_grouping(active: sqlite3.Row) -> None:
+    """Manual value grouping: drag equivalent records across documents into groups.
+
+    Grouping is entirely user-driven — nothing is suggested, matched or grouped
+    automatically. Main Metadata is only read here; saving writes the group tables."""
+    docket_id = active["id"]
+    if _value_groups_component is None:
+        st.error("The drag-and-drop board (value_group_component/) is missing next to "
+                 "app.py, so records cannot be grouped visually. Reinstall the app files "
+                 "or contact support.", icon="🚫")
+        return
+
+    documents, flat = _grouping_facts(active)
+    with connect() as connection:
+        groups = load_groups(connection, docket_id)
+    group_views = [
+        {
+            "id": group["id"],
+            "name": group["name"],
+            "primary": group["primary_label"],
+            "members": [
+                {"label": m.label, "value": m.value, "document": m.document_name,
+                 "score": m.confidence_score}
+                for m in group["members"]
+            ],
+        }
+        for group in groups
+    ]
+
+    if not documents and not groups:
+        empty_state("Nothing to group", "Every record is either grouped or rejected. "
+                    "Re-extract documents in the Workspace to add more records.")
+        return
+
+    result = _value_groups_component(
+        documents=documents,
+        groups=group_views,
+        reset=int(st.session_state.get("vg_reset", 0)),
+        key=f"vg_board_{docket_id}",
+    )
+    draft = list((result or {}).get("draft") or [])
+
+    draft_col, save_col = st.columns([3, 1], vertical_alignment="bottom")
+    group_name = draft_col.text_input(
+        "Group name", key=f"vg_name_{docket_id}",
+        placeholder="e.g. Driver Name",
+        help="A short name for the information these records have in common.",
+    )
+    save_label = f"Save group ({len(draft)} record{'' if len(draft) == 1 else 's'})"
+    if save_col.button(save_label, key=f"vg_save_{docket_id}", **stretch()):
+        if not draft:
+            st.warning("Drag at least one record into Group Values before saving.")
+        else:
+            try:
+                with connect() as connection:
+                    create_group(connection, docket_id, group_name, draft)
+            except GroupError as exc:
+                st.error(str(exc), icon="🚫")
+            else:
+                st.session_state["vg_reset"] = int(st.session_state.get("vg_reset", 0)) + 1
+                st.session_state.pop(f"vg_name_{docket_id}", None)
+                queue_flash("success", f"Saved group “{' '.join(str(group_name).split())}”. "
+                            "Its records stay in Main Metadata untouched.")
+                st.rerun()
+
+    _render_group_management(active, groups, flat)
+
+
+def _render_group_management(active: sqlite3.Row, groups: List[dict],
+                             ungrouped: List[dict]) -> None:
+    """Rename, add/remove records, merge or delete saved groups. All changes go through
+    value_groups validation; the primary label is recomputed from confidence scores."""
+    docket_id = active["id"]
+    with st.expander("Manage saved groups", expanded=bool(groups)):
+        if not groups:
+            st.caption("No saved groups yet. Drag records into Group Values and save one.")
+            return
+        names = [group["name"] for group in groups]
+        picked = st.selectbox("Group", names, key=f"vg_manage_{docket_id}")
+        group = next(g for g in groups if g["name"] == picked)
+        st.caption(f"{len(group['members'])} record(s) · primary label: "
+                   f"**{group['primary_label'] or '—'}** (highest confidence wins)")
+
+        member_display = {
+            m.fact_id: f"{m.label} = {m.value} — {m.document_name} ({m.confidence_score}%)"
+            for m in group["members"]
+        }
+        ungrouped_display = {
+            item["id"]: f"{item['label']} = {item['value']} — {item['document']} ({item['score']}%)"
+            for item in ungrouped
+        }
+        current_ids = list(member_display)
+
+        new_name = st.text_input("Rename group", value=group["name"],
+                                 key=f"vg_rename_{group['id']}")
+        action_col1, action_col2 = st.columns([1, 3], vertical_alignment="bottom")
+        if action_col1.button("Rename", key=f"vg_rename_btn_{group['id']}", **stretch()):
+            try:
+                with connect() as connection:
+                    rename_group(connection, docket_id, group["id"], new_name)
+            except GroupError as exc:
+                st.error(str(exc), icon="🚫")
+            else:
+                queue_flash("success", "Group renamed.")
+                st.rerun()
+        st.caption("Renaming never changes the records inside the group.")
+
+        remove_pick = st.multiselect(
+            "Remove records from this group", options=current_ids,
+            format_func=member_display.get, key=f"vg_remove_{group['id']}",
+        )
+        add_pick = st.multiselect(
+            "Add records from the ungrouped pool", options=list(ungrouped_display),
+            format_func=ungrouped_display.get, key=f"vg_add_{group['id']}",
+        )
+        if st.button("Apply member changes", key=f"vg_members_btn_{group['id']}"):
+            target_ids = [i for i in current_ids if i not in remove_pick] + add_pick
+            try:
+                with connect() as connection:
+                    replace_members(connection, docket_id, group["id"], target_ids)
+            except GroupError as exc:
+                st.error(str(exc), icon="🚫")
+            else:
+                queue_flash("success", "Group membership updated. The primary label was "
+                            "recalculated from confidence scores.")
+                st.rerun()
+
+        other_groups = [g for g in groups if g["id"] != group["id"]]
+        if other_groups:
+            merge_name = st.selectbox("Merge this group into", [g["name"] for g in other_groups],
+                                      key=f"vg_merge_{group['id']}")
+            if st.button("Merge", key=f"vg_merge_btn_{group['id']}"):
+                target = next(g for g in other_groups if g["name"] == merge_name)
+                try:
+                    with connect() as connection:
+                        merge_groups(connection, docket_id, target["id"], group["id"])
+                except GroupError as exc:
+                    st.error(str(exc), icon="🚫")
+                else:
+                    queue_flash("success", f"“{group['name']}” merged into “{target['name']}”. "
+                                "No records were lost.")
+                    st.rerun()
+
+        confirm = st.checkbox("Delete this group; its records return to their document "
+                              "sections", key=f"vg_del_confirm_{group['id']}")
+        if st.button("Delete group", key=f"vg_delete_btn_{group['id']}",
+                     disabled=not confirm, **stretch()):
+            try:
+                with connect() as connection:
+                    delete_group(connection, docket_id, group["id"])
+            except GroupError as exc:
+                st.error(str(exc), icon="🚫")
+            else:
+                queue_flash("success", f"Deleted group “{group['name']}”. Its records were "
+                            "ungrouped, not removed from Main Metadata.")
+                st.rerun()
+
+
 def _render_create(active: sqlite3.Row, metadata: List[dict]) -> None:
     """New template: pick labels from one document, review the fields, name and save."""
     docket_id = active["id"]
@@ -3861,12 +4066,13 @@ def _render_manage(active: sqlite3.Row, metadata: List[dict]) -> None:
             st.rerun()
 
 
-ORGANIZE_MODES = ("Create new template", "Apply existing template")
+ORGANIZE_MODES = ("Group values", "Create new template", "Apply existing template")
 
 
 def page_organize(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
-    page_header("Organize", "Create or apply reusable client templates. "
-                "Main Metadata is never modified here.", active["name"] if active else None)
+    page_header("Organize", "Group equivalent records manually, or build and apply "
+                "reusable client templates. Main Metadata is never modified here.",
+                active["name"] if active else None)
     if not need_docket(active):
         return
     metadata = metadata_records(active["id"])
@@ -3881,11 +4087,14 @@ def page_organize(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> 
     mode = st.radio("Workflow", list(ORGANIZE_MODES), horizontal=True, key="org_mode",
                     label_visibility="collapsed")
     if mode == ORGANIZE_MODES[0]:
+        _render_grouping(active)
+    elif mode == ORGANIZE_MODES[1]:
         _render_create(active, metadata)
     else:
         _render_apply(active, metadata)
-    with st.expander("Manage saved templates"):
-        _render_manage(active, metadata)
+    if mode != ORGANIZE_MODES[0]:
+        with st.expander("Manage saved templates"):
+            _render_manage(active, metadata)
 
 
 def confidence_score_style(value: object) -> str:
