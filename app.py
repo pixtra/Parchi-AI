@@ -43,6 +43,7 @@ from value_groups import (
     merge_groups,
     rename_group,
     replace_members,
+    set_primary_member,
     ungrouped_fact_ids,
 )
 from extraction_adapter import coerce_nullable_value, confidence_map
@@ -776,6 +777,9 @@ def init_db() -> bool:
         connection.executescript(SCHEMA)
         connection.executescript(VALUE_GROUP_SCHEMA)
         _migrate_global_value_groups(connection)
+        value_group_columns = {row["name"] for row in connection.execute("PRAGMA table_info(value_groups)")}
+        if "primary_fact_id" not in value_group_columns:
+            connection.execute("ALTER TABLE value_groups ADD COLUMN primary_fact_id TEXT")
         _remove_template_snapshots(connection)
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(dockets)")}
         if "docket_type" not in columns:
@@ -1659,7 +1663,7 @@ def earliest_cooldown(keys: List[Dict[str, str]]) -> float:
     for entry in keys:
         wait = cooldown_remaining(entry["id"])
         model_waits = [cooldown_remaining(f"{entry['id']}:{model}") for model in GEMINI_MODELS]
-        recover_at = max([wait, *model_waits], default=0.0)
+        recover_at = wait if wait > 0 else min((delay for delay in model_waits if delay > 0), default=0.0)
         if recover_at > 0:
             waits.append(recover_at)
     return min(waits) if waits else 0.0
