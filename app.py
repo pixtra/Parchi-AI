@@ -4375,22 +4375,12 @@ def _render_create(active: sqlite3.Row, metadata: List[dict]) -> None:
     sources = [("group", gid, next(g["name"] for g in selectable_groups if g["id"] == gid))
                for gid in selected_groups]
     sources += [("label", label, label) for label in selected_labels]
-    fields = []
-    st.markdown("**Destination fields and order**")
-    for position, (source_type, source_id, source_name) in enumerate(sources):
-        destination, order = st.columns([4, 1])
-        label = destination.text_input(
-            f"{source_name} destination", value=source_name,
-            key=f"org_create_dest_{docket_id}_{source_type}_{key_id(source_id)}",
-        )
-        order_num = order.number_input(
-            f"Order · {source_name}", min_value=1, value=position + 1, step=1,
-            key=f"org_create_order_{docket_id}_{source_type}_{key_id(source_id)}",
-        )
-        fields.append({"source_type": source_type, "source_id": source_id,
-                       "source_name": source_name, "destination_label": label,
-                       "position": int(order_num)})
-    fields.sort(key=lambda field: (field["position"], field["source_name"].casefold()))
+    # Each source keeps its own name as its label, in the order it was added.
+    fields = [
+        {"source_type": source_type, "source_id": source_id, "source_name": source_name,
+         "destination_label": source_name, "position": position + 1}
+        for position, (source_type, source_id, source_name) in enumerate(sources)
+    ]
     name = st.text_input("Template name", key=f"org_create_name_{docket_id}", max_chars=120)
     if st.button("Save template", type="primary", key=f"org_create_save_{docket_id}",
                  disabled=not fields or not name.strip(), **stretch()):
