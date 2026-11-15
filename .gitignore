@@ -18,3 +18,5 @@ parchai_storage/
 *.xlsx
 *.csv
 *.psv
+
+.streamlit/secrets.toml

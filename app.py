@@ -45,6 +45,7 @@ from value_groups import (
     replace_members,
     ungrouped_fact_ids,
 )
+from extraction_adapter import coerce_nullable_value, confidence_map
 try:
     import rapidfuzz
     import rapidfuzz.fuzz  # noqa: F401  (load the submodules explicitly)
@@ -104,7 +105,7 @@ def _legacy_default(new: Path, old: Path) -> Path:
 
 DB_PATH = Path(_env("DB", _legacy_default(BASE_DIR / "parchi_v3.db", BASE_DIR / "parchai_v3.db")))
 STORAGE_DIR = Path(_env("STORAGE", _legacy_default(BASE_DIR / "parchi_storage", BASE_DIR / "parchai_storage"))).resolve()
-CONFIG_PATH = Path(_env("CONFIG", _legacy_default(BASE_DIR / "parchi.config.json", BASE_DIR / "parchai.config.json")))
+CONFIG_PATH = BASE_DIR / ".streamlit" / "secrets.toml"
 
 
 def load_config() -> Dict[str, Any]:
@@ -1846,7 +1847,14 @@ def parse_batch_payload(text: str, labels: List[str]) -> Tuple[Dict[str, Dict[st
             if not isinstance(item, dict):
                 continue
             name = str(item.get("label") or "Unlabelled field").strip()
-            value = str(item.get("value") or "").strip()
+            value, _ = coerce_nullable_value(item.get("value"), str)
+            value = value.strip()
+            ambiguity_notes = str(item.get("ambiguity_notes") or "").strip()
+            legibility = str(item.get("legibility") or "CLEAR").strip().upper()
+            box_2d = item.get("box_2d")
+            evidence = str(item.get("evidence") or "").strip()[:500]
+            if ambiguity_notes:
+                evidence = f"{evidence} Ambiguity notes: {ambiguity_notes}".strip()[:500]
             if is_document_title_fact(name, value, document_type):
                 continue
             name = contextual_label(name, document_type)
@@ -1854,9 +1862,13 @@ def parse_batch_payload(text: str, labels: List[str]) -> Tuple[Dict[str, Dict[st
             fact = _fact(
                 page_number, name, to_concept(name),
                 value,
-                str(item.get("evidence") or "").strip()[:500],
+                evidence,
                 item.get("confidence_score"),
             )
+            fact["_source_label"] = str(item.get("label") or "Unlabelled field").strip()
+            fact["_legibility"] = legibility if legibility in {"CLEAR", "BLURRY", "HANDWRITTEN", "MISSING"} else "CLEAR"
+            fact["_ambiguity_notes"] = ambiguity_notes
+            fact["_box_2d"] = box_2d
             fact["_page_number_valid"] = page_valid
             bucket["facts"].append(fact)
 
@@ -1879,6 +1891,96 @@ def parse_batch_payload(text: str, labels: List[str]) -> Tuple[Dict[str, Dict[st
             "evidence": str(ref.get("evidence") or "").strip()[:500],
         })
     return by_label, references
+
+
+def _token_confidences(response: Any) -> Dict[Tuple[str, str], List[float]]:
+    """Map confidence to fact label/value occurrences, excluding cross-reference values."""
+    try:
+        candidate = response.candidates[0]
+        chosen = candidate.logprobs_result.chosen_candidates
+        tokens = [(item.token, float(item.log_probability)) for item in chosen]
+        serialized = "".join(token for token, _ in tokens)
+        spans = []
+        cursor = 0
+        for token, logprob in tokens:
+            spans.append((cursor, cursor + len(token), logprob))
+            cursor += len(token)
+        objects = []
+        object_starts = []
+        depth = 0
+        quoted = escaped = False
+        for pos, char in enumerate(serialized):
+            if quoted:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    quoted = False
+                continue
+            if char == '"':
+                quoted = True
+            elif char == "{":
+                object_starts.append(pos)
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if object_starts:
+                    object_start = object_starts.pop()
+                    objects.append((object_start, serialized[object_start:pos + 1]))
+        result: Dict[Tuple[str, str], List[float]] = {}
+        for obj_start, fragment in objects:
+            if "{" in fragment[1:-1]:
+                continue
+            label_match = re.search(r'"label"\s*:\s*("(?:\\.|[^"\\])*")', fragment)
+            value_match = re.search(r'"value"\s*:\s*("(?:\\.|[^"\\])*"|null)', fragment)
+            if not label_match or not value_match:
+                continue
+            try:
+                label = json.loads(label_match.group(1))
+                raw_value = value_match.group(1)
+                value = json.loads(raw_value) if raw_value != "null" else ""
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(label, str) or not isinstance(value, str):
+                continue
+            label, value = label.strip(), value.strip()
+            if raw_value == "null":
+                score = 0.0
+            else:
+                value_start = obj_start + value_match.start(1) + 1
+                value_end = obj_start + value_match.end(1) - 1
+                selected = [prob for left, right, prob in spans
+                            if right > value_start and left < value_end]
+                score = math.exp(sum(selected) / len(selected)) if selected else 0.0
+            result.setdefault((label, value), []).append(score)
+        return result
+    except (AttributeError, IndexError, TypeError, ValueError, OverflowError):
+        return {}
+
+
+def _audit_confidence(
+    model_score: Any, token_probability: Optional[float], value: str,
+    evidence: str, page_text: Optional[str], legibility: str, ambiguity: str,
+) -> int:
+    """Combine existing score calibration with token, OCR-agreement, and legibility signals."""
+    base = calibrated_confidence(model_score, value, evidence, page_text, "")
+    if token_probability is not None:
+        base = round(base * 0.65 + max(0.0, min(1.0, token_probability)) * 100 * 0.35)
+    if page_text and value.strip():
+        if normalise(value) in normalise(page_text):
+            base += 4
+        else:
+            base -= 8
+    if legibility == "HANDWRITTEN":
+        base = round(base * 0.88)
+    elif legibility == "BLURRY":
+        base = min(round(base * 0.75), 65)
+    elif legibility == "MISSING" or not value.strip():
+        return 0
+    if ambiguity.strip():
+        base -= 12
+    return max(0, min(100, base))
 
 
 MAX_COOLDOWN_WAIT = 75.0  # at most one per-minute quota window when the whole pool is busy
@@ -1930,18 +2032,38 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
                     for number, (unit, handle) in enumerate(zip(batch, handles), start=1):
                         contents.append(f"=== DOCUMENT: P{number} | {unit['label']} ===")
                         contents.append(handle)
+                        ocr_context = "\n".join(
+                            str(page.get("text") or "") for page in unit.get("pages_slice", [])
+                        )
+                        contents.append(
+                            "Existing OCR text for comparison (may contain errors):\n"
+                            + (ocr_context[:12000] if ocr_context else "[No text layer available]")
+                        )
                     contents.append(BATCH_PROMPT)
+                    contents.append(
+                        "For every fact, also return legibility as CLEAR, BLURRY, HANDWRITTEN, "
+                        "or MISSING; box_2d as [ymin,xmin,ymax,xmax] normalized 0-1000 "
+                        "(use [] when unavailable); and ambiguity_notes as a short string. "
+                        "Keep the existing documents/facts JSON structure and all existing keys."
+                    )
                     set_gemini_activity(True, f"Gemini request in progress · {model}")
                     try:
-                        response = client.models.generate_content(
-                            model=model,
-                            contents=contents,
-                            config=types.GenerateContentConfig(
-                                response_mime_type="application/json",
-                                temperature=0.1,
-                                max_output_tokens=MAX_OUTPUT_TOKENS,
-                            ),
-                        )
+                        config_args = dict(response_mime_type="application/json", temperature=0.1,
+                                           max_output_tokens=MAX_OUTPUT_TOKENS)
+                        try:
+                            response = client.models.generate_content(
+                                model=model, contents=contents,
+                                config=types.GenerateContentConfig(**config_args,
+                                                                  response_logprobs=True, logprobs=1),
+                            )
+                        except Exception as logprob_exc:
+                            # Older models/endpoints may not support response log probabilities.
+                            LOG.info("Gemini log probabilities unavailable; retrying without them: %s",
+                                     str(logprob_exc)[:200])
+                            response = client.models.generate_content(
+                                model=model, contents=contents,
+                                config=types.GenerateContentConfig(**config_args),
+                            )
                     except Exception as exc:  # noqa: BLE001
                         if is_size_error(exc):
                             raise OversizedBatch(scrub(exc, entry["key"]))
@@ -1961,7 +2083,19 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
                         raise OversizedBatch("response was truncated at the output token limit")
                     try:
                         parsed = parse_batch_payload(response.text or "", labels)
+                        token_scores = _token_confidences(response)
+                        for unit in batch:
+                            bucket = parsed[0].get(unit["label"])
+                            if not bucket:
+                                continue
+                            for fact in bucket["facts"]:
+                                key = (fact.get("_source_label", ""), fact["value"])
+                                candidates = token_scores.get(key, [])
+                                if candidates:
+                                    fact["_token_probability"] = candidates.pop(0)
                     except ValueError as exc:  # json.JSONDecodeError is a ValueError
+                        LOG.warning("Gemini extraction schema/payload parse failed for %s · %s: %s",
+                                    masked, model, str(exc)[:300])
                         errors.append(f"{masked} · {model}: invalid JSON ({str(exc)[:120]})")
                         continue
                     record_key_success(keys, entry["id"])
@@ -2151,6 +2285,28 @@ def finalize_document(docket_id: str, doc: Dict[str, Any], status: str,
         completeness_message = f"{failed_units} page/sheet(s) returned no extracted value at all."
     else:
         completeness_message = "Some parts were not extracted by Gemini; see the processing message."
+    financial_by_page: Dict[int, Dict[str, List[float]]] = {}
+    for item in extracted_items:
+        concept = str(item.get("concept") or "")
+        key = next((candidate for candidate in ("subtotal", "tax_amount", "total_amount", "grand_total")
+                    if candidate in concept), None)
+        if key:
+            try:
+                financial_by_page.setdefault(int(item.get("page_number", 1)), {}).setdefault(key, []).append(
+                    float(str(item.get("value") or "").replace(",", "").replace("₹", "").strip())
+                )
+            except ValueError:
+                pass
+    math_consistent = {}
+    for page_number, amounts in financial_by_page.items():
+        total_key = "total_amount" if "total_amount" in amounts else "grand_total"
+        # Do not infer accounting equations when multiple values/sections exist.
+        unique = all(len(amounts.get(key, [])) == 1 for key in ("subtotal", "tax_amount", total_key))
+        if unique and all(key in amounts for key in ("subtotal", "tax_amount", total_key)):
+            math_consistent[page_number] = (
+                round(amounts["subtotal"][0] + amounts["tax_amount"][0], 2)
+                == round(amounts[total_key][0], 2)
+            )
     with connect() as connection:
         # Replace-on-success: drop any earlier extraction of this document (its history
         # cascades) before inserting the new facts, all in one transaction.
@@ -2160,24 +2316,29 @@ def finalize_document(docket_id: str, doc: Dict[str, Any], status: str,
             value = clean_text(item["value"])
             evidence = clean_text(item["evidence"])
             assessment = assess(value, evidence, doc["page_text"].get(page_number))
-            # Model-supplied scores are validated explicitly. A missing or malformed
-            # score is NEVER defaulted: we keep the deterministic assess() result and
-            # record why the model's own number could not be used.
+            # Model scores, when present, are combined with token and audit signals;
+            # otherwise the deterministic assessment supplies the base score.
             model_score = _parse_model_score(item.get("confidence_score"))
             if model_score is None:
                 assessment["reasons"].append(
                     "MODEL_SCORE_MISSING" if item.get("confidence_score") is None
                     else "MODEL_SCORE_INVALID"
                 )
-            else:
-                assessment["score"] = calibrated_confidence(
-                    model_score, value, evidence,
-                    doc["page_text"].get(page_number), item["label"],
-                )
-                assessment["band"] = band_for(assessment["score"])
-                assessment["reasons"] = list(dict.fromkeys(
-                    assessment["reasons"] + ["MODEL_CONFIDENCE"]
-                ))
+            assessment["score"] = _audit_confidence(
+                model_score if model_score is not None else assessment["score"],
+                item.get("_token_probability"), value, evidence,
+                doc["page_text"].get(page_number), item.get("_legibility", "CLEAR"),
+                item.get("_ambiguity_notes", ""),
+            )
+            concept = str(item.get("concept") or "")
+            if any(key in concept for key in ("subtotal", "tax_amount", "total_amount", "grand_total")):
+                if math_consistent.get(page_number) is True:
+                    assessment["score"] = min(100, assessment["score"] + 6)
+                    assessment["reasons"].append("FINANCIAL_MATH_CHECK_PASSED")
+            assessment["band"] = band_for(assessment["score"])
+            assessment["reasons"] = list(dict.fromkeys(
+                assessment["reasons"] + ["AUDIT_CONFIDENCE"]
+            ))
             # An unreadable label makes the whole extraction unreliable even when the
             # value looks right: cap the score low. The value itself is never dropped —
             # the reviewer decides what to do with it.
