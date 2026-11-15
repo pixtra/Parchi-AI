@@ -347,11 +347,39 @@ Rules:
 - Use specific contextual labels such as Supplier Name, Invoice Number, Invoice Date,
   Gross Weight or Taxable Amount when the document establishes that meaning. Do not invent
   context when it is genuinely ambiguous.
+- Write labels in clear, concise language that names what the field means. Prefer precise
+  names ("Supplier GSTIN", "Net Weight", "Challan Date") over vague or overly generic text
+  ("Number", "Detail 1", "Other"). Read the surrounding headings, table column headers and
+  nearby text before choosing a label, and keep the label's original meaning — do not
+  pad, abbreviate or reword it beyond what is needed to be clear.
+- If the source text of a label is garbled or unreadable (for example OCR noise such as
+  "asfasfafw"), use the document's context — nearby headings, table headers, the values on
+  the same row or column — to infer the intended field name, and use that corrected label.
+  Quote the original garbled text verbatim in evidence, keep the extracted value exactly
+  as read, and give the fact a LOW confidence score (20-40) reflecting the uncertainty of
+  the correction. If the intended field cannot be inferred even with context, use the label
+  "Unclear", give a very low score (5-15), keep the extracted value, and describe what is
+  unreadable in evidence. Never invent a meaning or a value, and never drop the occurrence.
 - Copy values exactly as written. Do not normalize, calculate, correct, translate, or infer.
 - Never fill a missing value from another document. Evidence must be verbatim from the same
   page or worksheet.
-- Assign every fact an individual integer confidence_score from 1 through 100. Make it
-  granular and evidence-based; do not reuse a small set of default scores and never use 0.
+- Assign every fact an individual integer confidence_score from 1 through 100, judging THAT
+  occurrence on its own merits: the legibility of the text it came from, the quality of the
+  scan or writing, ambiguity, and how well the evidence supports the value. Never derive a
+  score from other occurrences: a value repeated across documents or pages must NOT get a
+  higher score for repeating, and a conflict with another occurrence must NOT lower one.
+  Never return 0 or 100, and never reuse one default score for many facts — two facts from
+  the same page should get different scores when their legibility differs.
+  Calibrate with these anchors and interpolate between them:
+    * 95-99: crisp digitally-typed text; label and value cleanly legible; evidence quoted
+      verbatim from the page.
+    * 75-90: typed text with slight noise, a cramped layout, or a value assembled across
+      line breaks.
+    * 55-80: clear handwriting or a modest-quality scan, at most one ambiguous character.
+    * 25-55: faint, skewed or partially readable text, or a label you had to infer from
+      context.
+    * 5-20: text you could barely read at all, or a garbled label you could not confidently
+      correct.
 - Do not omit a page or worksheet. If it contains no identifiable value, return a
   "Page processing status" fact with an empty value and explain the limitation in evidence.
 - Report links between documents (invoice to PO, challan to GRN, weighment slip to challan)
@@ -1082,8 +1110,28 @@ def clamp_confidence(score: Any, default: int = 50) -> int:
     """Scores are always integers within 0–100 (0 allowed; the model guidance avoids it)."""
     try:
         return max(0, min(100, round(float(score))))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
+
+
+def _parse_model_score(raw: Any) -> Optional[int]:
+    """Parse a model-supplied confidence score, or None when it is unusable.
+
+    A missing or malformed score is never replaced with a fixed default: the caller
+    falls back to the deterministic assess() pipeline and records exactly why
+    (MODEL_SCORE_MISSING / MODEL_SCORE_INVALID) so the gap is visible in the UI.
+    Accepts ints/floats and numeric strings (a trailing % is tolerated); booleans,
+    non-numeric strings, infinities and out-of-range values are rejected."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        text = str(raw).strip().rstrip("%")
+        number = float(text)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number < 0 or number > 100:
+        return None
+    return round(number)
 
 
 DOCUMENT_TITLE_WORDS = {
@@ -1095,6 +1143,35 @@ DOCUMENT_TITLE_WORDS = {
 
 def _normalised_phrase(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def _looks_gibberish(token: Any) -> bool:
+    """True when a token looks like keyboard noise rather than language.
+
+    Language-agnostic heuristics: no vowels at all, or too few distinct letters for
+    the token's length (e.g. "asfasfafw" has 4 distinct letters in 8). Deliberately
+    coarse — it only ever disqualifies a label, and only when the page text cannot
+    ground a reading (see _label_unreadable), so real but terse labels like "Wt"
+    survive whenever they actually appear on the page."""
+    text = re.sub(r"[^a-zA-Z]", "", str(token or ""))
+    if len(text) < 3:
+        return False
+    if not re.search(r"[aeiouAEIOU]", text):
+        return True
+    return len(set(text.lower())) / len(text) <= 0.5
+
+
+def _label_unreadable(label: Any, page_text: Optional[str]) -> bool:
+    """A label is unreadable when it looks like gibberish AND the page offers no text
+    that could ground a corrected reading. Gibberish that the page actually contains
+    (codes, serials) is kept: this flag never discards information, it only marks
+    extraction unreliability for the score cap in finalize_document."""
+    stripped = str(label or "").strip()
+    if not _looks_gibberish(stripped):
+        return False
+    if page_text is None:
+        return True
+    return not (_tokens(stripped) & _tokens(page_text))
 
 
 def is_document_title_fact(
@@ -1910,14 +1987,32 @@ def finalize_document(docket_id: str, doc: Dict[str, Any], status: str,
             value = clean_text(item["value"])
             evidence = clean_text(item["evidence"])
             assessment = assess(value, evidence, doc["page_text"].get(page_number))
-            if item.get("confidence_score") is not None:
+            # Model-supplied scores are validated explicitly. A missing or malformed
+            # score is NEVER defaulted: we keep the deterministic assess() result and
+            # record why the model's own number could not be used.
+            model_score = _parse_model_score(item.get("confidence_score"))
+            if model_score is None:
+                assessment["reasons"].append(
+                    "MODEL_SCORE_MISSING" if item.get("confidence_score") is None
+                    else "MODEL_SCORE_INVALID"
+                )
+            else:
                 assessment["score"] = calibrated_confidence(
-                    item["confidence_score"], value, evidence,
+                    model_score, value, evidence,
                     doc["page_text"].get(page_number), item["label"],
                 )
                 assessment["band"] = band_for(assessment["score"])
                 assessment["reasons"] = list(dict.fromkeys(
                     assessment["reasons"] + ["MODEL_CONFIDENCE"]
+                ))
+            # An unreadable label makes the whole extraction unreliable even when the
+            # value looks right: cap the score low. The value itself is never dropped —
+            # the reviewer decides what to do with it.
+            if _label_unreadable(item.get("label"), doc["page_text"].get(page_number)):
+                assessment["score"] = min(assessment["score"], 12)
+                assessment["band"] = band_for(assessment["score"])
+                assessment["reasons"] = list(dict.fromkeys(
+                    assessment["reasons"] + ["LABEL_UNREADABLE"]
                 ))
             if not item.get("_page_number_valid", True):
                 assessment["band"] = "Red"
@@ -3023,6 +3118,10 @@ def inject_css() -> None:
         [data-testid="stMetricLabel"] p { color: var(--muted) !important; font-size:13px !important; }
         [data-testid="stMetricValue"] { color: var(--ink) !important; }
         div[data-testid="stVerticalBlockBorderWrapper"] { background: var(--panel); border-radius: 10px; }
+        /* Value Grouping board: blend the section into the page instead of boxing it in a
+           panel — the drag-and-drop frame provides its own card styling. */
+        div[data-testid="stVerticalBlockBorderWrapper"]:has(iframe[title*="parchi_value_groups"]) {
+            background: transparent; border-radius: 0; }
         [data-testid="stFileUploader"] section { background: var(--panel2); border-radius: 10px; }
         [data-testid="stDataFrame"] { border:1px solid var(--line); border-radius:10px; overflow:hidden; }
         div[data-baseweb="select"] > div, div[data-baseweb="input"] { border-radius: 8px !important; }
