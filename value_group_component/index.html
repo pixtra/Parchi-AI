@@ -93,6 +93,7 @@
   function pill(item) {
     const p = el("div", "pill");
     p.dataset.id = item.id;
+    p.dataset.document = item.document_id;
     p.title = item.document + " · " + item.label + " · " + item.value;
     p.appendChild(el("span", "lbl", item.label));
     p.appendChild(el("span", "val", item.value));
@@ -134,10 +135,18 @@
       if (!e.relatedTarget || !node.contains(e.relatedTarget)) node.classList.remove("drag-over");
     });
     new Sortable(node, {
-      group: "value-groups",
+      group: {
+        name: "value-groups",
+        pull: true,
+        // Document zones may only receive a pill back from Group Values when it
+        // belongs to that same document. They never accept another document's pills.
+        put: (to, from, dragEl) => to.id === "draft"
+          || to.dataset.document === dragEl.dataset.document,
+      },
       draggable: ".pill",
       animation: 150,
       ghostClass: "sortable-ghost",
+      revertOnSpill: true,
       // AutoScroll (bundled in sortable.min.js) lets a drag near the edge of a long
       // document list scroll it — first-row-to-dock drags stay reachable.
       scroll: true,
@@ -156,21 +165,6 @@
       },
     });
   }
-  // Whole-board drop routing: a native drop that Sortable did not consume (dropped on the
-  // gap between zones, on a heading, on the dock padding…) still counts as "put it in
-  // Group Values" instead of silently cancelling the drag.
-  document.addEventListener("dragover", (e) => { if (dragging) e.preventDefault(); });
-  document.addEventListener("drop", (e) => {
-    if (!dragging) return;
-    e.preventDefault();
-    const fromZone = e.target instanceof Element ? e.target.closest(".zone") : null;
-    if (!fromZone) {
-      const drop = document.getElementById("draft");
-      if (drop && !drop.contains(dragging)) drop.appendChild(dragging);
-    }
-    clearDragState();
-    emit();
-  });
   document.addEventListener("dragend", clearDragState);
 
   function render(args) {
@@ -193,6 +187,7 @@
       const box = el("div", "doc");
       box.appendChild(el("div", "doc-title", name));
       const zone = el("div", "zone");
+      zone.dataset.document = docs[name][0] ? docs[name][0].document_id : "";
       zone.dataset.hint = "All records here are grouped or in Group Values.";
       docs[name].forEach(item => { if (!draft.includes(item.id)) zone.appendChild(pill(item)); });
       syncZone(zone);

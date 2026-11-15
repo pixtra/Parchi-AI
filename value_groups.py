@@ -15,18 +15,17 @@ from typing import Iterable, List, Optional
 VALUE_GROUP_SCHEMA = """
 CREATE TABLE IF NOT EXISTS value_groups (
     id TEXT PRIMARY KEY,
-    docket_id TEXT NOT NULL REFERENCES dockets(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    UNIQUE(docket_id, name)
+    UNIQUE(name)
 );
 CREATE TABLE IF NOT EXISTS value_group_members (
     group_id TEXT NOT NULL REFERENCES value_groups(id) ON DELETE CASCADE,
     fact_id TEXT NOT NULL UNIQUE REFERENCES facts(id) ON DELETE CASCADE,
     PRIMARY KEY (group_id, fact_id)
 );
-CREATE INDEX IF NOT EXISTS idx_value_groups_docket ON value_groups(docket_id);
+CREATE INDEX IF NOT EXISTS idx_value_groups_name ON value_groups(name);
 """
 
 
@@ -66,14 +65,13 @@ def _clean_ids(fact_ids: Iterable[str]) -> List[str]:
 
 
 def _check_facts(conn: sqlite3.Connection, docket_id: str, fact_ids: List[str]) -> None:
-    """Every fact must exist in this docket and must not be rejected."""
+    """Every fact must exist and must not be rejected."""
     if not fact_ids:
         return
     placeholders = ",".join("?" * len(fact_ids))
     rows = conn.execute(
-        f"""SELECT id, review_status FROM facts
-            WHERE docket_id = ? AND id IN ({placeholders})""",
-        (docket_id, *fact_ids),
+        f"""SELECT id, review_status FROM facts WHERE id IN ({placeholders})""",
+        fact_ids,
     ).fetchall()
     found = {row["id"] if isinstance(row, sqlite3.Row) else row[0]: row for row in rows}
     missing = [f for f in fact_ids if f not in found]
@@ -117,8 +115,8 @@ def create_group(conn: sqlite3.Connection, docket_id: str, name: str, fact_ids: 
     now = _now()
     try:
         conn.execute(
-            "INSERT INTO value_groups (id, docket_id, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-            (group_id, docket_id, name, now, now),
+            "INSERT INTO value_groups (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            (group_id, name, now, now),
         )
     except sqlite3.IntegrityError as exc:
         raise GroupError(f"A group named “{name}” already exists.") from exc
@@ -175,18 +173,14 @@ def delete_group(conn: sqlite3.Connection, docket_id: str, group_id: str) -> Non
 
 
 def _owned_group(conn: sqlite3.Connection, docket_id: str, group_id: str) -> None:
-    row = conn.execute("SELECT 1 FROM value_groups WHERE id = ? AND docket_id = ?",
-                       (group_id, docket_id)).fetchone()
+    row = conn.execute("SELECT 1 FROM value_groups WHERE id = ?", (group_id,)).fetchone()
     if row is None:
         raise GroupError("That group no longer exists. Refresh the page and try again.")
 
 
 def load_groups(conn: sqlite3.Connection, docket_id: str) -> List[dict]:
     """Every group with its members and computed primary label. Read-only."""
-    groups = conn.execute(
-        "SELECT id, name FROM value_groups WHERE docket_id = ? ORDER BY name COLLATE NOCASE",
-        (docket_id,),
-    ).fetchall()
+    groups = conn.execute("SELECT id, name FROM value_groups ORDER BY name COLLATE NOCASE").fetchall()
     result = []
     for group in groups:
         rows = conn.execute(
@@ -195,6 +189,7 @@ def load_groups(conn: sqlite3.Connection, docket_id: str) -> List[dict]:
                JOIN facts f ON f.id = m.fact_id
                JOIN documents d ON d.id = f.document_id
                WHERE m.group_id = ? AND f.review_status != 'rejected'
+                 AND f.concept != 'page_processing_status'
                ORDER BY d.filename, f.page_number, f.created_at""",
             (group["id"],),
         ).fetchall()

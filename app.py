@@ -265,6 +265,16 @@ CREATE TABLE IF NOT EXISTS templates (
     updated_at TEXT NOT NULL,
     UNIQUE(docket_id, name)
 );
+CREATE TABLE IF NOT EXISTS template_fields (
+    id TEXT PRIMARY KEY,
+    template_id TEXT NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
+    source_type TEXT NOT NULL CHECK(source_type IN ('group', 'label')),
+    source_id TEXT NOT NULL,
+    source_name TEXT NOT NULL,
+    destination_label TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    UNIQUE(template_id, position)
+);
 CREATE TABLE IF NOT EXISTS label_mappings (
     id TEXT PRIMARY KEY,
     docket_id TEXT NOT NULL REFERENCES dockets(id) ON DELETE CASCADE,
@@ -698,6 +708,64 @@ def _migrate_template_tables(connection: sqlite3.Connection) -> None:
         """)
 
 
+def _migrate_global_value_groups(connection: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(value_groups)")}
+    if not columns or "docket_id" not in columns:
+        return
+    connection.execute("DROP INDEX IF EXISTS idx_value_groups_name")
+    connection.execute("ALTER TABLE value_group_members RENAME TO value_group_members_docketed")
+    connection.execute("ALTER TABLE value_groups RENAME TO value_groups_docketed")
+    connection.executescript(VALUE_GROUP_SCHEMA)
+    rows = connection.execute(
+        "SELECT id, docket_id, name, created_at, updated_at FROM value_groups_docketed "
+        "ORDER BY created_at, id"
+    ).fetchall()
+    used = set()
+    for row in rows:
+        name = row["name"]
+        if name.casefold() in used:
+            docket = connection.execute("SELECT name FROM dockets WHERE id = ?", (row["docket_id"],)).fetchone()
+            suffix = docket["name"] if docket else row["docket_id"][:8]
+            name = f"{name} ({suffix})"
+        used.add(name.casefold())
+        connection.execute(
+            "INSERT INTO value_groups (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            (row["id"], name, row["created_at"], row["updated_at"]),
+        )
+    connection.execute(
+        """INSERT INTO value_group_members (group_id, fact_id)
+           SELECT group_id, fact_id FROM value_group_members_docketed"""
+    )
+    connection.execute("DROP TABLE value_group_members_docketed")
+    connection.execute("DROP TABLE value_groups_docketed")
+
+
+def _remove_template_snapshots(connection: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(template_fields)")}
+    if "snapshot_json" not in columns and "group_version" not in columns:
+        return
+    connection.execute("ALTER TABLE template_fields RENAME TO template_fields_with_snapshots")
+    connection.executescript("""
+        CREATE TABLE template_fields (
+            id TEXT PRIMARY KEY,
+            template_id TEXT NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
+            source_type TEXT NOT NULL CHECK(source_type IN ('group', 'label')),
+            source_id TEXT NOT NULL,
+            source_name TEXT NOT NULL,
+            destination_label TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            UNIQUE(template_id, position)
+        );
+    """)
+    connection.execute(
+        """INSERT INTO template_fields
+           (id, template_id, source_type, source_id, source_name, destination_label, position)
+           SELECT id, template_id, source_type, source_id, source_name, destination_label, position
+           FROM template_fields_with_snapshots"""
+    )
+    connection.execute("DROP TABLE template_fields_with_snapshots")
+
+
 @st.cache_resource
 def init_db() -> bool:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -706,6 +774,8 @@ def init_db() -> bool:
         connection.execute("PRAGMA journal_mode = WAL")
         connection.executescript(SCHEMA)
         connection.executescript(VALUE_GROUP_SCHEMA)
+        _migrate_global_value_groups(connection)
+        _remove_template_snapshots(connection)
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(dockets)")}
         if "docket_type" not in columns:
             connection.execute(
@@ -927,6 +997,49 @@ def delete_template(docket_id: str, template_id: str) -> None:
         )
 
 
+def save_template_fields(template_id: str, fields: List[Dict[str, Any]]) -> None:
+    """Replace a template's ordered live source definitions atomically."""
+    with connect() as connection:
+        if not connection.execute("SELECT 1 FROM templates WHERE id = ?", (template_id,)).fetchone():
+            raise ValueError("That template no longer exists.")
+        validated = []
+        seen_sources = set()
+        seen_destinations = set()
+        for field in fields:
+            destination = clean_text(field.get("destination_label")).strip()
+            source_name = clean_text(field.get("source_name")).strip()
+            source_id = clean_text(field.get("source_id")).strip()
+            source_type = field.get("source_type")
+            source_key = (source_type, normalize_label(source_id))
+            destination_key = normalize_label(destination)
+            if not destination or not source_name or not source_id or source_type not in {"group", "label"}:
+                raise ValueError("Every template source needs a destination label.")
+            if source_key in seen_sources:
+                raise ValueError("A source can appear only once in a template.")
+            if destination_key in seen_destinations:
+                raise ValueError("Each template source needs a distinct destination label.")
+            seen_sources.add(source_key)
+            seen_destinations.add(destination_key)
+            validated.append((source_type, source_id, source_name, destination))
+        connection.execute("DELETE FROM template_fields WHERE template_id = ?", (template_id,))
+        for position, (source_type, source_id, source_name, destination) in enumerate(validated):
+            connection.execute(
+                """INSERT INTO template_fields
+                   (id, template_id, source_type, source_id, source_name, destination_label, position)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (str(uuid.uuid4()), template_id, source_type, source_id, source_name,
+                 destination, position),
+            )
+
+
+def template_field_rows(template_id: str) -> List[sqlite3.Row]:
+    with connect() as connection:
+        return connection.execute(
+            "SELECT * FROM template_fields WHERE template_id = ? ORDER BY position, id",
+            (template_id,),
+        ).fetchall()
+
+
 def append_template_labels(docket_id: str, template_id: str, labels: List[str]) -> List[str]:
     """Explicitly add labels to a template (the "Add to template" action in the apply
     workflow). Existing labels and their spelling are never altered; labels already
@@ -952,6 +1065,20 @@ def append_template_labels(docket_id: str, template_id: str, labels: List[str]) 
             "UPDATE templates SET labels_json = ?, updated_at = ? WHERE id = ?",
             (json.dumps(current_labels, ensure_ascii=False), utc_now(), template_id),
         )
+        if added and connection.execute(
+            "SELECT 1 FROM template_fields WHERE template_id = ? LIMIT 1", (template_id,)
+        ).fetchone():
+            position = int(connection.execute(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM template_fields WHERE template_id = ?",
+                (template_id,),
+            ).fetchone()[0])
+            connection.executemany(
+                """INSERT INTO template_fields
+                   (id, template_id, source_type, source_id, source_name, destination_label, position)
+                   VALUES (?, ?, 'label', ?, ?, ?, ?)""",
+                [(str(uuid.uuid4()), template_id, label, label, label, position + index)
+                 for index, label in enumerate(added)],
+            )
     return added
 
 
@@ -962,13 +1089,24 @@ def save_mapping(docket_id: str, template_id: str, source_label: str, requested_
     if not source_label or not requested_label:
         return
     with connect() as connection:
-        connection.execute(
-            """INSERT INTO label_mappings (id, docket_id, template_id, source_label, requested_label, method, approved, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, 1, ?)
-               ON CONFLICT(docket_id, template_id, source_label)
-               DO UPDATE SET requested_label = excluded.requested_label, method = excluded.method, approved = 1""",
-            (str(uuid.uuid4()), docket_id, template_id, source_label, requested_label, method, utc_now()),
-        )
+        existing_rows = connection.execute(
+            "SELECT id, source_label FROM label_mappings WHERE template_id = ? "
+            "ORDER BY approved DESC, created_at DESC", (template_id,),
+        ).fetchall()
+        existing = next((row for row in existing_rows
+                         if normalize_label(row["source_label"]) == normalize_label(source_label)), None)
+        if existing:
+            connection.execute(
+                """UPDATE label_mappings SET requested_label = ?, method = ?, approved = 1
+                   WHERE id = ?""", (requested_label, method, existing["id"]),
+            )
+        else:
+            connection.execute(
+                """INSERT INTO label_mappings
+                   (id, docket_id, template_id, source_label, requested_label, method, approved, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 1, ?)""",
+                (str(uuid.uuid4()), docket_id, template_id, source_label, requested_label, method, utc_now()),
+            )
 
 
 def approved_mappings(docket_id: str, template_id: str) -> Dict[str, str]:
@@ -976,8 +1114,8 @@ def approved_mappings(docket_id: str, template_id: str) -> Dict[str, str]:
     with connect() as connection:
         rows = connection.execute(
             """SELECT source_label, requested_label FROM label_mappings
-               WHERE docket_id = ? AND template_id = ? AND approved = 1""",
-            (docket_id, template_id),
+               WHERE template_id = ? AND approved = 1 ORDER BY created_at""",
+            (template_id,),
         ).fetchall()
     return {row["source_label"]: row["requested_label"] for row in rows}
 
@@ -987,8 +1125,8 @@ def mapping_details(docket_id: str, template_id: str) -> Dict[str, Dict[str, str
     with connect() as connection:
         rows = connection.execute(
             """SELECT source_label, requested_label, method FROM label_mappings
-               WHERE docket_id = ? AND template_id = ? AND approved = 1""",
-            (docket_id, template_id),
+               WHERE template_id = ? AND approved = 1 ORDER BY created_at""",
+            (template_id,),
         ).fetchall()
     return {
         row["source_label"]: {"target": row["requested_label"], "method": row["method"]}
@@ -1012,10 +1150,16 @@ def delete_mappings_to_labels(docket_id: str, template_id: str, labels: Iterable
 def delete_mapping(docket_id: str, template_id: str, source_label: str, requested_label: str) -> None:
     """Remove one approved mapping (Reject-after-approval or explicit Unmap)."""
     with connect() as connection:
-        connection.execute(
-            """DELETE FROM label_mappings
-               WHERE docket_id = ? AND template_id = ? AND source_label = ? AND requested_label = ?""",
-            (docket_id, template_id, clean_text(source_label).strip(), clean_text(requested_label).strip()),
+        rows = connection.execute(
+            "SELECT id, source_label, requested_label FROM label_mappings WHERE template_id = ?",
+            (template_id,),
+        ).fetchall()
+        source_key, target_key = normalize_label(source_label), normalize_label(requested_label)
+        connection.executemany(
+            "DELETE FROM label_mappings WHERE id = ?",
+            [(row["id"],) for row in rows
+             if normalize_label(row["source_label"]) == source_key
+             and normalize_label(row["requested_label"]) == target_key],
         )
 
 
@@ -1038,8 +1182,8 @@ def rejected_suggestions(docket_id: str, template_id: str) -> set:
     with connect() as connection:
         rows = connection.execute(
             """SELECT source_label, requested_label FROM rejected_suggestions
-               WHERE docket_id = ? AND template_id = ?""",
-            (docket_id, template_id),
+               WHERE template_id = ?""",
+            (template_id,),
         ).fetchall()
     return {(row["source_label"], row["requested_label"]) for row in rows}
 
@@ -3152,30 +3296,69 @@ def client_template_records(docket_id: str, template: sqlite3.Row) -> Tuple[List
         labels = [str(label) for label in raw_labels] if isinstance(raw_labels, list) else []
     except (TypeError, ValueError):
         labels = []
+    field_rows = template_field_rows(template["id"])
     mappings = approved_mappings(docket_id, template["id"])
     # Mappings may be stored with one spelling of a source label while facts carry another,
     # so the lookup compares case-insensitively and ignores surrounding whitespace.
     mapping_by_normalized = {normalize_label(source): target for source, target in mappings.items()}
     output: List[dict] = []
+    if field_rows:
+        with connect() as connection:
+            rows = connection.execute(
+                """SELECT f.id, f.label, d.filename AS document_name, f.value, f.confidence_score
+                   FROM facts f JOIN documents d ON d.id = f.document_id
+                   WHERE f.docket_id = ? AND f.concept != 'page_processing_status'""",
+                (docket_id,),
+            ).fetchall()
+            membership = {row["group_id"]: set() for row in connection.execute(
+                "SELECT DISTINCT group_id FROM value_group_members"
+            ).fetchall()}
+            for member in connection.execute("SELECT group_id, fact_id FROM value_group_members"):
+                membership.setdefault(member["group_id"], set()).add(member["fact_id"])
+        matched = {row["id"]: 0 for row in field_rows}
+        for field in field_rows:
+            if field["source_type"] == "group":
+                allowed_ids = membership.get(field["source_id"], set())
+            else:
+                allowed_ids = {row["id"] for row in rows
+                                if normalize_label(row["label"]) == normalize_label(field["source_id"])}
+            source_labels = {normalize_label(source) for source, target in mappings.items()
+                             if target == field["destination_label"]}
+            for record in rows:
+                if record["id"] not in allowed_ids and normalize_label(record["label"]) not in source_labels:
+                    continue
+                output.append({
+                    "document_name": record["document_name"],
+                    "label": field["destination_label"], "value": record["value"],
+                    "confidence_score": int(record["confidence_score"]),
+                    "source_label": record["label"], "record_id": record["id"],
+                })
+                matched[field["id"]] += 1
+        return output, [row["destination_label"] for row in field_rows if matched[row["id"]] == 0]
     matched = {label: 0 for label in labels}
-    for record in metadata_records(docket_id):
-        target = mapping_by_normalized.get(normalize_label(record["label"]))
+    for fact in fetch_facts(docket_id):
+        if fact["concept"] == "page_processing_status":
+            continue
+        target = mapping_by_normalized.get(normalize_label(fact["label"]))
         if target in matched:
-            output.append({**record, "label": target})
+            output.append({
+                "document_name": fact["filename"], "label": target, "value": fact["value"],
+                "confidence_score": int(fact["confidence_score"]),
+                "source_label": fact["label"], "record_id": fact["id"],
+            })
             matched[target] += 1
     return output, [label for label, count in matched.items() if count == 0]
 
 
 def build_metadata_export(records: List[dict], description: str) -> Tuple[bytes, int]:
-    exported = [
-        {
-            "Document Name": record["document_name"],
-            "Label": record["label"],
-            "Value": record["value"],
-            "Confidence Score": int(record["confidence_score"]),
-        }
-        for record in records
-    ]
+    exported = []
+    for record in records:
+        item = {field: record[field] for field in METADATA_FIELDS}
+        item["confidence_score"] = int(item["confidence_score"])
+        if "source_label" in record:
+            item["source_label"] = record.get("source_label", "")
+            item["record_id"] = record.get("record_id", "")
+        exported.append(item)
     data = json_bytes(exported)
     if json.loads(data.decode("utf-8")) != exported:
         raise ExportError(f"{description} integrity check failed after re-reading.")
@@ -3183,13 +3366,17 @@ def build_metadata_export(records: List[dict], description: str) -> Tuple[bytes,
 
 
 def build_metadata_psv(records: List[dict], description: str) -> Tuple[bytes, int]:
-    expected = [METADATA_HEADERS] + [
+    headers = list(METADATA_HEADERS)
+    if any("source_label" in record for record in records):
+        headers += ["source_label", "record_id"]
+    expected = [headers] + [
         [
             safe_cell(record["document_name"]),
             safe_cell(record["label"]),
             safe_cell(record["value"]),
             str(int(record["confidence_score"])),
-        ]
+        ] + ([safe_cell(record.get("source_label", "")), safe_cell(record.get("record_id", ""))]
+             if len(headers) > 4 else [])
         for record in records
     ]
     buffer = io.StringIO(newline="")
@@ -3207,15 +3394,20 @@ def build_metadata_psv(records: List[dict], description: str) -> Tuple[bytes, in
 
 
 def build_metadata_xlsx(records: List[dict], description: str) -> Tuple[bytes, int]:
+    fields = list(METADATA_FIELDS)
+    headers = list(METADATA_HEADERS)
+    if any("source_label" in record for record in records):
+        fields += ["source_label", "record_id"]
+        headers += ["source_label", "record_id"]
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Metadata"
-    sheet.append(METADATA_HEADERS)
+    sheet.append(headers)
     for cell in sheet[1]:
         cell.font = Font(bold=True)
     for row_number, record in enumerate(records, start=2):
-        for column_number, field in enumerate(METADATA_FIELDS, start=1):
-            value = record[field]
+        for column_number, field in enumerate(fields, start=1):
+            value = record.get(field, "")
             cell = sheet.cell(row=row_number, column=column_number, value=value)
             if isinstance(value, str) and value[:1] in ("=", "+", "-", "@"):
                 cell.data_type = "s"
@@ -3225,26 +3417,31 @@ def build_metadata_xlsx(records: List[dict], description: str) -> Tuple[bytes, i
             fill_type="solid", start_color=color, end_color=color
         )
     sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = f"A1:D{max(sheet.max_row, 1)}"
-    for letter, width in zip("ABCD", (34, 34, 60, 18)):
+    last_column = sheet.max_column
+    sheet.auto_filter.ref = f"A1:{sheet.cell(row=1, column=last_column).column_letter}{max(sheet.max_row, 1)}"
+    for letter, width in zip((sheet.cell(row=1, column=i).column_letter for i in range(1, last_column + 1)),
+                             (34, 34, 60, 18, 34, 40)):
         sheet.column_dimensions[letter].width = width
     output = io.BytesIO()
     workbook.save(output)
     data = output.getvalue()
     reloaded = load_workbook(io.BytesIO(data), read_only=True)
-    raw_rows = list(reloaded.active.iter_rows(min_row=2, max_col=4, values_only=True))
+    raw_rows = list(reloaded.active.iter_rows(min_row=2, max_col=len(fields), values_only=True))
     reloaded.close()
     # openpyxl has no concept of "blank but present" - an empty string cell round-trips as
     # None. That is expected, not corruption, so None is normalised back to "" for the
     # text columns before the comparison (confidence_score has no such ambiguity).
     got = []
-    for document_name, label, value, confidence_score in raw_rows:
-        got.append({
-            "document_name": document_name or "",
-            "label": label or "",
-            "value": "" if value is None else value,
-            "confidence_score": int(confidence_score) if confidence_score is not None else 0,
-        })
+    for values in raw_rows:
+        row = dict(zip(fields, values))
+        row["document_name"] = row["document_name"] or ""
+        row["label"] = row["label"] or ""
+        row["value"] = "" if row["value"] is None else row["value"]
+        row["confidence_score"] = int(row["confidence_score"]) if row["confidence_score"] is not None else 0
+        for optional in ("source_label", "record_id"):
+            if optional in row:
+                row[optional] = row[optional] or ""
+        got.append(row)
     if got != records:
         raise ExportError(f"{description} XLSX integrity check failed after re-reading.")
     return data, len(records)
@@ -3252,7 +3449,7 @@ def build_metadata_xlsx(records: List[dict], description: str) -> Tuple[bytes, i
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 METADATA_FIELDS = ("document_name", "label", "value", "confidence_score")
-METADATA_HEADERS = ["Document Name", "Label", "Value", "Confidence Score"]
+METADATA_HEADERS = list(METADATA_FIELDS)
 
 # ---------------------------------------------------------------- styling
 def inject_css() -> None:
@@ -3966,8 +4163,10 @@ def _grouping_facts(active: sqlite3.Row) -> Tuple[Dict[str, List[Dict[str, Any]]
             "value": row["value"],
             "score": int(row["confidence_score"]),
             "document": row["filename"],
+            "document_id": row["document_id"],
         }
-        documents.setdefault(row["filename"], []).append(item)
+        document_key = f"{row['filename']} · {row['document_id'][:8]}"
+        documents.setdefault(document_key, []).append(item)
         flat.append(item)
     return documents, flat
 
@@ -4131,58 +4330,72 @@ def _render_group_management(active: sqlite3.Row, groups: List[dict],
 
 
 def _render_create(active: sqlite3.Row, metadata: List[dict]) -> None:
-    """New template: pick labels from one document, review the fields, name and save."""
+    """Create an ordered template from live group or label sources."""
     docket_id = active["id"]
-    fields_key = f"org_create_fields_{docket_id}"
-    if st.session_state.pop(f"org_create_reset_{docket_id}", False):
-        st.session_state.pop(fields_key, None)
-        st.session_state.pop(f"org_create_name_{docket_id}", None)
-    fields: List[str] = st.session_state.setdefault(fields_key, [])
+    with connect() as connection:
+        groups = load_groups(connection, docket_id)
+        all_rows = connection.execute(
+            """SELECT f.id, f.label, f.review_status FROM facts f WHERE f.docket_id = ?
+               AND f.concept != 'page_processing_status' ORDER BY f.label COLLATE NOCASE""",
+            (docket_id,),
+        ).fetchall()
+        group_rows = connection.execute(
+            "SELECT group_id, fact_id FROM value_group_members"
+        ).fetchall()
+    group_members = {}
+    for row in group_rows:
+        group_members.setdefault(row["group_id"], set()).add(row["fact_id"])
+    selectable_groups = [g for g in groups if g["members"]]
+    grouped_ids = set().union(*(group_members.get(g["id"], set()) for g in selectable_groups)) \
+        if selectable_groups else set()
+    label_ids = {}
+    for row in all_rows:
+        if row["id"] in grouped_ids:
+            continue
+        label_ids.setdefault(row["label"], []).append(row["id"])
 
-    st.markdown("**1 · Add fields from a document**")
-    documents = sorted({record["document_name"] for record in metadata}, key=str.casefold)
-    doc_col, label_col = st.columns([2, 3], vertical_alignment="bottom")
-    document = doc_col.selectbox("Document", documents, key=f"org_create_doc_{docket_id}")
-    available = [label for label in unique_labels(
-        [record for record in metadata if record["document_name"] == document]
-    ) if normalize_label(label) not in _norm_set(fields)]
-    picked = label_col.multiselect(
-        "Labels to add", available,
-        key=f"org_create_pick_{docket_id}_{key_id(document)}_{len(fields)}",
-        placeholder="Choose one or more labels" if available else "All labels here are already added",
-        disabled=not available,
+    st.markdown("**Grouped Values**")
+    selected_groups = st.multiselect(
+        "Group sources", [g["id"] for g in selectable_groups],
+        format_func=lambda gid: next(g["name"] for g in selectable_groups if g["id"] == gid),
+        key=f"org_create_groups_{docket_id}",
     )
-    if st.button("Add to template", disabled=not picked, key=f"org_create_add_{docket_id}"):
-        st.session_state[fields_key] = _dedupe_labels([*fields, *picked])
-        st.rerun()
-
-    st.markdown(f"**2 · Template fields ({len(fields)})**")
-    if fields:
-        kept = st.pills("Fields", fields, selection_mode="multi", default=fields,
-                        key=f"org_create_fields_pills_{docket_id}_{len(fields)}",
-                        label_visibility="collapsed", width="stretch")
-        kept = list(kept) if kept is not None else list(fields)
-        if kept != fields:
-            st.session_state[fields_key] = kept
-            st.rerun()
-        st.caption("Deselect a field to drop it. Nothing is mapped yet; Main Metadata is never changed.")
-    else:
-        st.caption("No fields yet. Add labels from a document above.")
-
-    st.markdown("**3 · Name and save**")
-    name_col, save_col = st.columns([3, 1], vertical_alignment="bottom")
-    name = name_col.text_input("Template name", key=f"org_create_name_{docket_id}", max_chars=120)
-    if save_col.button("Save template", type="primary", key=f"org_create_save_{docket_id}",
-                       disabled=not fields or not name.strip(), **stretch()):
+    st.markdown("**Ungrouped Values**")
+    selected_labels = st.multiselect(
+        "Original label sources", list(label_ids), key=f"org_create_labels_{docket_id}"
+    )
+    sources = [("group", gid, next(g["name"] for g in selectable_groups if g["id"] == gid))
+               for gid in selected_groups]
+    sources += [("label", label, label) for label in selected_labels]
+    fields = []
+    st.markdown("**Destination fields and order**")
+    for position, (source_type, source_id, source_name) in enumerate(sources):
+        destination, order = st.columns([4, 1])
+        label = destination.text_input(
+            f"{source_name} destination", value=source_name,
+            key=f"org_create_dest_{docket_id}_{source_type}_{key_id(source_id)}",
+        )
+        order_num = order.number_input(
+            f"Order · {source_name}", min_value=1, value=position + 1, step=1,
+            key=f"org_create_order_{docket_id}_{source_type}_{key_id(source_id)}",
+        )
+        fields.append({"source_type": source_type, "source_id": source_id,
+                       "source_name": source_name, "destination_label": label,
+                       "position": int(order_num)})
+    fields.sort(key=lambda field: (field["position"], field["source_name"].casefold()))
+    name = st.text_input("Template name", key=f"org_create_name_{docket_id}", max_chars=120)
+    if st.button("Save template", type="primary", key=f"org_create_save_{docket_id}",
+                 disabled=not fields or not name.strip(), **stretch()):
+        if any(not field["destination_label"].strip() for field in fields):
+            st.error("Every source needs a destination label.", icon="🚫")
+            return
         try:
-            template_id = save_template(docket_id, name, fields)
+            template_id = save_template(docket_id, name, [f["destination_label"] for f in fields])
+            save_template_fields(template_id, fields)
         except ValueError as exc:
             st.error(str(exc), icon="🚫")
             return
-        for label in fields:
-            save_mapping(docket_id, template_id, label, label, "direct")
-        st.session_state[f"org_create_reset_{docket_id}"] = True
-        queue_flash("success", f"Template “{clean_text(name).strip()}” saved. Main Metadata was not changed.")
+        queue_flash("success", f"Template “{clean_text(name).strip()}” saved with live sources.")
         st.rerun()
 
 
@@ -4200,14 +4413,27 @@ def _render_apply(active: sqlite3.Row, metadata: List[dict]) -> None:
     template = next(row for row in templates if row["name"] == selected)
     template_id = template["id"]
     template_labels = json.loads(template["labels_json"])
-    documents = sorted({record["document_name"] for record in metadata}, key=str.casefold)
-    chosen = docs_col.multiselect("Documents", documents, default=documents,
-                                  key=f"org_apply_docs_{docket_id}_{template_id}")
+    fact_rows = fetch_facts(docket_id)
+    document_names = {}
+    for fact in fact_rows:
+        document_names[fact["document_id"]] = fact["filename"]
+    document_ids = sorted(document_names, key=lambda did: (document_names[did].casefold(), did))
+    chosen = docs_col.multiselect(
+        "Documents", document_ids, default=document_ids,
+        format_func=lambda did: (f"{document_names[did]} · {did[:8]}"
+                                 if sum(name == document_names[did] for name in document_names.values()) > 1
+                                 else document_names[did]),
+        key=f"org_apply_docs_{docket_id}_{template_id}")
     if not chosen:
         st.info("Select at least one document.")
         return
 
-    chosen_records = [record for record in metadata if record["document_name"] in chosen]
+    chosen_records = [
+        {"document_name": fact["filename"], "label": fact["label"], "value": fact["value"],
+         "confidence_score": int(fact["confidence_score"]), "record_id": fact["id"]}
+        for fact in fact_rows if fact["document_id"] in set(chosen)
+        and fact["concept"] != "page_processing_status"
+    ]
     labels = unique_labels(chosen_records)
     sources_map = documents_by_label(chosen_records)
 
@@ -4216,20 +4442,23 @@ def _render_apply(active: sqlite3.Row, metadata: List[dict]) -> None:
         return ", ".join(names) if names else "—"
 
     current = approved_mappings(docket_id, template_id)
+    current_normalized = {normalize_label(source): target for source, target in current.items()}
     rejected = rejected_suggestions(docket_id, template_id)
+    rejected_normalized = {(normalize_label(source), normalize_label(target))
+                           for source, target in rejected}
 
     suggested: Dict[str, List[Dict[str, Any]]] = {}
     unmatched: List[str] = []
     for source in labels:
         exact_target = exact_template_label(source, template_labels)
         if exact_target is not None:
-            if source not in current:
+            if normalize_label(source) not in current_normalized:
                 save_mapping(docket_id, template_id, source, exact_target, "exact")
             continue
-        if source in current:
+        if normalize_label(source) in current_normalized:
             continue
         options = [m for m in fuzzy_suggestions(source, template_labels)
-                   if (source, m["label"]) not in rejected]
+                   if (normalize_label(source), normalize_label(m["label"])) not in rejected_normalized]
         if options:
             suggested[source] = options
         else:
@@ -4297,6 +4526,15 @@ def _render_apply(active: sqlite3.Row, metadata: List[dict]) -> None:
             label_col, target_col, map_col, add_col = st.columns([2, 2, 1, 1.5], vertical_alignment="bottom")
             label_col.markdown(f"**{source}**  \n<small>from: {esc(from_docs(source))}</small>",
                                unsafe_allow_html=True)
+            occurrences = [record for record in chosen_records
+                           if normalize_label(record["label"]) == normalize_label(source)]
+            with st.expander(f"Inspect {len(occurrences)} occurrence(s) · {source}"):
+                st.dataframe(
+                    [{"Source document": row["document_name"], "Original label": row["label"],
+                      "Value": row["value"], "Confidence score": row["confidence_score"]}
+                     for row in occurrences],
+                    hide_index=True, **stretch(),
+                )
             target = target_col.selectbox(f"Field for {source}", template_labels,
                                           key=f"tpl_manual_t_{docket_id}_{template_id}_{key_id(source)}",
                                           label_visibility="collapsed")
@@ -4322,6 +4560,7 @@ def _render_manage(active: sqlite3.Row, metadata: List[dict]) -> None:
     template = next(row for row in templates if row["name"] == selected)
     template_id = template["id"]
     current = json.loads(template["labels_json"])
+    source_fields = template_field_rows(template_id)
     addable = [label for label in unique_labels(metadata) if normalize_label(label) not in _norm_set(current)]
 
     kept = st.pills("Fields", current, selection_mode="multi", default=current,
@@ -4333,12 +4572,44 @@ def _render_manage(active: sqlite3.Row, metadata: List[dict]) -> None:
     name = st.text_input("Template name", value=template["name"], key=f"org_manage_name_{template_id}",
                          max_chars=120)
     new_labels = _dedupe_labels([*kept, *to_add])
+    edited_sources = []
+    if source_fields:
+        st.markdown("**Source fields and order**")
+        active_source_fields = [field for field in source_fields
+                                if field["destination_label"] in kept]
+        for index, field in enumerate(active_source_fields):
+            source_col, destination_col, order_col = st.columns([2, 3, 1])
+            source_col.caption(f"{field['source_type'].title()} · {field['source_name']}")
+            destination = destination_col.text_input(
+                "Destination", value=field["destination_label"],
+                key=f"org_edit_dest_{field['id']}",
+            )
+            order = order_col.number_input(
+                "Order", min_value=1, value=index + 1, step=1,
+                key=f"org_edit_order_{field['id']}",
+            )
+            edited_sources.append({
+                "source_type": field["source_type"], "source_id": field["source_id"],
+                "source_name": field["source_name"], "destination_label": destination,
+                "position": int(order),
+            })
+        existing_sources = {(field["source_type"], field["source_id"]) for field in edited_sources}
+        for label in to_add:
+            if ("label", label) not in existing_sources:
+                edited_sources.append({
+                    "source_type": "label", "source_id": label, "source_name": label,
+                    "destination_label": label, "position": len(edited_sources) + 1,
+                })
+        edited_sources.sort(key=lambda item: (item["position"], item["source_name"].casefold()))
+        new_labels = _dedupe_labels([field["destination_label"] for field in edited_sources])
     changed = new_labels != current or name.strip() != template["name"]
     save_col, delete_col = st.columns(2)
     if save_col.button("Save changes", type="primary", key=f"org_manage_save_{template_id}",
                        disabled=not changed or not new_labels or not name.strip(), **stretch()):
         try:
             save_template(docket_id, name, new_labels, template_id=template_id)
+            if source_fields:
+                save_template_fields(template_id, edited_sources)
         except ValueError as exc:
             st.error(str(exc), icon="🚫")
             return
@@ -4409,7 +4680,8 @@ def viewer_frame(rows: List[dict], show_status: bool = False) -> None:
 
     `show_status` adds a Review Status column (display-only traceability); it is never
     part of the exported four-field schema."""
-    columns = VIEWER_COLUMNS + (["Review Status"] if show_status else [])
+    template_columns = ["Source Label", "Record ID"] if any("source_label" in row for row in rows) else []
+    columns = VIEWER_COLUMNS + template_columns + (["Review Status"] if show_status else [])
     frame = pd.DataFrame(
         [
             {
@@ -4417,6 +4689,8 @@ def viewer_frame(rows: List[dict], show_status: bool = False) -> None:
                 "Label": record["label"],
                 "Value": record["value"],
                 "Confidence Score": clamp_confidence(record["confidence_score"], 50),
+                "Source Label": record.get("source_label", ""),
+                "Record ID": record.get("record_id", ""),
                 "Review Status": record.get("review_status", ""),
             }
             for record in rows
@@ -4576,9 +4850,20 @@ def page_export(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
             chosen_name = st.selectbox("Client template", names, key="export_template_choice")
             template = next(row for row in templates if row["name"] == chosen_name)
             records, missing = client_template_records(active["id"], template)
+            mapped_ids = {record.get("record_id") for record in records if record.get("record_id")}
+            unmatched_sources = [
+                {"record_id": fact["id"], "document_name": fact["filename"],
+                 "label": fact["label"], "value": fact["value"],
+                 "confidence_score": int(fact["confidence_score"])}
+                for fact in fetch_facts(active["id"])
+                if fact["concept"] != "page_processing_status" and fact["id"] not in mapped_ids
+            ]
             export_panel(f"Client Template · {template['name']}",
-                         "Only labels with a saved mapping, under the template's exact labels.",
+                         "Mapped occurrences keep their source document, original label and record ID.",
                          records, missing, "client_template")
+            if unmatched_sources:
+                with st.expander(f"Unmatched occurrences remain in Main Metadata ({len(unmatched_sources)})"):
+                    st.dataframe(unmatched_sources, hide_index=True, **stretch())
         else:
             st.markdown("**Client Template**")
             st.info("Create a template in Organize first.")
