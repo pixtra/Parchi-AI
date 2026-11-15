@@ -2816,6 +2816,7 @@ def _render_processing_status(job: Optional[Dict[str, Any]]) -> None:
         else:
             title = "Processing saved documents"
         message = esc(job.get("message") or "Preparing the saved documents.")
+        st.progress(percent, text=f"Overall document progress · {done}/{total} finished")
         _render_processing_panel(
             job, title=f"{title}…", message=message, percent=percent,
             sub=f"{done} of {total} document(s) finished · you can switch tabs safely; "
@@ -2833,6 +2834,7 @@ def _render_processing_status(job: Optional[Dict[str, Any]]) -> None:
         for row in rows:
             counts[row["status"]] = counts.get(row["status"], 0) + 1
         facts = sum(row["facts"] for row in rows)
+        st.progress(100, text="Overall document progress · complete")
         summary = " · ".join(
             f"{document_state_label(status)}: {counts[status]}"
             for status in ("completed", "partial", "failed") if status in counts
@@ -4421,8 +4423,9 @@ def _render_group_management(active: sqlite3.Row, groups: List[dict],
         names = [group["name"] for group in groups]
         picked = st.selectbox("Group", names, key=f"vg_manage_{docket_id}")
         group = next(g for g in groups if g["name"] == picked)
+        primary_mode = "Manual choice" if group.get("manual_primary") else "Highest confidence"
         st.caption(f"{len(group['members'])} record(s) · primary label: "
-                   f"**{group['primary_label'] or '—'}** (highest confidence wins)")
+                   f"**{group['primary_label'] or '—'}** · {primary_mode}")
 
         member_display = {
             m.fact_id: f"{m.label} = {m.value} — {m.document_name} ({m.confidence_score}%)"
@@ -4433,6 +4436,29 @@ def _render_group_management(active: sqlite3.Row, groups: List[dict],
             for item in ungrouped
         }
         current_ids = list(member_display)
+
+        primary_options = ["__automatic__", *current_ids]
+        primary_choice = st.selectbox(
+            "Primary label priority",
+            primary_options,
+            index=(primary_options.index(group["primary_fact_id"])
+                   if group.get("manual_primary") and group.get("primary_fact_id") in primary_options else 0),
+            format_func=lambda fact_id: "Automatic · highest confidence" if fact_id == "__automatic__"
+            else member_display.get(fact_id, "Unavailable member"),
+            key=f"vg_primary_{group['id']}_{key_id(','.join(sorted(current_ids)))}",
+        )
+        if st.button("Save primary priority", key=f"vg_primary_save_{group['id']}", **stretch()):
+            try:
+                with connect() as connection:
+                    set_primary_member(
+                        connection, docket_id, group["id"],
+                        None if primary_choice == "__automatic__" else primary_choice,
+                    )
+            except GroupError as exc:
+                st.error(str(exc), icon="🚫")
+            else:
+                queue_flash("success", "Primary label priority saved.")
+                st.rerun()
 
         new_name = st.text_input("Rename group", value=group["name"],
                                  key=f"vg_rename_{group['id']}")
