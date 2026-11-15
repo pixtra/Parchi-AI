@@ -16,6 +16,7 @@ VALUE_GROUP_SCHEMA = """
 CREATE TABLE IF NOT EXISTS value_groups (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
+    primary_fact_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(name)
@@ -48,6 +49,23 @@ def primary_member(members: Iterable[GroupMember]) -> Optional[GroupMember]:
     if not members:
         return None
     return min(members, key=lambda m: (-m.confidence_score, m.fact_id))
+
+
+def set_primary_member(conn: sqlite3.Connection, docket_id: str, group_id: str,
+                       fact_id: Optional[str]) -> None:
+    """Save a manual primary choice, or clear it to use confidence ordering."""
+    _owned_group(conn, docket_id, group_id)
+    if fact_id is not None:
+        row = conn.execute(
+            """SELECT 1 FROM value_group_members m JOIN facts f ON f.id = m.fact_id
+               WHERE m.group_id = ? AND m.fact_id = ? AND f.review_status != 'rejected'
+                 AND f.concept != 'page_processing_status'""",
+            (group_id, fact_id),
+        ).fetchone()
+        if row is None:
+            raise GroupError("Choose a current, non-rejected member of this group.")
+    conn.execute("UPDATE value_groups SET primary_fact_id = ?, updated_at = ? WHERE id = ?",
+                 (fact_id, _now(), group_id))
 
 
 def _now() -> str:
@@ -140,6 +158,11 @@ def replace_members(conn: sqlite3.Connection, docket_id: str, group_id: str, fac
         "INSERT INTO value_group_members (group_id, fact_id) VALUES (?, ?)",
         [(group_id, fact_id) for fact_id in ids],
     )
+    conn.execute(
+        "UPDATE value_groups SET primary_fact_id = NULL WHERE id = ? AND primary_fact_id IS NOT NULL "
+        "AND primary_fact_id NOT IN (SELECT fact_id FROM value_group_members WHERE group_id = ?)",
+        (group_id, group_id),
+    )
     conn.execute("UPDATE value_groups SET updated_at = ? WHERE id = ?", (_now(), group_id))
 
 
@@ -180,7 +203,9 @@ def _owned_group(conn: sqlite3.Connection, docket_id: str, group_id: str) -> Non
 
 def load_groups(conn: sqlite3.Connection, docket_id: str) -> List[dict]:
     """Every group with its members and computed primary label. Read-only."""
-    groups = conn.execute("SELECT id, name FROM value_groups ORDER BY name COLLATE NOCASE").fetchall()
+    groups = conn.execute(
+        "SELECT id, name, primary_fact_id FROM value_groups ORDER BY name COLLATE NOCASE"
+    ).fetchall()
     result = []
     for group in groups:
         rows = conn.execute(
@@ -198,12 +223,17 @@ def load_groups(conn: sqlite3.Connection, docket_id: str) -> List[dict]:
                         int(r["confidence_score"]))
             for r in rows
         ]
-        primary = primary_member(members)
+        primary = next((member for member in members
+                        if member.fact_id == group["primary_fact_id"]), None)
+        if primary is None:
+            primary = primary_member(members)
         result.append({
             "id": group["id"],
             "name": group["name"],
             "members": members,
             "primary_label": primary.label if primary else "",
+            "primary_fact_id": primary.fact_id if primary else None,
+            "manual_primary": bool(primary and group["primary_fact_id"] == primary.fact_id),
         })
     return result
 
