@@ -6,13 +6,15 @@
 <style>
   :root { color-scheme: dark; }
   body { margin: 0; font: 13px/1.4 system-ui, -apple-system, Segoe UI, sans-serif; color: #e5e7eb; background: transparent; }
+  #root { padding: 12px 14px 16px; }
   h4 { margin: 12px 0 6px; font-size: 13px; font-weight: 600; color: #cbd5e1; }
-  .doc { border: 1px solid #374151; border-radius: 10px; padding: 8px; margin-bottom: 8px; }
-  .doc-title { font-size: 12px; color: #9ca3af; margin-bottom: 6px; overflow-wrap: anywhere; }
-  .zone { display: flex; flex-wrap: wrap; gap: 6px; min-height: 40px; align-items: flex-start;
-          border: 1px dashed #4b5563; border-radius: 10px; padding: 6px; }
-  .zone.draft { border-color: #f59e0b; background: rgba(245, 158, 11, 0.06); min-height: 56px; }
+  .doc { border: 1px solid #374151; border-radius: 14px; padding: 14px 16px; margin-bottom: 10px; }
+  .doc-title { font-size: 12px; color: #9ca3af; margin-bottom: 8px; overflow-wrap: anywhere; }
+  .zone { display: flex; flex-wrap: wrap; gap: 6px; min-height: 44px; align-items: flex-start;
+          border: 1px dashed #4b5563; border-radius: 12px; padding: 10px 12px; }
+  .zone.draft { border-color: #f59e0b; background: rgba(245, 158, 11, 0.06); min-height: 64px; }
   .zone.drag-target { border-color: #818cf8; background: rgba(129, 140, 248, 0.10); }
+  .zone.drag-over .empty { display: none; }
   .pill { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; box-sizing: border-box;
           border: 1px solid #6366f1; border-radius: 999px; padding: 4px 10px; background: #1f2937;
           cursor: grab; user-select: none; }
@@ -76,6 +78,13 @@
     send("streamlit:setComponentValue", { value: { draft: ids }, dataType: "json" });
   }
   function sortable(node) {
+    // While a pill hovers over a zone, its placeholder ("Drag records here…") hides so the
+    // drop target looks genuinely empty. Cleared on drop and on global drag end.
+    node.addEventListener("dragover", () => node.classList.add("drag-over"));
+    node.addEventListener("dragleave", (e) => {
+      if (!e.relatedTarget || !node.contains(e.relatedTarget)) node.classList.remove("drag-over");
+    });
+    node.addEventListener("drop", () => node.classList.remove("drag-over"));
     new Sortable(node, {
       group: "value-groups",
       draggable: ".pill",
@@ -83,11 +92,13 @@
       ghostClass: "sortable-ghost",
       onStart: () => document.querySelectorAll(".zone").forEach(z => z.classList.add("drag-target")),
       onEnd: () => {
-        document.querySelectorAll(".zone").forEach(z => z.classList.remove("drag-target"));
+        document.querySelectorAll(".zone").forEach(z => z.classList.remove("drag-target", "drag-over"));
         emit();
       },
     });
   }
+  document.addEventListener("dragend", () =>
+    document.querySelectorAll(".zone").forEach(z => z.classList.remove("drag-over")));
 
   function render(args) {
     const root = document.getElementById("root");
