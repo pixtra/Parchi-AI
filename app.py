@@ -37,13 +37,13 @@ from metadata_workflow import (
 from value_groups import (
     VALUE_GROUP_SCHEMA,
     GroupError,
+    add_member,
     create_group,
     delete_group,
     load_groups,
-    merge_groups,
     rename_group,
-    replace_members,
-    set_primary_member,
+    remove_member,
+    reorder_members,
     ungrouped_fact_ids,
 )
 from extraction_adapter import coerce_nullable_value, confidence_map
@@ -780,6 +780,11 @@ def init_db() -> bool:
         value_group_columns = {row["name"] for row in connection.execute("PRAGMA table_info(value_groups)")}
         if "primary_fact_id" not in value_group_columns:
             connection.execute("ALTER TABLE value_groups ADD COLUMN primary_fact_id TEXT")
+        member_columns = {row["name"] for row in connection.execute("PRAGMA table_info(value_group_members)")}
+        if "priority" not in member_columns:
+            connection.execute(
+                "ALTER TABLE value_group_members ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
+            )
         _remove_template_snapshots(connection)
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(dockets)")}
         if "docket_type" not in columns:
@@ -3678,7 +3683,12 @@ def inject_css() -> None:
         /* Value Grouping board: blend the section into the page instead of boxing it in a
            panel — the drag-and-drop frame provides its own card styling. */
         div[data-testid="stVerticalBlockBorderWrapper"]:has(iframe[title*="parchi_value_groups"]) {
-            background: transparent; border-radius: 0; }
+            background: transparent !important; background-color: transparent !important;
+            border-color: transparent !important; box-shadow: none !important; border-radius: 0;
+            width: calc(100% + 2rem); max-width: none; margin-left: -1rem; }
+        div[data-testid="stElementContainer"]:has(iframe[title*="parchi_value_groups"]) {
+            background: transparent !important; background-color: transparent !important; }
+        iframe[title*="parchi_value_groups"] { width: 100% !important; }
         [data-testid="stFileUploader"] section { background: var(--panel2); border-radius: 10px; }
         [data-testid="stDataFrame"] { border:1px solid var(--line); border-radius:10px; overflow:hidden; }
         div[data-baseweb="select"] > div, div[data-baseweb="input"] { border-radius: 8px !important; }
@@ -4359,7 +4369,7 @@ def _render_grouping(active: sqlite3.Row) -> None:
             "name": group["name"],
             "primary": group["primary_label"],
             "members": [
-                {"label": m.label, "value": m.value, "document": m.document_name,
+                {"id": m.fact_id, "label": m.label, "value": m.value, "document": m.document_name,
                  "score": m.confidence_score}
                 for m in group["members"]
             ],
@@ -4378,155 +4388,51 @@ def _render_grouping(active: sqlite3.Row) -> None:
         reset=int(st.session_state.get("vg_reset", 0)),
         key=f"vg_board_{docket_id}",
     )
+    result = result or {}
+    action = result.get("action")
+    event_id = str(result.get("event_id") or "")
+    event_key = f"vg_last_event_{docket_id}"
+    if action in {"create_group", "add_member", "remove_member", "reorder_members", "rename_group", "delete_group"} and event_id \
+            and st.session_state.get(event_key) != event_id:
+        st.session_state[event_key] = event_id
+        try:
+            with connect() as connection:
+                if action == "create_group":
+                    create_group(connection, docket_id, str(result.get("name") or ""),
+                                 result.get("fact_ids") or [])
+                elif action == "add_member":
+                    add_member(connection, docket_id, str(result.get("group_id") or ""),
+                               str(result.get("fact_id") or ""))
+                elif action == "remove_member":
+                    remove_member(connection, docket_id, str(result.get("group_id") or ""),
+                                  str(result.get("fact_id") or ""))
+                elif action == "reorder_members":
+                    reorder_members(connection, docket_id, str(result.get("group_id") or ""),
+                                    result.get("fact_ids") or [])
+                elif action == "rename_group":
+                    rename_group(connection, docket_id, str(result.get("group_id") or ""),
+                                 str(result.get("name") or ""))
+                else:
+                    delete_group(connection, docket_id, str(result.get("group_id") or ""))
+        except GroupError as exc:
+            queue_flash("error", str(exc))
+        else:
+            if action == "create_group":
+                st.session_state["vg_reset"] = int(st.session_state.get("vg_reset", 0)) + 1
+            messages = {
+                "create_group": "Group saved. Its records stay in Main Metadata untouched.",
+                "add_member": "Occurrence added to the group.",
+                "remove_member": "Occurrence returned to its document. Main Metadata is unchanged.",
+                "reorder_members": "Occurrence priority order saved.",
+                "rename_group": "Group renamed.",
+                "delete_group": "Group deleted. Its occurrences returned to their documents; Main Metadata is unchanged.",
+            }
+            queue_flash("success", messages[action])
+        st.rerun()
     # The component keeps its last value after a save, so drop anything that is no longer
     # ungrouped. Otherwise saved records linger in the count and can be "saved" twice.
     still_free = {item["id"] for item in flat}
-    draft = [str(i) for i in dict.fromkeys((result or {}).get("draft") or []) if i in still_free]
-
-    draft_col, save_col = st.columns([3, 1], vertical_alignment="bottom")
-    # The field gets a new key after each save, so it always starts empty.
-    name_seq = int(st.session_state.get("vg_name_seq", 0))
-    group_name = draft_col.text_input(
-        "Group name", key=f"vg_name_{docket_id}_{name_seq}",
-        placeholder="e.g. Driver Name",
-        help="A short name for the information these records have in common.",
-    )
-    save_label = f"Save group ({len(draft)} record{'' if len(draft) == 1 else 's'})"
-    if save_col.button(save_label, key=f"vg_save_{docket_id}", **stretch()):
-        if not draft:
-            st.warning("Drag at least one record into Group Values before saving.")
-        else:
-            try:
-                with connect() as connection:
-                    create_group(connection, docket_id, group_name, draft)
-            except GroupError as exc:
-                st.error(str(exc), icon="🚫")
-            else:
-                st.session_state["vg_reset"] = int(st.session_state.get("vg_reset", 0)) + 1
-                st.session_state["vg_name_seq"] = name_seq + 1
-                queue_flash("success", f"Saved group “{' '.join(str(group_name).split())}”. "
-                            "Its records stay in Main Metadata untouched.")
-                st.rerun()
-
-    _render_group_management(active, groups, flat)
-
-
-def _render_group_management(active: sqlite3.Row, groups: List[dict],
-                             ungrouped: List[dict]) -> None:
-    """Rename, add/remove records, merge or delete saved groups. All changes go through
-    value_groups validation; the primary label is recomputed from confidence scores."""
-    docket_id = active["id"]
-    with st.expander("Manage saved groups", expanded=bool(groups)):
-        if not groups:
-            st.caption("No saved groups yet. Drag records into Group Values and save one.")
-            return
-        names = [group["name"] for group in groups]
-        picked = st.selectbox("Group", names, key=f"vg_manage_{docket_id}")
-        group = next(g for g in groups if g["name"] == picked)
-        primary_mode = "Manual choice" if group.get("manual_primary") else "Highest confidence"
-        st.caption(f"{len(group['members'])} record(s) · primary label: "
-                   f"**{group['primary_label'] or '—'}** · {primary_mode}")
-
-        member_display = {
-            m.fact_id: f"{m.label} = {m.value} — {m.document_name} ({m.confidence_score}%)"
-            for m in group["members"]
-        }
-        ungrouped_display = {
-            item["id"]: f"{item['label']} = {item['value']} — {item['document']} ({item['score']}%)"
-            for item in ungrouped
-        }
-        current_ids = list(member_display)
-
-        primary_options = ["__automatic__", *current_ids]
-        primary_choice = st.selectbox(
-            "Primary label priority",
-            primary_options,
-            index=(primary_options.index(group["primary_fact_id"])
-                   if group.get("manual_primary") and group.get("primary_fact_id") in primary_options else 0),
-            format_func=lambda fact_id: "Automatic · highest confidence" if fact_id == "__automatic__"
-            else member_display.get(fact_id, "Unavailable member"),
-            key=f"vg_primary_{group['id']}_{key_id(','.join(sorted(current_ids)))}",
-        )
-        if st.button("Save primary priority", key=f"vg_primary_save_{group['id']}", **stretch()):
-            try:
-                with connect() as connection:
-                    set_primary_member(
-                        connection, docket_id, group["id"],
-                        None if primary_choice == "__automatic__" else primary_choice,
-                    )
-            except GroupError as exc:
-                st.error(str(exc), icon="🚫")
-            else:
-                queue_flash("success", "Primary label priority saved.")
-                st.rerun()
-
-        new_name = st.text_input("Rename group", value=group["name"],
-                                 key=f"vg_rename_{group['id']}")
-        action_col1, action_col2 = st.columns([1, 3], vertical_alignment="bottom")
-        if action_col1.button("Rename", key=f"vg_rename_btn_{group['id']}", **stretch()):
-            try:
-                with connect() as connection:
-                    rename_group(connection, docket_id, group["id"], new_name)
-            except GroupError as exc:
-                st.error(str(exc), icon="🚫")
-            else:
-                queue_flash("success", "Group renamed.")
-                st.rerun()
-        st.caption("Renaming never changes the records inside the group.")
-
-        # Keys include the current membership: once records are added or removed the old
-        # selections are no longer valid options, so the pickers must start empty again.
-        membership_key = key_id(",".join(sorted(current_ids)))
-        remove_pick = st.multiselect(
-            "Remove records from this group", options=current_ids,
-            format_func=member_display.get, key=f"vg_remove_{group['id']}_{membership_key}",
-        )
-        add_pick = st.multiselect(
-            "Add records from the ungrouped pool", options=list(ungrouped_display),
-            format_func=ungrouped_display.get, key=f"vg_add_{group['id']}_{membership_key}",
-        )
-        if st.button("Apply member changes", key=f"vg_members_btn_{group['id']}"):
-            target_ids = [i for i in current_ids if i not in remove_pick] + add_pick
-            try:
-                with connect() as connection:
-                    replace_members(connection, docket_id, group["id"], target_ids)
-            except GroupError as exc:
-                st.error(str(exc), icon="🚫")
-            else:
-                queue_flash("success", "Group membership updated. The primary label was "
-                            "recalculated from confidence scores.")
-                st.rerun()
-
-        other_groups = [g for g in groups if g["id"] != group["id"]]
-        if other_groups:
-            merge_name = st.selectbox("Merge this group into", [g["name"] for g in other_groups],
-                                      key=f"vg_merge_{group['id']}")
-            if st.button("Merge", key=f"vg_merge_btn_{group['id']}"):
-                target = next(g for g in other_groups if g["name"] == merge_name)
-                try:
-                    with connect() as connection:
-                        merge_groups(connection, docket_id, target["id"], group["id"])
-                except GroupError as exc:
-                    st.error(str(exc), icon="🚫")
-                else:
-                    queue_flash("success", f"“{group['name']}” merged into “{target['name']}”. "
-                                "No records were lost.")
-                    st.rerun()
-
-        confirm = st.checkbox("Delete this group; its records return to their document "
-                              "sections", key=f"vg_del_confirm_{group['id']}")
-        if st.button("Delete group", key=f"vg_delete_btn_{group['id']}",
-                     disabled=not confirm, **stretch()):
-            try:
-                with connect() as connection:
-                    delete_group(connection, docket_id, group["id"])
-            except GroupError as exc:
-                st.error(str(exc), icon="🚫")
-            else:
-                queue_flash("success", f"Deleted group “{group['name']}”. Its records were "
-                            "ungrouped, not removed from Main Metadata.")
-                st.rerun()
-
+    draft = [str(i) for i in dict.fromkeys(result.get("draft") or []) if i in still_free]
 
 def _render_create(active: sqlite3.Row, metadata: List[dict]) -> None:
     """Create an ordered template from live group or label sources."""

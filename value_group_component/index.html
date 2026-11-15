@@ -14,18 +14,21 @@
   html, body { margin: 0; padding: 0; background: transparent; }
   body { font: 14px/1.45 "Source Sans Pro", -apple-system, "Segoe UI", system-ui, sans-serif; color: var(--ink); }
 
-  .board { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 14px; align-items: start; }
-  @media (max-width: 760px) { .board { grid-template-columns: minmax(0, 1fr); } }
+  .board { display: flex; flex-direction: column; gap: 14px; align-items: stretch; }
+  .top-row { display:grid; grid-template-columns:minmax(0,1.15fr) minmax(0,1fr); gap:14px; align-items:stretch; }
+  @media (max-width:760px) { .top-row { grid-template-columns:minmax(0,1fr); } }
 
-  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px; min-width: 0; }
+  .panel { background: linear-gradient(155deg, #191f29, var(--panel)); border: 1px solid var(--line); border-radius: 12px; padding: 13px; min-width: 0; box-shadow: 0 5px 16px rgba(0,0,0,.12); }
+  .top-row > .panel { height:100%; display:flex; flex-direction:column; }
+  .top-row > .panel > .docs-scroll, .top-row > .panel > .zone.draft { flex:1 1 auto; min-height:110px; }
   .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
-  .panel-head h3 { margin: 0; font-size: 13.5px; font-weight: 700; }
+  .panel-head h3 { margin: 0; font-size: 13.5px; font-weight: 700; letter-spacing:.01em }
   .count { font-size: 11.5px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 2px 9px; white-space: nowrap; }
   .hint { color: var(--muted); font-size: 12.5px; margin: 2px 0 8px; }
 
-  /* The document list scrolls inside its own panel. Nothing overlaps: every panel is in flow. */
-  .docs-scroll { max-height: 460px; overflow-y: auto; padding-right: 4px; scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
-  .doc { border: 1px solid var(--line); border-radius: 10px; padding: 10px; margin-bottom: 10px; background: var(--panel2); }
+  /* Keep many document pills in a bounded, independently scrollable area. */
+  .docs-scroll { display:flex; flex-direction:column; gap:8px; max-height:440px; overflow-y:auto; padding-right:5px; scrollbar-width:thin; scrollbar-color:var(--line) transparent; }
+  .doc { border: 1px solid #303a4b; border-radius: 9px; padding: 9px; background: linear-gradient(145deg,#202734,#1c222d); }
   .doc-title { font-size: 12.5px; color: var(--muted); font-weight: 600; margin-bottom: 8px; overflow-wrap: anywhere; }
 
   .zone { display: flex; flex-wrap: wrap; align-content: flex-start; gap: 8px; min-height: 48px;
@@ -36,7 +39,7 @@
   .zone.draft { min-height: 110px; }
 
   .pill { display: inline-flex; align-items: center; gap: 7px; max-width: 100%; min-height: 32px;
-          border: 1px solid var(--accent); border-radius: 999px; padding: 6px 12px; background: var(--panel2);
+          border: 1px solid #617ce0; border-radius: 999px; padding: 6px 12px; background: #222a3a;
           color: var(--ink); cursor: grab; user-select: none; -webkit-user-select: none; }
   .pill:active { cursor: grabbing; }
   .pill .lbl { font-weight: 600; white-space: nowrap; }
@@ -47,14 +50,51 @@
   .pill.sortable-drag { box-shadow: 0 8px 20px rgba(0,0,0,.45); }
   .empty { color: var(--muted); font-size: 12.5px; padding: 4px 2px; }
 
-  .groups { display: flex; flex-direction: column; gap: 8px; max-height: 340px; overflow-y: auto; padding-right: 4px; scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
-  details.group { border: 1px solid var(--line); border-radius: 10px; background: var(--panel2); overflow: hidden; }
-  details.group summary { list-style: none; cursor: pointer; padding: 9px 12px; color: #fff; font-weight: 600; display: flex; justify-content: space-between; gap: 8px; }
+  .groups { display:grid; grid-template-columns:repeat(auto-fill,minmax(min(100%,320px),1fr)); gap:10px; align-items:start; align-content:start; }
+  details.group { align-self:start; width:100%; border: 1px solid var(--line); border-radius: 10px; background: var(--panel2); overflow: hidden; min-width:0; box-shadow:0 3px 10px rgba(0,0,0,.1); transition:border-color .16s ease,box-shadow .16s ease; }
+  details.group[open] { border-color:#435477; box-shadow:0 6px 16px rgba(0,0,0,.16); }
+  details.group summary { list-style: none; cursor: pointer; min-height:46px; padding: 9px 11px; color: #fff; font-weight: 600; display: flex; align-items:center; justify-content: space-between; gap: 8px; }
   details.group summary::-webkit-details-marker { display: none; }
   details.group summary small { font-weight: 500; opacity: .85; white-space: nowrap; }
-  .members { display: grid; gap: 6px; padding: 8px 10px 10px; }
-  .member { border-left: 3px solid var(--muted); padding: 5px 9px; background: var(--panel); border-radius: 6px; overflow-wrap: anywhere; }
-  .member small { color: var(--muted); }
+  .members { display:grid; gap:6px; padding:8px 9px 10px; }
+  .member { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:3px 8px; border:1px solid #303a4b; border-left:3px solid var(--muted); padding:8px 9px; background:var(--panel); border-radius:7px; overflow-wrap:anywhere; transition:background .14s ease,border-color .14s ease; }
+  .member:hover { background:#1b222d; border-color:#3b475b; }
+  .member-label {font-weight:650}.member-value{color:var(--ink)}
+  .member-meta {grid-column:1;color:var(--muted);font-size:11.5px}
+  .member {cursor:default}.member .reorder-handle {grid-column:2;grid-row:1;}
+  .member.sortable-ghost{opacity:.35}.member.sortable-drag{box-shadow:0 6px 16px rgba(0,0,0,.4)}
+  .remove-member {grid-column:2;grid-row:1/4;align-self:center;border:1px solid #70464b;background:transparent;color:#ffc2c7;border-radius:6px;padding:4px 8px;cursor:pointer}
+  .remove-member:hover{background:#502d32}
+  .group-zone {min-height:38px;border:1px dashed #58637a;border-radius:8px;padding:6px;display:flex;flex-wrap:wrap;gap:6px;margin:0 8px 8px}
+  .group-zone:empty:after{content:"Drop a document occurrence here";color:var(--muted);font-size:11px}
+  .groups-help{color:var(--muted);font-size:12px;margin:0 0 7px}
+  .group-tools{display:flex;gap:6px;padding:0 9px 8px;align-items:center}
+  .group-tools input{min-width:0;flex:1;background:var(--panel);border:1px solid var(--line);border-radius:6px;color:var(--ink);padding:6px 8px;font:inherit;font-size:12px}
+  .group-tools button,.trash-confirm button{border:1px solid var(--line);border-radius:6px;padding:6px 9px;background:#252e3d;color:var(--ink);cursor:pointer;font:inherit;font-size:12px}
+  .group-tools button:hover,.trash-confirm button:hover{border-color:var(--accent)}
+  .new-group-form{display:flex;gap:8px;align-items:center;margin-top:9px}
+  .new-group-form input{min-width:0;flex:1;background:var(--panel);border:1px solid var(--line);border-radius:7px;color:var(--ink);padding:8px 10px;font:inherit;font-size:13px}
+  .new-group-form button{border:1px solid #667fe0;border-radius:7px;padding:8px 12px;background:#354b91;color:#fff;cursor:pointer;font:inherit;font-size:12px;font-weight:650;white-space:nowrap}
+  .new-group-form button:hover{background:#405ba9}.new-group-form button:disabled{opacity:.45;cursor:not-allowed}
+  .group-title{display:flex;align-items:center;gap:7px;min-width:0}
+  .rename-toggle{border:1px solid rgba(255,255,255,.25);border-radius:5px;background:rgba(0,0,0,.16);color:#fff;padding:1px 6px;font-size:13px;line-height:1.3;cursor:pointer}
+  .rename-toggle:hover{background:rgba(255,255,255,.17)}
+  .inline-delete{margin:0 8px 9px;border:1px solid #8b424a;border-radius:7px;padding:6px 10px;background:rgba(112,45,52,.2);color:#ffc2c7;cursor:pointer;font:inherit;font-size:12px}
+  .inline-delete:hover{background:rgba(160,48,59,.35)}
+  .inline-delete-confirm{margin:0 8px 9px;padding:9px;border-radius:8px;background:rgba(112,45,52,.22);color:#ffe4e6;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;font-size:12px}
+  .inline-delete-confirm .actions{display:flex;gap:6px}
+  .inline-delete-confirm button{border:1px solid var(--line);border-radius:6px;padding:5px 8px;background:#252e3d;color:var(--ink);cursor:pointer;font:inherit}
+  .inline-delete-confirm .confirm-delete{background:#8d303b;border-color:#ba5861;color:#fff}
+  .reorder-hint{font-size:11px;color:var(--muted);padding:0 9px 6px}
+  .reorder-handle{color:var(--muted);font-size:14px;cursor:grab;align-self:center;user-select:none}
+  .trash-panel{border-color:#70464b;background:rgba(112,70,75,.08)}
+  .trash-zone{min-height:58px;border:1.5px dashed #a65b63;border-radius:9px;padding:10px;display:flex;align-items:center;justify-content:center;color:#ffc2c7;background:rgba(112,45,52,.12);transition:background .15s,border-color .15s,transform .15s}
+  .trash-zone.trash-ready{border-style:solid}.trash-zone.drag-over{background:rgba(190,55,66,.28);border-color:#ff8992;transform:scale(1.01);color:#fff}
+  .trash-confirm{margin-top:8px;padding:9px;border-radius:8px;background:rgba(112,45,52,.22);color:#ffe4e6;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+  .trash-confirm .actions{display:flex;gap:7px}.trash-confirm .confirm-delete{background:#8d303b;border-color:#ba5861}
+  details.group { interpolate-size:allow-keywords; }
+  details.group::details-content{block-size:0;overflow:hidden;transition:block-size .2s ease,content-visibility .2s allow-discrete}
+  details.group[open]::details-content{block-size:auto}
 </style>
 </head>
 <body>
@@ -66,6 +106,13 @@
   let draft = [];
   let lastReset = null;
   let lastSent = null;
+  const expandedGroups = new Set();
+  const renamingGroups = new Set();
+  const renameDrafts = new Map();
+  let currentArgs = {};
+  let pendingTrashGroup = null;
+  let pendingInlineDelete = null;
+  let newGroupName = "";
 
   function send(type, data) {
     window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data), "*");
@@ -105,6 +152,51 @@
     lastSent = key;
     send("streamlit:setComponentValue", { value: { draft: ids }, dataType: "json" });
   }
+  function emitAction(action, groupId, factId, extra = {}) {
+    send("streamlit:setComponentValue", {
+      value: Object.assign({draft: draftIds(), action, group_id: groupId, fact_id: factId,
+        event_id: (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now()) + Math.random()}, extra),
+      dataType: "json"
+    });
+  }
+
+  function sortableMembers(zone, groupId) {
+    new Sortable(zone, {
+      group: {name: "members-" + groupId, pull: false, put: false},
+      draggable: ".member", handle: ".reorder-handle", animation: 140,
+      fallbackTolerance: 8, ghostClass: "sortable-ghost", dragClass: "sortable-drag",
+      onEnd: () => emitAction("reorder_members", groupId, null,
+        {fact_ids: [...zone.querySelectorAll(".member")].map(row => row.dataset.id)})
+    });
+  }
+
+  function installGroupTrashDrag(list, trash) {
+    new Sortable(list, {
+      group: {name: "saved-groups", pull: true, put: false},
+      draggable: "details.group", handle: ".group-summary", sort: false,
+      filter: ".rename-toggle", preventOnFilter: false,
+      animation: 140, forceFallback: true, fallbackTolerance: 5,
+      ghostClass: "sortable-ghost", dragClass: "sortable-drag",
+      onStart: () => trash.classList.add("trash-ready"),
+      onEnd: event => {
+        trash.classList.remove("trash-ready", "drag-over");
+        if (event.to === trash) {
+          pendingTrashGroup = event.item.dataset.groupId;
+          render(currentArgs);
+        }
+      }
+    });
+    new Sortable(trash, {
+      group: {name: "saved-groups", pull: false,
+        put: (to, from) => from.el && from.el.id === "group-list"},
+      draggable: "details.group", sort: false, animation: 140,
+      onMove: () => { trash.classList.add("drag-over"); return true; }
+    });
+    trash.addEventListener("pointerenter", () => {
+      if (document.querySelector(".sortable-drag")) trash.classList.add("drag-over");
+    });
+    trash.addEventListener("pointerleave", () => trash.classList.remove("drag-over"));
+  }
 
   // Sortable's group.put receives Sortable INSTANCES; the element is instance.el.
   // Records may move between a document and Group Values, and back to their own document.
@@ -115,6 +207,7 @@
         name: "value-groups",
         pull: true,
         put: (to, from, dragEl) => {
+          if (to.el.dataset.groupId) return true;
           if (to.el.id === "draft") return true;
           return to.el.dataset.document === dragEl.dataset.document;
         },
@@ -129,9 +222,13 @@
       scrollSensitivity: 60,
       scrollSpeed: 12,
       onStart: () => document.querySelectorAll(".zone").forEach(z => z.classList.add("drag-target")),
-      onEnd: () => {
+      onEnd: (event) => {
         document.querySelectorAll(".zone").forEach(z => z.classList.remove("drag-target", "drag-over"));
-        emit();
+        if (event.to && event.to.dataset.groupId) {
+          emitAction("add_member", event.to.dataset.groupId, event.item.dataset.id);
+        } else {
+          emit();
+        }
       },
     });
     zone.addEventListener("pointerenter", () => { if (document.querySelector(".sortable-drag")) zone.classList.add("drag-over"); });
@@ -149,17 +246,21 @@
   }
 
   function render(args) {
+    currentArgs = args || {};
     const root = document.getElementById("root");
     root.textContent = "";
-    const docs = args.documents || {};
+    const docs = currentArgs.documents || {};
     const all = {};
     Object.values(docs).forEach(list => list.forEach(item => { all[item.id] = item; }));
 
     // A save bumps `reset`: clear the draft and let the next drop send a fresh snapshot.
-    if (args.reset !== lastReset) { lastReset = args.reset; draft = []; lastSent = null; }
+    if (currentArgs.reset !== lastReset) {
+      if (lastReset !== null) newGroupName = "";
+      lastReset = currentArgs.reset; draft = []; lastSent = null;
+    }
     draft = draft.filter(id => all[id]);
 
-    // Left column: ungrouped records, one zone per document.
+    // Document sections come first so every source pill stays immediately accessible.
     const docsBody = el("div", "docs-scroll");
     const names = Object.keys(docs).sort((a, b) => a.localeCompare(b));
     if (!names.length) docsBody.appendChild(el("div", "empty", "No ungrouped records. Everything is grouped or rejected."));
@@ -175,48 +276,170 @@
       sortable(zone);
     });
     const left = panel("Documents", names.length ? names.length + " doc" + (names.length === 1 ? "" : "s") : undefined, docsBody);
-    const hintLeft = el("div", "hint", "Drag a record into Group Values. Records return to their own document.");
+    const hintLeft = el("div", "hint", "Drag an occurrence to Group Values or expand a saved group to add it there.");
     left.insertBefore(hintLeft, docsBody);
 
-    // Right column: Group Values (drop target) above Grouped Values.
+    // New group draft follows all document pills.
     const dropBody = el("div", "zone draft");
     dropBody.id = "draft";
     draft.forEach(id => dropBody.appendChild(pill(all[id])));
     if (!draft.length) dropBody.appendChild(el("div", "empty", "Drag records here from any document."));
     sortable(dropBody);
-    const right = el("div");
-    right.style.display = "flex";
-    right.style.flexDirection = "column";
-    right.style.gap = "14px";
-    right.style.alignSelf = "stretch";
-    right.appendChild(panel("Group Values", draft.length, dropBody));
+    const draftPanel = panel("Group Values", draft.length, dropBody);
+    const createForm = el("div", "new-group-form");
+    const groupNameInput = el("input");
+    groupNameInput.type = "text";
+    groupNameInput.maxLength = 120;
+    groupNameInput.placeholder = "Group name (e.g. Driver Name)";
+    groupNameInput.setAttribute("aria-label", "New group name");
+    groupNameInput.value = newGroupName;
+    groupNameInput.addEventListener("input", () => { newGroupName = groupNameInput.value; });
+    const createButton = el("button", null, "Save group");
+    createButton.type = "button";
+    createButton.disabled = draft.length === 0;
+    createButton.addEventListener("click", () => {
+      newGroupName = groupNameInput.value;
+      emitAction("create_group", null, null, {name: newGroupName, fact_ids: draftIds()});
+    });
+    createForm.append(groupNameInput, createButton);
+    draftPanel.appendChild(createForm);
 
-    const groups = args.groups || [];
+    const groups = currentArgs.groups || [];
     const groupBody = el("div", "groups");
+    groupBody.id = "group-list";
     if (!groups.length) groupBody.appendChild(el("div", "empty", "No saved groups yet."));
     groups.forEach(group => {
       const details = el("details", "group");
+      details.dataset.groupId = group.id;
+      details.open = expandedGroups.has(group.id);
+      details.addEventListener("toggle", () => {
+        if (details.open) expandedGroups.add(group.id); else expandedGroups.delete(group.id);
+      });
       const summary = el("summary");
+      summary.classList.add("group-summary");
       summary.style.background = groupColour(group.id);
-      summary.appendChild(el("span", null, group.name));
+      const title = el("span", "group-title");
+      title.appendChild(el("span", null, group.name));
+      const renameToggle = el("button", "rename-toggle", "✎");
+      renameToggle.type = "button";
+      renameToggle.title = "Rename group";
+      renameToggle.setAttribute("aria-label", "Rename group");
+      renameToggle.addEventListener("click", event => {
+        event.preventDefault(); event.stopPropagation();
+        expandedGroups.add(group.id);
+        if (renamingGroups.has(group.id)) renamingGroups.delete(group.id);
+        else { renamingGroups.add(group.id); renameDrafts.set(group.id, group.name); }
+        render(currentArgs);
+      });
+      title.appendChild(renameToggle);
+      summary.appendChild(title);
       summary.appendChild(el("small", null, "primary: " + (group.primary || "—") + "  ·  " + group.members.length + " record(s)"));
       details.appendChild(summary);
+      if (renamingGroups.has(group.id)) {
+        const tools = el("div", "group-tools");
+        const nameInput = el("input");
+        nameInput.type = "text";
+        nameInput.maxLength = 120;
+        nameInput.value = renameDrafts.get(group.id) ?? group.name;
+        nameInput.setAttribute("aria-label", "Group name");
+        nameInput.addEventListener("input", () => renameDrafts.set(group.id, nameInput.value));
+        const saveName = el("button", null, "Save");
+        saveName.type = "button";
+        saveName.addEventListener("click", event => {
+          event.preventDefault(); event.stopPropagation();
+          renamingGroups.delete(group.id);
+          renameDrafts.delete(group.id);
+          emitAction("rename_group", group.id, null, {name: nameInput.value});
+        });
+        tools.append(nameInput, saveName);
+        details.appendChild(tools);
+      }
+      details.appendChild(el("div", "reorder-hint", "Drag the handle to set occurrence priority. First is primary."));
       const members = el("div", "members");
       group.members.forEach(m => {
         const row = el("div", "member");
-        row.appendChild(el("div", null, m.label + "  =  " + m.value));
-        row.appendChild(el("small", null, m.document + "  ·  confidence " + m.score + "%"));
+        row.dataset.id = m.id;
+        row.appendChild(el("span", "reorder-handle", "⠿"));
+        row.lastChild.title = "Drag to change priority";
+        row.appendChild(el("div", "member-label", m.label));
+        row.appendChild(el("div", "member-value", m.value));
+        row.appendChild(el("div", "member-meta", m.document + " · confidence " + m.score + "%"));
+        const remove = el("button", "remove-member", "Remove");
+        remove.type = "button";
+        remove.title = "Return this occurrence to its document; keep Main Metadata";
+        remove.addEventListener("click", () => emitAction("remove_member", group.id, m.id));
+        row.appendChild(remove);
         members.appendChild(row);
       });
       details.appendChild(members);
+      sortableMembers(members, group.id);
+      const target = el("div", "group-zone");
+      target.dataset.groupId = group.id;
+      target.dataset.document = "group-" + group.id;
+      sortable(target);
+      details.appendChild(target);
+      if (pendingInlineDelete === group.id) {
+        const confirm = el("div", "inline-delete-confirm");
+        confirm.appendChild(el("span", null, `Delete “${group.name}”? Its occurrences return to their documents; Main Metadata stays unchanged.`));
+        const actions = el("div", "actions");
+        const cancel = el("button", null, "Cancel");
+        cancel.type = "button";
+        cancel.addEventListener("click", () => { pendingInlineDelete = null; render(currentArgs); });
+        const confirmDelete = el("button", "confirm-delete", "Delete group");
+        confirmDelete.type = "button";
+        confirmDelete.addEventListener("click", () => {
+          pendingInlineDelete = null;
+          emitAction("delete_group", group.id, null);
+        });
+        actions.append(cancel, confirmDelete);
+        confirm.appendChild(actions);
+        details.appendChild(confirm);
+      } else {
+        const deleteButton = el("button", "inline-delete", "Delete group");
+        deleteButton.type = "button";
+        deleteButton.addEventListener("click", event => {
+          event.preventDefault(); event.stopPropagation();
+          pendingInlineDelete = group.id;
+          expandedGroups.add(group.id);
+          render(currentArgs);
+        });
+        details.appendChild(deleteButton);
+      }
       groupBody.appendChild(details);
     });
     const groupsPanel = panel("Grouped Values", groups.length || undefined, groupBody);
-    groupsPanel.style.flex = "1 1 auto";
-    right.appendChild(groupsPanel);
-
-    root.appendChild(left);
-    root.appendChild(right);
+    groupsPanel.insertBefore(el("div", "groups-help", "Expand a group to inspect, rename, reorder, remove, or add occurrences. The first occurrence sets its primary label."), groupBody);
+    const topRow = el("div", "top-row");
+    topRow.appendChild(left);
+    topRow.appendChild(draftPanel);
+    root.appendChild(topRow);
+    root.appendChild(groupsPanel);
+    const trashBody = el("div", "trash-zone", "♲  Drag a saved group here to delete it");
+    const trashPanel = panel("Trash", undefined, trashBody);
+    trashPanel.classList.add("trash-panel");
+    if (pendingTrashGroup) {
+      const pending = groups.find(group => group.id === pendingTrashGroup);
+      const confirm = el("div", "trash-confirm");
+      confirm.appendChild(el("span", null, pending
+        ? `Delete “${pending.name}”? Its occurrences will return to their documents; Main Metadata stays unchanged.`
+        : "Delete this group? Its occurrences will return to their documents; Main Metadata stays unchanged."));
+      const actions = el("div", "actions");
+      const cancel = el("button", null, "Cancel");
+      cancel.type = "button";
+      cancel.addEventListener("click", () => { pendingTrashGroup = null; render(currentArgs); });
+      const remove = el("button", "confirm-delete", "Delete group");
+      remove.type = "button";
+      remove.addEventListener("click", () => {
+        const groupId = pendingTrashGroup;
+        pendingTrashGroup = null;
+        emitAction("delete_group", groupId, null);
+      });
+      actions.append(cancel, remove);
+      confirm.appendChild(actions);
+      trashPanel.appendChild(confirm);
+    }
+    root.appendChild(trashPanel);
+    installGroupTrashDrag(groupBody, trashBody);
     requestAnimationFrame(fitHeight);
   }
 

@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS value_groups (
 CREATE TABLE IF NOT EXISTS value_group_members (
     group_id TEXT NOT NULL REFERENCES value_groups(id) ON DELETE CASCADE,
     fact_id TEXT NOT NULL UNIQUE REFERENCES facts(id) ON DELETE CASCADE,
+    priority INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (group_id, fact_id)
 );
 CREATE INDEX IF NOT EXISTS idx_value_groups_name ON value_groups(name);
@@ -49,23 +50,6 @@ def primary_member(members: Iterable[GroupMember]) -> Optional[GroupMember]:
     if not members:
         return None
     return min(members, key=lambda m: (-m.confidence_score, m.fact_id))
-
-
-def set_primary_member(conn: sqlite3.Connection, docket_id: str, group_id: str,
-                       fact_id: Optional[str]) -> None:
-    """Save a manual primary choice, or clear it to use confidence ordering."""
-    _owned_group(conn, docket_id, group_id)
-    if fact_id is not None:
-        row = conn.execute(
-            """SELECT 1 FROM value_group_members m JOIN facts f ON f.id = m.fact_id
-               WHERE m.group_id = ? AND m.fact_id = ? AND f.review_status != 'rejected'
-                 AND f.concept != 'page_processing_status'""",
-            (group_id, fact_id),
-        ).fetchone()
-        if row is None:
-            raise GroupError("Choose a current, non-rejected member of this group.")
-    conn.execute("UPDATE value_groups SET primary_fact_id = ?, updated_at = ? WHERE id = ?",
-                 (fact_id, _now(), group_id))
 
 
 def _now() -> str:
@@ -139,8 +123,8 @@ def create_group(conn: sqlite3.Connection, docket_id: str, name: str, fact_ids: 
     except sqlite3.IntegrityError as exc:
         raise GroupError(f"A group named “{name}” already exists.") from exc
     conn.executemany(
-        "INSERT INTO value_group_members (group_id, fact_id) VALUES (?, ?)",
-        [(group_id, fact_id) for fact_id in ids],
+        "INSERT INTO value_group_members (group_id, fact_id, priority) VALUES (?, ?, ?)",
+        [(group_id, fact_id, index) for index, fact_id in enumerate(ids)],
     )
     return group_id
 
@@ -155,8 +139,8 @@ def replace_members(conn: sqlite3.Connection, docket_id: str, group_id: str, fac
     _check_not_grouped(conn, ids, except_group=group_id)
     conn.execute("DELETE FROM value_group_members WHERE group_id = ?", (group_id,))
     conn.executemany(
-        "INSERT INTO value_group_members (group_id, fact_id) VALUES (?, ?)",
-        [(group_id, fact_id) for fact_id in ids],
+        "INSERT INTO value_group_members (group_id, fact_id, priority) VALUES (?, ?, ?)",
+        [(group_id, fact_id, index) for index, fact_id in enumerate(ids)],
     )
     conn.execute(
         "UPDATE value_groups SET primary_fact_id = NULL WHERE id = ? AND primary_fact_id IS NOT NULL "
@@ -164,6 +148,60 @@ def replace_members(conn: sqlite3.Connection, docket_id: str, group_id: str, fac
         (group_id, group_id),
     )
     conn.execute("UPDATE value_groups SET updated_at = ? WHERE id = ?", (_now(), group_id))
+
+
+def add_member(conn: sqlite3.Connection, docket_id: str, group_id: str, fact_id: str) -> None:
+    """Add one occurrence to an existing group without changing other membership."""
+    _owned_group(conn, docket_id, group_id)
+    _check_facts(conn, docket_id, [fact_id])
+    if conn.execute("SELECT 1 FROM value_group_members WHERE group_id = ? AND fact_id = ?",
+                    (group_id, fact_id)).fetchone():
+        return
+    _check_not_grouped(conn, [fact_id], except_group=group_id)
+    priority = conn.execute(
+        "SELECT COALESCE(MAX(priority), -1) + 1 FROM value_group_members WHERE group_id = ?",
+        (group_id,),
+    ).fetchone()[0]
+    conn.execute("INSERT INTO value_group_members (group_id, fact_id, priority) VALUES (?, ?, ?)",
+                 (group_id, fact_id, priority))
+    conn.execute("UPDATE value_groups SET updated_at = ? WHERE id = ?", (_now(), group_id))
+
+
+def reorder_members(conn: sqlite3.Connection, docket_id: str, group_id: str,
+                    fact_ids: Iterable[str]) -> None:
+    """Persist the visible occurrence order; its first member is the primary label."""
+    _owned_group(conn, docket_id, group_id)
+    ids = _clean_ids(fact_ids)
+    rows = conn.execute(
+        """SELECT m.fact_id FROM value_group_members m JOIN facts f ON f.id = m.fact_id
+           WHERE m.group_id = ? AND f.review_status != 'rejected'
+             AND f.concept != 'page_processing_status'""",
+        (group_id,),
+    ).fetchall()
+    visible = {row[0] for row in rows}
+    if len(ids) != len(visible) or set(ids) != visible:
+        raise GroupError("Group membership changed while reordering. Refresh and try again.")
+    conn.executemany(
+        "UPDATE value_group_members SET priority = ? WHERE group_id = ? AND fact_id = ?",
+        [(index, group_id, fact_id) for index, fact_id in enumerate(ids)],
+    )
+    conn.execute("UPDATE value_groups SET primary_fact_id = ?, updated_at = ? WHERE id = ?",
+                 (ids[0] if ids else None, _now(), group_id))
+
+
+def remove_member(conn: sqlite3.Connection, docket_id: str, group_id: str, fact_id: str) -> None:
+    """Remove one occurrence from a group; the underlying fact remains untouched."""
+    _owned_group(conn, docket_id, group_id)
+    cursor = conn.execute(
+        "DELETE FROM value_group_members WHERE group_id = ? AND fact_id = ?",
+        (group_id, fact_id),
+    )
+    if cursor.rowcount == 0:
+        raise GroupError("That occurrence is no longer in this group. Refresh and try again.")
+    conn.execute(
+        "UPDATE value_groups SET primary_fact_id = NULL, updated_at = ? "
+        "WHERE id = ? AND primary_fact_id = ?", (_now(), group_id, fact_id),
+    )
 
 
 def rename_group(conn: sqlite3.Connection, docket_id: str, group_id: str, name: str) -> None:
@@ -177,21 +215,12 @@ def rename_group(conn: sqlite3.Connection, docket_id: str, group_id: str, name: 
         raise GroupError(f"A group named “{name}” already exists.") from exc
 
 
-def merge_groups(conn: sqlite3.Connection, docket_id: str, target_id: str, source_id: str) -> None:
-    """Move every record from source into target, then delete source. No record is lost."""
-    if target_id == source_id:
-        raise GroupError("Choose two different groups to merge.")
-    _owned_group(conn, docket_id, target_id)
-    _owned_group(conn, docket_id, source_id)
-    conn.execute("UPDATE value_group_members SET group_id = ? WHERE group_id = ?",
-                 (target_id, source_id))
-    conn.execute("DELETE FROM value_groups WHERE id = ?", (source_id,))
-    conn.execute("UPDATE value_groups SET updated_at = ? WHERE id = ?", (_now(), target_id))
-
-
 def delete_group(conn: sqlite3.Connection, docket_id: str, group_id: str) -> None:
     """Delete a group. Its records are ungrouped, not deleted, and reappear in their documents."""
     _owned_group(conn, docket_id, group_id)
+    # Explicitly ungroup first; this also behaves correctly on legacy/test connections
+    # that have not enabled SQLite's foreign-key cascade pragma.
+    conn.execute("DELETE FROM value_group_members WHERE group_id = ?", (group_id,))
     conn.execute("DELETE FROM value_groups WHERE id = ?", (group_id,))
 
 
@@ -215,7 +244,10 @@ def load_groups(conn: sqlite3.Connection, docket_id: str) -> List[dict]:
                JOIN documents d ON d.id = f.document_id
                WHERE m.group_id = ? AND f.review_status != 'rejected'
                  AND f.concept != 'page_processing_status'
-               ORDER BY d.filename, f.page_number, f.created_at""",
+               ORDER BY m.priority,
+                 CASE WHEN f.id = (SELECT primary_fact_id FROM value_groups WHERE id = m.group_id)
+                      THEN 0 ELSE 1 END,
+                 f.confidence_score DESC, d.filename, f.page_number, f.created_at, f.id""",
             (group["id"],),
         ).fetchall()
         members = [
@@ -223,17 +255,13 @@ def load_groups(conn: sqlite3.Connection, docket_id: str) -> List[dict]:
                         int(r["confidence_score"]))
             for r in rows
         ]
-        primary = next((member for member in members
-                        if member.fact_id == group["primary_fact_id"]), None)
-        if primary is None:
-            primary = primary_member(members)
+        primary = members[0] if members else None
         result.append({
             "id": group["id"],
             "name": group["name"],
             "members": members,
             "primary_label": primary.label if primary else "",
             "primary_fact_id": primary.fact_id if primary else None,
-            "manual_primary": bool(primary and group["primary_fact_id"] == primary.fact_id),
         })
     return result
 

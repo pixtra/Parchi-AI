@@ -6,10 +6,12 @@ from unittest.mock import patch
 import app
 from value_groups import (
     VALUE_GROUP_SCHEMA,
+    add_member,
     create_group,
+    delete_group,
     load_groups,
-    replace_members,
-    set_primary_member,
+    remove_member,
+    reorder_members,
 )
 
 
@@ -95,19 +97,41 @@ class GroupPriorityTests(unittest.TestCase):
     def tearDown(self):
         self.db.close()
 
-    def test_manual_primary_overrides_confidence_and_survives_reload(self):
-        set_primary_member(self.db, "dock", self.group_id, "f2")
+    def test_saved_occurrence_order_overrides_confidence_and_survives_reload(self):
+        reorder_members(self.db, "dock", self.group_id, ["f2", "f1"])
         group = load_groups(self.db, "dock")[0]
         self.assertEqual(group["primary_fact_id"], "f2")
         self.assertEqual(group["primary_label"], "Driver Name")
-        self.assertTrue(group["manual_primary"])
+        self.assertEqual([m.fact_id for m in group["members"]], ["f2", "f1"])
 
-    def test_removed_manual_primary_resets_to_confidence_choice(self):
-        set_primary_member(self.db, "dock", self.group_id, "f2")
-        replace_members(self.db, "dock", self.group_id, ["f1"])
+    def test_reorder_requires_exact_current_membership(self):
+        with self.assertRaises(ValueError):
+            reorder_members(self.db, "dock", self.group_id, ["f1"])
+        self.assertEqual([m.fact_id for m in load_groups(self.db, "dock")[0]["members"]],
+                         ["f1", "f2"])
+
+    def test_removing_first_member_preserves_remaining_order(self):
+        reorder_members(self.db, "dock", self.group_id, ["f2", "f1"])
+        remove_member(self.db, "dock", self.group_id, "f2")
         group = load_groups(self.db, "dock")[0]
         self.assertEqual(group["primary_fact_id"], "f1")
-        self.assertFalse(group["manual_primary"])
+        self.assertEqual(group["primary_label"], "Driver")
+
+    def test_add_and_remove_change_one_occurrence_without_deleting_fact(self):
+        self.db.execute("INSERT INTO documents VALUES ('d3', 'three.pdf')")
+        self.db.execute("INSERT INTO facts VALUES ('f3','dock','d3','Driver','A',70,'pending','driver',1,'3')")
+        add_member(self.db, "dock", self.group_id, "f3")
+        remove_member(self.db, "dock", self.group_id, "f1")
+        members = {member.fact_id for member in load_groups(self.db, "dock")[0]["members"]}
+        self.assertEqual(members, {"f2", "f3"})
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM facts WHERE id = 'f1'").fetchone()[0], 1)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM facts WHERE id = 'f3'").fetchone()[0], 1)
+
+    def test_deleting_group_keeps_facts_and_ungroups_all_occurrences(self):
+        delete_group(self.db, "dock", self.group_id)
+        self.assertEqual(load_groups(self.db, "dock"), [])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM facts").fetchone()[0], 2)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM value_group_members").fetchone()[0], 0)
 
 
 if __name__ == "__main__":
