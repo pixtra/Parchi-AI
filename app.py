@@ -783,13 +783,17 @@ def fetch_facts(docket_id: str) -> List[sqlite3.Row]:
 
 
 def fetch_metadata(docket_id: str) -> List[sqlite3.Row]:
+    """Every extracted occurrence in the docket, whatever its review status.
+
+    Main Metadata is the canonical dataset: pending, approved and rejected records are all
+    included (spec §6.2) and exports must never silently drop records by review status.
+    Only internal bookkeeping rows (page processing status) are excluded."""
     with connect() as connection:
         return connection.execute(
             """SELECT d.filename AS document_name, f.label AS label, f.value AS value,
-                      f.confidence_score AS confidence_score
+                      f.confidence_score AS confidence_score, f.review_status AS review_status
                FROM facts f JOIN documents d ON d.id = f.document_id
-               WHERE f.docket_id = ? AND f.review_status != 'rejected'
-                 AND f.concept != 'page_processing_status'
+               WHERE f.docket_id = ? AND f.concept != 'page_processing_status'
                ORDER BY d.filename, f.page_number, f.created_at""",
             (docket_id,),
         ).fetchall()
@@ -1847,7 +1851,11 @@ def prepare_document(docket_id: str, filename: str, data: bytes, mode: str) -> T
 
 def finalize_document(docket_id: str, doc: Dict[str, Any], status: str,
                       document_type: str, items: List[Dict[str, Any]]) -> int:
-    """Save all facts and return the number persisted for this document."""
+    """Save all facts and return the number persisted for this document.
+
+    Facts from an earlier extraction of the same document are deleted first, inside the
+    same transaction, so a failed save rolls back and leaves the previous extraction —
+    and its review history — untouched."""
     now = utc_now()
     # Pages/sheets the extractor actually returned at least one fact for. A page with no
     # text layer (e.g. an image, vision-only) can still land here once Gemini reads it -
@@ -1873,6 +1881,9 @@ def finalize_document(docket_id: str, doc: Dict[str, Any], status: str,
     else:
         completeness_message = "Some parts were not extracted by Gemini; see the processing message."
     with connect() as connection:
+        # Replace-on-success: drop any earlier extraction of this document (its history
+        # cascades) before inserting the new facts, all in one transaction.
+        connection.execute("DELETE FROM facts WHERE document_id = ?", (doc["id"],))
         for item in items:
             page_number = min(max(1, item["page_number"]), doc["page_count"])
             value = clean_text(item["value"])
@@ -2074,6 +2085,12 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
         set_document_status(doc["id"], "saving")
         try:
             fact_count = finalize_document(docket_id, doc, status, doc_type, items)
+            # Decisions captured when the document was queued are restored onto the fresh
+            # extraction where label and value still match; unmatched decisions lapse.
+            carried = reapply_review_decisions(doc["id"], doc.get("previous_decisions") or [])
+            if carried:
+                LOG.info("carried %d review decision(s) onto re-extracted facts of %s",
+                         carried, doc["filename"])
             finalized.add(doc["id"])
             return {
                 "filename": doc["filename"],
@@ -2392,16 +2409,79 @@ def load_saved_document(docket_id: str, document_id: str) -> Tuple[Optional[Dict
     return document, None
 
 
-def clear_document_facts(document_id: str) -> None:
-    """Re-processing replaces the document's earlier extraction: drop its facts
-    (fact_history cascades) and reset its completeness counters first."""
+def capture_review_decisions(document_id: str) -> List[Dict[str, Any]]:
+    """Snapshot every human review decision on a document's facts before re-extraction.
+
+    A decision is a fact the user corrected and/or approved or rejected. The snapshot is
+    keyed by label and value so it can be re-applied to re-extracted occurrences; the
+    document's facts themselves are NOT deleted here — they stay visible and are only
+    replaced when the new extraction actually succeeds (see finalize_document)."""
     with connect() as connection:
-        connection.execute("DELETE FROM facts WHERE document_id = ?", (document_id,))
-        connection.execute(
-            """UPDATE documents SET processed_units = 0, failed_units = 0,
-               completeness_status = 'pending', completeness_message = '' WHERE id = ?""",
+        rows = connection.execute(
+            """SELECT label, value, original_value, review_status, corrected
+               FROM facts
+               WHERE document_id = ?
+                 AND concept != 'page_processing_status'
+                 AND (review_status IN ('approved', 'rejected') OR corrected = 1)""",
             (document_id,),
-        )
+        ).fetchall()
+    return [
+        {
+            "label": row["label"],
+            "value": row["value"],
+            "original_value": row["original_value"],
+            "review_status": row["review_status"],
+            "corrected": int(row["corrected"]),
+        }
+        for row in rows
+    ]
+
+
+def reapply_review_decisions(document_id: str, decisions: List[Dict[str, Any]]) -> int:
+    """Carry queued review decisions onto re-extracted facts where they still match.
+
+    Matching is by normalized label plus value: a decision applies when the re-extracted
+    value equals the value the user decided on, or (for a human-corrected fact) equals the
+    original extraction the user corrected. Matching occurrences get the decided status
+    (and the corrected value, if the user had edited it). Extracted confidence scores are
+    never changed. Returns the number of facts updated."""
+    applicable = [d for d in decisions if d.get("review_status") in ("approved", "rejected")]
+    if not applicable:
+        return 0
+    with connect() as connection:
+        facts = connection.execute(
+            """SELECT id, label, value FROM facts
+               WHERE document_id = ? AND concept != 'page_processing_status'""",
+            (document_id,),
+        ).fetchall()
+        now = utc_now()
+        applied = 0
+        for fact in facts:
+            fact_label = normalize_label(fact["label"])
+            for decision in applicable:
+                if normalize_label(decision["label"]) != fact_label:
+                    continue
+                final_value = fact["value"]
+                if decision["value"] != final_value:
+                    if not (decision["corrected"] and decision["original_value"] == final_value):
+                        continue
+                    # The user had edited this extraction; restore their correction.
+                    final_value = decision["value"]
+                connection.execute(
+                    """UPDATE facts SET value = ?, corrected = ?, review_status = ?, updated_at = ?
+                       WHERE id = ?""",
+                    (final_value, int(decision["corrected"]), decision["review_status"], now,
+                     fact["id"]),
+                )
+                connection.execute(
+                    """INSERT INTO fact_history (id, fact_id, old_value, new_value, old_status,
+                       new_status, changed_at, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (str(uuid.uuid4()), fact["id"], fact["value"], final_value, "pending",
+                     decision["review_status"], now,
+                     "review carried over from the previous extraction (retry)"),
+                )
+                applied += 1
+    return applied
 
 
 JOB_RETENTION_SECONDS = 3600
@@ -2444,8 +2524,10 @@ def queue_saved_documents(docket_id: str, document_ids: List[str]) -> Tuple[int,
             set_document_status(row["id"], "failed")
             results.append(job_result(row["filename"], "failed", problem))
             continue
-        clear_document_facts(row["id"])
         set_document_status(row["id"], "queued")
+        # Snapshot review decisions now; the document's existing facts stay in place until
+        # its new extraction succeeds (finalize_document replaces them transactionally).
+        document["previous_decisions"] = capture_review_decisions(row["id"])
         payloads.append({"filename": row["filename"], "data": document["data"], "document": document})
     if not payloads:
         queue_flash("info", "No queued documents to start on.")
@@ -2726,6 +2808,23 @@ def metadata_records(docket_id: str) -> List[dict]:
             "label": row["label"],
             "value": row["value"],
             "confidence_score": int(row["confidence_score"]),
+        }
+        for row in fetch_metadata(docket_id)
+    ]
+
+
+def viewer_metadata_records(docket_id: str) -> List[dict]:
+    """Main Metadata rows for the Viewer table, plus each record's review status.
+
+    The record set is identical to the exports — nothing is filtered by review status.
+    The review status column is display-only traceability and is never exported."""
+    return [
+        {
+            "document_name": row["document_name"],
+            "label": row["label"],
+            "value": row["value"],
+            "confidence_score": int(row["confidence_score"]),
+            "review_status": row["review_status"],
         }
         for row in fetch_metadata(docket_id)
     ]
@@ -3803,9 +3902,13 @@ def confidence_score_style(value: object) -> str:
 VIEWER_COLUMNS = ["Document Name", "Label", "Value", "Confidence Score"]
 
 
-def viewer_frame(rows: List[dict]) -> None:
+def viewer_frame(rows: List[dict], show_status: bool = False) -> None:
     """Render metadata records with stable, human-readable headers (never raw
-    snake_case keys) and colour-coded confidence cells."""
+    snake_case keys) and colour-coded confidence cells.
+
+    `show_status` adds a Review Status column (display-only traceability); it is never
+    part of the exported four-field schema."""
+    columns = VIEWER_COLUMNS + (["Review Status"] if show_status else [])
     frame = pd.DataFrame(
         [
             {
@@ -3813,10 +3916,11 @@ def viewer_frame(rows: List[dict]) -> None:
                 "Label": record["label"],
                 "Value": record["value"],
                 "Confidence Score": clamp_confidence(record["confidence_score"], 50),
+                "Review Status": record.get("review_status", ""),
             }
             for record in rows
         ],
-        columns=VIEWER_COLUMNS,
+        columns=columns,
     )
     st.dataframe(
         frame.style.map(confidence_score_style, subset=["Confidence Score"]),
@@ -3862,9 +3966,10 @@ def page_viewer(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
     )
 
     if selected_view == "Main Metadata":
-        rows = metadata
-        st.caption(f"All extracted records · {len(rows)} row(s), including duplicates and "
-                   "conflicting values.")
+        rows = viewer_metadata_records(docket_id)
+        st.caption(f"All extracted records · {len(rows)} row(s), including duplicates, "
+                   "conflicting values, and pending or rejected records. Manage review "
+                   "statuses in the Review tab.")
     else:
         template_names = [template["name"] for template in templates]
         selected_name = st.selectbox("Client template", template_names, key="viewer_template")
@@ -3893,7 +3998,7 @@ def page_viewer(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
         st.caption(f"Mapped records · {len(rows)} row(s); duplicate and conflicting values each "
                    "remain a separate row with its own document name and confidence score.")
 
-    viewer_frame(rows)
+    viewer_frame(rows, show_status=(selected_view == "Main Metadata"))
 
 
 def page_validation(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
