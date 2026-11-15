@@ -4211,11 +4211,16 @@ def _render_grouping(active: sqlite3.Row) -> None:
         reset=int(st.session_state.get("vg_reset", 0)),
         key=f"vg_board_{docket_id}",
     )
-    draft = list((result or {}).get("draft") or [])
+    # The component keeps its last value after a save, so drop anything that is no longer
+    # ungrouped. Otherwise saved records linger in the count and can be "saved" twice.
+    still_free = {item["id"] for item in flat}
+    draft = [str(i) for i in dict.fromkeys((result or {}).get("draft") or []) if i in still_free]
 
     draft_col, save_col = st.columns([3, 1], vertical_alignment="bottom")
+    # The field gets a new key after each save, so it always starts empty.
+    name_seq = int(st.session_state.get("vg_name_seq", 0))
     group_name = draft_col.text_input(
-        "Group name", key=f"vg_name_{docket_id}",
+        "Group name", key=f"vg_name_{docket_id}_{name_seq}",
         placeholder="e.g. Driver Name",
         help="A short name for the information these records have in common.",
     )
@@ -4231,7 +4236,7 @@ def _render_grouping(active: sqlite3.Row) -> None:
                 st.error(str(exc), icon="🚫")
             else:
                 st.session_state["vg_reset"] = int(st.session_state.get("vg_reset", 0)) + 1
-                st.session_state.pop(f"vg_name_{docket_id}", None)
+                st.session_state["vg_name_seq"] = name_seq + 1
                 queue_flash("success", f"Saved group “{' '.join(str(group_name).split())}”. "
                             "Its records stay in Main Metadata untouched.")
                 st.rerun()
@@ -4278,13 +4283,16 @@ def _render_group_management(active: sqlite3.Row, groups: List[dict],
                 st.rerun()
         st.caption("Renaming never changes the records inside the group.")
 
+        # Keys include the current membership: once records are added or removed the old
+        # selections are no longer valid options, so the pickers must start empty again.
+        membership_key = key_id(",".join(sorted(current_ids)))
         remove_pick = st.multiselect(
             "Remove records from this group", options=current_ids,
-            format_func=member_display.get, key=f"vg_remove_{group['id']}",
+            format_func=member_display.get, key=f"vg_remove_{group['id']}_{membership_key}",
         )
         add_pick = st.multiselect(
             "Add records from the ungrouped pool", options=list(ungrouped_display),
-            format_func=ungrouped_display.get, key=f"vg_add_{group['id']}",
+            format_func=ungrouped_display.get, key=f"vg_add_{group['id']}_{membership_key}",
         )
         if st.button("Apply member changes", key=f"vg_members_btn_{group['id']}"):
             target_ids = [i for i in current_ids if i not in remove_pick] + add_pick

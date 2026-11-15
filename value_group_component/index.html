@@ -4,90 +4,79 @@
 <meta charset="utf-8">
 <script src="sortable.min.js"></script>
 <style>
-  /* Design tokens copied from the app's inject_css so the board reads as one surface,
-     not a second style merged into the page. */
+  /* Same tokens as the app's inject_css, so the board is part of the page, not a widget. */
   :root {
     color-scheme: dark;
     --bg:#10141b; --panel:#171c25; --panel2:#1e2430; --line:#2c3545;
-    --ink:#eef2f8; --muted:#a4afc1; --accent:#6c8cff; --accent-strong:#4f71f0;
-    --warn:#f2c46d; --ok:#4fd6a8; --bad:#ff8585;
+    --ink:#eef2f8; --muted:#a4afc1; --accent:#6c8cff; --warn:#f2c46d; --ok:#4fd6a8;
   }
-  html, body { margin: 0; }
-  body { font: 14px/1.45 "Source Sans Pro", -apple-system, "Segoe UI", system-ui, sans-serif;
-         color: var(--ink); background: transparent; }
-  #root { padding: 2px 2px 6px; box-sizing: border-box; }
-  /* The document list scrolls INSIDE a capped area; the Group Values dock is a sibling
-     below it (never sticky, never scrolls), so it is reachable and visible from every
-     document, and labels slide behind it as they scroll up. */
-  .scroll { max-height: 470px; overflow-y: auto; padding: 0 2px 4px;
-            scrollbar-width: thin; scrollbar-color: var(--line) transparent;
-            -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 22px), transparent);
-            mask-image: linear-gradient(to bottom, #000 calc(100% - 22px), transparent); }
-  h4 { margin: 12px 0 8px; font-size: 13px; font-weight: 700; color: var(--ink); letter-spacing: .01em; }
-  .doc { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-bottom: 10px;
-         background: rgba(23, 28, 37, .45); }
-  .doc-title { font-size: 12px; color: var(--muted); margin-bottom: 8px; overflow-wrap: anywhere; }
-  .zone { display: flex; flex-wrap: wrap; gap: 8px; min-height: 48px; align-items: flex-start;
-          border: 1.5px dashed #3a465c; border-radius: 10px; padding: 10px 12px;
-          background: rgba(16, 20, 27, .35);
-          transition: border-color .12s, background .12s, box-shadow .12s; }
-  .zone.drag-target { border-color: var(--accent); background: rgba(108, 140, 255, .08); }
-  .zone.drag-over { border-color: var(--warn); background: rgba(242, 196, 109, .13);
-                    box-shadow: inset 0 0 0 1px var(--warn); }
-  .dock { position: relative; z-index: 5; margin: -14px 6px 12px;
-          background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
-          padding: 10px 12px 12px; box-shadow: 0 -10px 22px rgba(0, 0, 0, .5), 0 6px 18px rgba(0, 0, 0, .35); }
-  .dock h4 { margin-top: 0; }
-  .zone.draft { border-color: var(--warn); background: rgba(242, 196, 109, .05); min-height: 76px; }
-  .pill { display: inline-flex; align-items: center; gap: 7px; max-width: 100%; box-sizing: border-box;
-          border: 1px solid var(--accent); border-radius: 999px; padding: 7px 12px; min-height: 30px;
-          background: var(--panel2); color: var(--ink); cursor: grab; user-select: none; touch-action: none; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: transparent; }
+  body { font: 14px/1.45 "Source Sans Pro", -apple-system, "Segoe UI", system-ui, sans-serif; color: var(--ink); }
+
+  .board { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 14px; align-items: start; }
+  @media (max-width: 760px) { .board { grid-template-columns: minmax(0, 1fr); } }
+
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px; min-width: 0; }
+  .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+  .panel-head h3 { margin: 0; font-size: 13.5px; font-weight: 700; }
+  .count { font-size: 11.5px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 2px 9px; white-space: nowrap; }
+  .hint { color: var(--muted); font-size: 12.5px; margin: 2px 0 8px; }
+
+  /* The document list scrolls inside its own panel. Nothing overlaps: every panel is in flow. */
+  .docs-scroll { max-height: 460px; overflow-y: auto; padding-right: 4px; scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+  .doc { border: 1px solid var(--line); border-radius: 10px; padding: 10px; margin-bottom: 10px; background: var(--panel2); }
+  .doc-title { font-size: 12.5px; color: var(--muted); font-weight: 600; margin-bottom: 8px; overflow-wrap: anywhere; }
+
+  .zone { display: flex; flex-wrap: wrap; align-content: flex-start; gap: 8px; min-height: 48px;
+          border: 1.5px dashed #3a465c; border-radius: 10px; padding: 8px; background: rgba(16, 20, 27, .4);
+          transition: border-color .12s, background .12s; }
+  .zone.drag-target { border-color: var(--accent); }
+  .zone.drag-over { border-color: var(--warn); background: rgba(242, 196, 109, .08); }
+  .zone.draft { min-height: 110px; }
+
+  .pill { display: inline-flex; align-items: center; gap: 7px; max-width: 100%; min-height: 32px;
+          border: 1px solid var(--accent); border-radius: 999px; padding: 6px 12px; background: var(--panel2);
+          color: var(--ink); cursor: grab; user-select: none; -webkit-user-select: none; }
   .pill:active { cursor: grabbing; }
   .pill .lbl { font-weight: 600; white-space: nowrap; }
-  .pill .val { color: var(--muted); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis;
-               white-space: nowrap; max-width: 240px; }
+  .pill .val { color: var(--muted); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px; }
   .pill .score { font-size: 11px; color: #9db4ff; white-space: nowrap; }
   .draft .pill { border-color: var(--warn); }
-  .sortable-ghost { opacity: 0.35; }
-  .empty { color: var(--muted); font-size: 12.5px; padding: 6px 4px; width: 100%; }
-  .groups-list { max-height: 175px; overflow-y: auto; padding-right: 2px;
-                 scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
-  .group { margin-bottom: 6px; }
-  .group summary { list-style: none; cursor: pointer; display: inline-block; max-width: 100%;
-                   border-radius: 999px; padding: 7px 13px; color: #fff; font-weight: 600; }
-  .group summary::-webkit-details-marker { display: none; }
-  .members { margin: 6px 0 4px 4px; display: grid; gap: 4px; }
-  .member { border-left: 3px solid var(--muted); padding: 4px 8px; background: var(--panel2);
-            border-radius: 6px; overflow-wrap: anywhere; }
+  .pill.sortable-ghost { opacity: .35; }
+  .pill.sortable-drag { box-shadow: 0 8px 20px rgba(0,0,0,.45); }
+  .empty { color: var(--muted); font-size: 12.5px; padding: 4px 2px; }
+
+  .groups { display: flex; flex-direction: column; gap: 8px; max-height: 340px; overflow-y: auto; padding-right: 4px; scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+  details.group { border: 1px solid var(--line); border-radius: 10px; background: var(--panel2); overflow: hidden; }
+  details.group summary { list-style: none; cursor: pointer; padding: 9px 12px; color: #fff; font-weight: 600; display: flex; justify-content: space-between; gap: 8px; }
+  details.group summary::-webkit-details-marker { display: none; }
+  details.group summary small { font-weight: 500; opacity: .85; white-space: nowrap; }
+  .members { display: grid; gap: 6px; padding: 8px 10px 10px; }
+  .member { border-left: 3px solid var(--muted); padding: 5px 9px; background: var(--panel); border-radius: 6px; overflow-wrap: anywhere; }
   .member small { color: var(--muted); }
 </style>
 </head>
 <body>
-<div id="root"></div>
+<div class="board" id="root"></div>
 <script>
 (function () {
-  // Draft = the records dragged into Group Values. It lives here, in the component, so it
-  // survives Streamlit reruns. Python receives the full snapshot after every drop.
+  // Draft = records dragged into Group Values. It lives in this component so it survives
+  // Streamlit reruns. Every change sends the complete draft to Python.
   let draft = [];
   let lastReset = null;
   let lastSent = null;
-  // The pill currently under the pointer during a native drag, tracked so a drop that
-  // lands anywhere on the board (not exactly inside a zone) can still be routed to
-  // Group Values instead of being swallowed by the document.
-  let dragging = null;
 
   function send(type, data) {
     window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data), "*");
   }
-  function setHeight() {
-    // The frame grows with the groups section but is capped; the document list scrolls
-    // internally (.scroll max-height), so the iframe height stays stable while working.
-    send("streamlit:setFrameHeight", { height: Math.min(document.documentElement.scrollHeight, 680) });
+  function fitHeight() {
+    send("streamlit:setFrameHeight", { height: Math.ceil(document.body.scrollHeight) + 4 });
   }
   function el(tag, cls, text) {
     const node = document.createElement(tag);
     if (cls) node.className = cls;
-    if (text !== undefined) node.textContent = text;   // textContent: never interpret labels as HTML
+    if (text !== undefined) node.textContent = text;   // never interpret extracted text as HTML
     return node;
   }
   function pill(item) {
@@ -100,72 +89,64 @@
     p.appendChild(el("span", "score", item.score + "%"));
     return p;
   }
-  function colour(id) {
+  function groupColour(id) {
     let hue = 0;
     for (const ch of id) hue = (hue * 31 + ch.charCodeAt(0)) % 360;
-    return "hsl(" + hue + " 55% 32%)";
+    return "hsl(" + hue + " 45% 30%)";
+  }
+  function draftIds() {
+    return [...document.querySelectorAll("#draft .pill")].map(p => p.dataset.id);
   }
   function emit() {
-    const ids = [...document.querySelectorAll("#draft .pill")].map(p => p.dataset.id);
+    const ids = draftIds();
     draft = ids;
     const key = JSON.stringify(ids);
     if (key === lastSent) return;
     lastSent = key;
     send("streamlit:setComponentValue", { value: { draft: ids }, dataType: "json" });
   }
-  // Placeholder rule: a zone shows its hint ONLY while it holds zero pills. Sortable moves
-  // pills around without a re-render, so every mutation funnels through here.
-  function syncZone(zone) {
-    if (!zone) return;
-    const hasPill = zone.querySelector(":scope > .pill") !== null;
-    const hint = zone.querySelector(":scope > .empty");
-    if (hasPill) { if (hint) hint.remove(); return; }
-    if (!hint) zone.appendChild(el("div", "empty", zone.dataset.hint || ""));
-  }
-  function clearDragState() {
-    dragging = null;
-    document.querySelectorAll(".zone").forEach(z => {
-      z.classList.remove("drag-target", "drag-over");
-      syncZone(z);
-    });
-  }
-  function sortable(node) {
-    node.addEventListener("dragover", () => node.classList.add("drag-over"));
-    node.addEventListener("dragleave", (e) => {
-      if (!e.relatedTarget || !node.contains(e.relatedTarget)) node.classList.remove("drag-over");
-    });
-    new Sortable(node, {
+
+  // Sortable's group.put receives Sortable INSTANCES; the element is instance.el.
+  // Records may move between a document and Group Values, and back to their own document.
+  // They never move between two documents, and never get copied.
+  function sortable(zone) {
+    new Sortable(zone, {
       group: {
         name: "value-groups",
         pull: true,
-        // Document zones may only receive a pill back from Group Values when it
-        // belongs to that same document. They never accept another document's pills.
-        put: (to, from, dragEl) => to.id === "draft"
-          || to.dataset.document === dragEl.dataset.document,
+        put: (to, from, dragEl) => {
+          if (to.el.id === "draft") return true;
+          return to.el.dataset.document === dragEl.dataset.document;
+        },
       },
       draggable: ".pill",
-      animation: 150,
+      forceFallback: true,        // pointer-driven drag: identical in every browser, inside the iframe
+      fallbackTolerance: 3,
+      animation: 120,
       ghostClass: "sortable-ghost",
-      revertOnSpill: true,
-      // AutoScroll (bundled in sortable.min.js) lets a drag near the edge of a long
-      // document list scroll it — first-row-to-dock drags stay reachable.
+      dragClass: "sortable-drag",
       scroll: true,
-      bubbleScroll: true,
-      scrollSensitivity: 90,
-      scrollSpeed: 14,
-      onStart: (evt) => {
-        dragging = evt.item;
-        document.querySelectorAll(".zone").forEach(z => z.classList.add("drag-target"));
-      },
-      onEnd: (evt) => {
-        syncZone(evt.to);
-        syncZone(evt.from);
-        clearDragState();
+      scrollSensitivity: 60,
+      scrollSpeed: 12,
+      onStart: () => document.querySelectorAll(".zone").forEach(z => z.classList.add("drag-target")),
+      onEnd: () => {
+        document.querySelectorAll(".zone").forEach(z => z.classList.remove("drag-target", "drag-over"));
         emit();
       },
     });
+    zone.addEventListener("pointerenter", () => { if (document.querySelector(".sortable-drag")) zone.classList.add("drag-over"); });
+    zone.addEventListener("pointerleave", () => zone.classList.remove("drag-over"));
   }
-  document.addEventListener("dragend", clearDragState);
+
+  function panel(title, count, body) {
+    const box = el("section", "panel");
+    const head = el("div", "panel-head");
+    head.appendChild(el("h3", null, title));
+    if (count !== undefined) head.appendChild(el("span", "count", String(count)));
+    box.appendChild(head);
+    box.appendChild(body);
+    return box;
+  }
 
   function render(args) {
     const root = document.getElementById("root");
@@ -174,49 +155,51 @@
     const all = {};
     Object.values(docs).forEach(list => list.forEach(item => { all[item.id] = item; }));
 
-    // A save bumps `reset`, which clears the draft. Otherwise drop records that were grouped
-    // elsewhere, so the draft can never hold a record that is no longer ungrouped.
-    if (args.reset !== lastReset) { lastReset = args.reset; draft = []; }
+    // A save bumps `reset`: clear the draft and let the next drop send a fresh snapshot.
+    if (args.reset !== lastReset) { lastReset = args.reset; draft = []; lastSent = null; }
     draft = draft.filter(id => all[id]);
 
-    const scroll = el("div", "scroll");
-    scroll.appendChild(el("h4", null, "Documents"));
+    // Left column: ungrouped records, one zone per document.
+    const docsBody = el("div", "docs-scroll");
     const names = Object.keys(docs).sort((a, b) => a.localeCompare(b));
-    if (names.length === 0) scroll.appendChild(el("div", "empty", "No ungrouped records. Everything is in a group."));
+    if (!names.length) docsBody.appendChild(el("div", "empty", "No ungrouped records. Everything is grouped or rejected."));
     names.forEach(name => {
       const box = el("div", "doc");
       box.appendChild(el("div", "doc-title", name));
       const zone = el("div", "zone");
-      zone.dataset.document = docs[name][0] ? docs[name][0].document_id : "";
-      zone.dataset.hint = "All records here are grouped or in Group Values.";
+      zone.dataset.document = docs[name][0].document_id;
       docs[name].forEach(item => { if (!draft.includes(item.id)) zone.appendChild(pill(item)); });
-      syncZone(zone);
+      if (!zone.children.length) zone.appendChild(el("div", "empty", "All records here are in a group or in Group Values."));
       box.appendChild(zone);
-      scroll.appendChild(box);
+      docsBody.appendChild(box);
       sortable(zone);
     });
-    root.appendChild(scroll);
+    const left = panel("Documents", names.length ? names.length + " doc" + (names.length === 1 ? "" : "s") : undefined, docsBody);
+    const hintLeft = el("div", "hint", "Drag a record into Group Values. Records return to their own document.");
+    left.insertBefore(hintLeft, docsBody);
 
-    const dock = el("div", "dock");
-    dock.appendChild(el("h4", null, "Group Values"));
-    const drop = el("div", "zone draft");
-    drop.id = "draft";
-    drop.dataset.hint = "Drag records from any document here.";
-    draft.forEach(id => drop.appendChild(pill(all[id])));
-    syncZone(drop);
-    dock.appendChild(drop);
-    root.appendChild(dock);
-    sortable(drop);
+    // Right column: Group Values (drop target) above Grouped Values.
+    const dropBody = el("div", "zone draft");
+    dropBody.id = "draft";
+    draft.forEach(id => dropBody.appendChild(pill(all[id])));
+    if (!draft.length) dropBody.appendChild(el("div", "empty", "Drag records here from any document."));
+    sortable(dropBody);
+    const right = el("div");
+    right.style.display = "flex";
+    right.style.flexDirection = "column";
+    right.style.gap = "14px";
+    right.style.alignSelf = "stretch";
+    right.appendChild(panel("Group Values", draft.length, dropBody));
 
-    const groupsWrap = el("div", null);
-    groupsWrap.appendChild(el("h4", null, "Grouped Values"));
     const groups = args.groups || [];
-    if (!groups.length) groupsWrap.appendChild(el("div", "empty", "No saved groups yet."));
-    const list = el("div", "groups-list");
+    const groupBody = el("div", "groups");
+    if (!groups.length) groupBody.appendChild(el("div", "empty", "No saved groups yet."));
     groups.forEach(group => {
       const details = el("details", "group");
-      const summary = el("summary", null, group.name + "  ·  primary: " + (group.primary || "—"));
-      summary.style.background = colour(group.id);
+      const summary = el("summary");
+      summary.style.background = groupColour(group.id);
+      summary.appendChild(el("span", null, group.name));
+      summary.appendChild(el("small", null, "primary: " + (group.primary || "—") + "  ·  " + group.members.length + " record(s)"));
       details.appendChild(summary);
       const members = el("div", "members");
       group.members.forEach(m => {
@@ -226,11 +209,15 @@
         members.appendChild(row);
       });
       details.appendChild(members);
-      list.appendChild(details);
+      groupBody.appendChild(details);
     });
-    groupsWrap.appendChild(list);
-    root.appendChild(groupsWrap);
-    setHeight();
+    const groupsPanel = panel("Grouped Values", groups.length || undefined, groupBody);
+    groupsPanel.style.flex = "1 1 auto";
+    right.appendChild(groupsPanel);
+
+    root.appendChild(left);
+    root.appendChild(right);
+    requestAnimationFrame(fitHeight);
   }
 
   window.addEventListener("message", event => {
@@ -238,7 +225,7 @@
     if (!msg || msg.type !== "streamlit:render") return;
     render(msg.args || {});
   });
-  window.addEventListener("load", setHeight);
+  if (window.ResizeObserver) new ResizeObserver(fitHeight).observe(document.body);
   send("streamlit:componentReady", { apiVersion: 1 });
 })();
 </script>
