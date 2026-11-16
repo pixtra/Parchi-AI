@@ -144,17 +144,37 @@
   function draftIds() {
     return [...document.querySelectorAll("#draft .pill")].map(p => p.dataset.id);
   }
+  function savedDraftKey() {
+    return String(currentArgs.storage_key || "parchi-value-group-draft");
+  }
+  function persistDraft(ids) {
+    try { window.localStorage.setItem(savedDraftKey(), JSON.stringify(ids)); } catch (_) {}
+  }
+  function readPersistedDraft() {
+    try {
+      const value = JSON.parse(window.localStorage.getItem(savedDraftKey()) || "[]");
+      return Array.isArray(value) ? value.map(String) : [];
+    } catch (_) { return []; }
+  }
+  function validDraft(ids, all) {
+    if (!Array.isArray(ids)) return [];
+    return [...new Set(ids.map(String))].filter(id => all[id]);
+  }
   function emit() {
     const ids = draftIds();
     draft = ids;
+    persistDraft(ids);
     const key = JSON.stringify(ids);
     if (key === lastSent) return;
     lastSent = key;
     send("streamlit:setComponentValue", { value: { draft: ids }, dataType: "json" });
   }
   function emitAction(action, groupId, factId, extra = {}) {
+    const ids = draftIds();
+    draft = ids;
+    persistDraft(ids);
     send("streamlit:setComponentValue", {
-      value: Object.assign({draft: draftIds(), action, group_id: groupId, fact_id: factId,
+      value: Object.assign({draft: ids, action, group_id: groupId, fact_id: factId,
         event_id: (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now()) + Math.random()}, extra),
       dataType: "json"
     });
@@ -221,6 +241,12 @@
       scroll: true,
       scrollSensitivity: 60,
       scrollSpeed: 12,
+      // Group Values is a temporary draft. Spilling its pills outside the board removes
+      // only those IDs from the draft; the saved document facts remain untouched.
+      removeOnSpill: zone.id === "draft",
+      onSpill: () => {
+        if (zone.id === "draft") requestAnimationFrame(emit);
+      },
       onStart: () => document.querySelectorAll(".zone").forEach(z => z.classList.add("drag-target")),
       onEnd: (event) => {
         document.querySelectorAll(".zone").forEach(z => z.classList.remove("drag-target", "drag-over"));
@@ -253,12 +279,24 @@
     const all = {};
     Object.values(docs).forEach(list => list.forEach(item => { all[item.id] = item; }));
 
-    // A save bumps `reset`: clear the draft and let the next drop send a fresh snapshot.
-    if (currentArgs.reset !== lastReset) {
+    // Keep the draft through Streamlit reruns and browser refreshes. A successful save
+    // bumps `reset` and Python explicitly supplies an empty draft.
+    if (lastReset === null) {
+      const supplied = validDraft(currentArgs.draft, all);
+      draft = supplied.length ? supplied : validDraft(readPersistedDraft(), all);
+      lastReset = currentArgs.reset;
+      lastSent = null;
+    } else if (currentArgs.reset !== lastReset) {
       if (lastReset !== null) newGroupName = "";
-      lastReset = currentArgs.reset; draft = []; lastSent = null;
+      lastReset = currentArgs.reset;
+      draft = validDraft(currentArgs.draft, all);
+      lastSent = null;
+    } else if (Array.isArray(currentArgs.draft)) {
+      draft = validDraft(currentArgs.draft, all);
+    } else {
+      draft = validDraft(draft, all);
     }
-    draft = draft.filter(id => all[id]);
+    persistDraft(draft);
 
     // Document sections come first so every source pill stays immediately accessible.
     const docsBody = el("div", "docs-scroll");

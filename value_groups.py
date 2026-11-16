@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS value_group_members (
 CREATE INDEX IF NOT EXISTS idx_value_groups_name ON value_groups(name);
 """
 
+# Group membership is stored separately from facts so grouping never edits extraction data.
+
 
 class GroupError(ValueError):
     """A user-facing validation failure. The message is safe to show in the UI."""
@@ -46,13 +48,16 @@ class GroupMember:
 
 def primary_member(members: Iterable[GroupMember]) -> Optional[GroupMember]:
     """Highest raw score wins. Ties go to the lowest fact_id, so the result is deterministic."""
+    # Materialize the iterable because callers may provide a generator.
     members = list(members)
     if not members:
         return None
+    # Sort by descending confidence, then by stable ID for deterministic ties.
     return min(members, key=lambda m: (-m.confidence_score, m.fact_id))
 
 
 def _now() -> str:
+    """Return one UTC timestamp format for all group records."""
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
@@ -70,15 +75,18 @@ def _check_facts(conn: sqlite3.Connection, docket_id: str, fact_ids: List[str]) 
     """Every fact must exist and must not be rejected."""
     if not fact_ids:
         return
+    # Use parameters for IDs so values cannot alter the SQL statement.
     placeholders = ",".join("?" * len(fact_ids))
     rows = conn.execute(
         f"""SELECT id, review_status FROM facts WHERE id IN ({placeholders})""",
         fact_ids,
     ).fetchall()
     found = {row["id"] if isinstance(row, sqlite3.Row) else row[0]: row for row in rows}
+    # Reject stale browser selections before writing any membership rows.
     missing = [f for f in fact_ids if f not in found]
     if missing:
         raise GroupError("Some selected records no longer exist. Refresh the page and try again.")
+    # Rejected facts remain available in Main Metadata but cannot join a group.
     rejected = [f for f in fact_ids
                 if (found[f]["review_status"] if isinstance(found[f], sqlite3.Row) else found[f][1])
                 == "rejected"]
@@ -87,6 +95,8 @@ def _check_facts(conn: sqlite3.Connection, docket_id: str, fact_ids: List[str]) 
 
 
 def _check_not_grouped(conn: sqlite3.Connection, fact_ids: List[str], except_group: Optional[str]) -> None:
+    """Prevent one occurrence from belonging to multiple groups."""
+    # SQLite cannot bind a whole list to IN, so create one placeholder per ID.
     placeholders = ",".join("?" * len(fact_ids))
     params: list = [*fact_ids]
     sql = f"SELECT fact_id, group_id FROM value_group_members WHERE fact_id IN ({placeholders})"
@@ -98,6 +108,8 @@ def _check_not_grouped(conn: sqlite3.Connection, fact_ids: List[str], except_gro
 
 
 def _validate_name(name: str) -> str:
+    """Normalize and validate a user-entered group name."""
+    # Collapse repeated whitespace so equivalent names look consistent.
     cleaned = " ".join(str(name or "").split())
     if not cleaned:
         raise GroupError("Enter a group name before saving.")
@@ -107,12 +119,15 @@ def _validate_name(name: str) -> str:
 
 
 def create_group(conn: sqlite3.Connection, docket_id: str, name: str, fact_ids: Iterable[str]) -> str:
+    """Create a group and attach the selected occurrence IDs in priority order."""
+    # Validate the name and preserve the drag order while removing duplicates.
     name = _validate_name(name)
     ids = _clean_ids(fact_ids)
     if not ids:
         raise GroupError("Add at least one record to the group before saving.")
     _check_facts(conn, docket_id, ids)
     _check_not_grouped(conn, ids, except_group=None)
+    # Generate a stable ID before inserting the group and its members.
     group_id = str(uuid.uuid4())
     now = _now()
     try:
@@ -122,6 +137,7 @@ def create_group(conn: sqlite3.Connection, docket_id: str, name: str, fact_ids: 
         )
     except sqlite3.IntegrityError as exc:
         raise GroupError(f"A group named “{name}” already exists.") from exc
+    # Priority zero is the first occurrence displayed by the UI.
     conn.executemany(
         "INSERT INTO value_group_members (group_id, fact_id, priority) VALUES (?, ?, ?)",
         [(group_id, fact_id, index) for index, fact_id in enumerate(ids)],
@@ -178,9 +194,11 @@ def reorder_members(conn: sqlite3.Connection, docket_id: str, group_id: str,
              AND f.concept != 'page_processing_status'""",
         (group_id,),
     ).fetchall()
+    # Compare the submitted set with the database set to reject stale reorder events.
     visible = {row[0] for row in rows}
     if len(ids) != len(visible) or set(ids) != visible:
         raise GroupError("Group membership changed while reordering. Refresh and try again.")
+    # Rewrite only priority values; labels, values, and confidence stay untouched.
     conn.executemany(
         "UPDATE value_group_members SET priority = ? WHERE group_id = ? AND fact_id = ?",
         [(index, group_id, fact_id) for index, fact_id in enumerate(ids)],
@@ -192,6 +210,7 @@ def reorder_members(conn: sqlite3.Connection, docket_id: str, group_id: str,
 def remove_member(conn: sqlite3.Connection, docket_id: str, group_id: str, fact_id: str) -> None:
     """Remove one occurrence from a group; the underlying fact remains untouched."""
     _owned_group(conn, docket_id, group_id)
+    # Delete only the join row, leaving the original fact intact.
     cursor = conn.execute(
         "DELETE FROM value_group_members WHERE group_id = ? AND fact_id = ?",
         (group_id, fact_id),
@@ -205,6 +224,8 @@ def remove_member(conn: sqlite3.Connection, docket_id: str, group_id: str, fact_
 
 
 def rename_group(conn: sqlite3.Connection, docket_id: str, group_id: str, name: str) -> None:
+    """Rename one existing group without changing its members."""
+    # Apply the same validation used during creation.
     name = _validate_name(name)
     _owned_group(conn, docket_id, group_id)
     try:
@@ -225,6 +246,8 @@ def delete_group(conn: sqlite3.Connection, docket_id: str, group_id: str) -> Non
 
 
 def _owned_group(conn: sqlite3.Connection, docket_id: str, group_id: str) -> None:
+    """Confirm that the requested group exists before a mutation."""
+    # The global group schema currently does not scope groups by docket.
     row = conn.execute("SELECT 1 FROM value_groups WHERE id = ?", (group_id,)).fetchone()
     if row is None:
         raise GroupError("That group no longer exists. Refresh the page and try again.")
@@ -232,6 +255,7 @@ def _owned_group(conn: sqlite3.Connection, docket_id: str, group_id: str) -> Non
 
 def load_groups(conn: sqlite3.Connection, docket_id: str) -> List[dict]:
     """Every group with its members and computed primary label. Read-only."""
+    # Load group headers first, then fetch each ordered member list.
     groups = conn.execute(
         "SELECT id, name, primary_fact_id FROM value_groups ORDER BY name COLLATE NOCASE"
     ).fetchall()
@@ -250,6 +274,7 @@ def load_groups(conn: sqlite3.Connection, docket_id: str) -> List[dict]:
                  f.confidence_score DESC, d.filename, f.page_number, f.created_at, f.id""",
             (group["id"],),
         ).fetchall()
+        # Convert database rows into the small immutable object used by the UI.
         members = [
             GroupMember(r["fact_id"], r["label"], r["value"], r["document_name"],
                         int(r["confidence_score"]))
@@ -267,6 +292,8 @@ def load_groups(conn: sqlite3.Connection, docket_id: str) -> List[dict]:
 
 
 def ungrouped_fact_ids(conn: sqlite3.Connection, docket_id: str) -> set:
+    """Return active fact IDs that are not members of any group."""
+    # Exclude rejected and internal status facts from drag-and-drop zones.
     rows = conn.execute(
         """SELECT f.id FROM facts f
            WHERE f.docket_id = ? AND f.review_status != 'rejected'

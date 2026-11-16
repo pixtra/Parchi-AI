@@ -25,10 +25,13 @@ ALIASES = {
 
 
 def _normalise_column(value: object) -> str:
+    """Convert a column heading into a comparison-friendly form."""
     return re.sub(r"[^a-z0-9]+", " ", str(value).strip().lower()).strip()
 
 
 def _find_column(columns: Iterable[object], aliases: Iterable[str]) -> str | None:
+    """Find the real input column matching one of the supported aliases."""
+    # Build the lookup once so aliases can be checked in their declared priority order.
     normalised = {_normalise_column(column): str(column) for column in columns}
     for alias in aliases:
         if _normalise_column(alias) in normalised:
@@ -37,6 +40,7 @@ def _find_column(columns: Iterable[object], aliases: Iterable[str]) -> str | Non
 
 
 def _score(value: object) -> float | None:
+    """Parse a score, accepting percentages and decimal fractions."""
     if value is None or str(value).strip() == "":
         return None
     text = str(value).strip().replace("%", "")
@@ -62,6 +66,8 @@ def band_for_score(score: int) -> str:
 
 
 def confidence_level(score: object = None, level: object = None) -> str:
+    """Return High, Medium, or Low using score first and text as fallback."""
+    # A numeric score is more precise than a possibly stale input level.
     numeric = _score(score)
     if numeric is not None:
         return {"Green": "High", "Yellow": "Medium", "Red": "Low"}[band_for_score(int(numeric))]
@@ -74,6 +80,7 @@ def confidence_level(score: object = None, level: object = None) -> str:
 
 
 def _normalise_fact(value: object) -> str:
+    """Normalize fact text for duplicate and conflict comparisons."""
     return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
 
 
@@ -93,6 +100,7 @@ def label_value_mismatch(label: object, value: object) -> bool:
     Labels are matched on whole words, so "Corporate" does not count as "rate" and
     "Update" does not count as "date".
     """
+    # Compare whole label tokens so partial words do not trigger false positives.
     label_text = _normalise_fact(label)
     tokens = set(label_text.split())
     value_text = str(value or "").strip()
@@ -113,6 +121,7 @@ def label_value_mismatch(label: object, value: object) -> bool:
 
 def auto_verified_indices(frame: pd.DataFrame) -> set[int]:
     """Rows duplicated by field/value are trusted for the review queue."""
+    # Build a normalized label/value key for each occurrence.
     keys = frame.apply(
         lambda row: (_normalise_fact(row["Field Name"]), _normalise_fact(row["Extracted Value"])),
         axis=1,
@@ -120,6 +129,7 @@ def auto_verified_indices(frame: pd.DataFrame) -> set[int]:
     label_values = frame.groupby(frame["Field Name"].map(_normalise_fact))["Extracted Value"].agg(
         lambda values: {_normalise_fact(value) for value in values if _normalise_fact(value)}
     )
+    # A duplicated value is safe only when that label has no conflicting value.
     conflicting_labels = {label for label, values in label_values.items() if len(values) > 1}
     counts = keys.value_counts()
     return {
@@ -130,6 +140,7 @@ def auto_verified_indices(frame: pd.DataFrame) -> set[int]:
 
 def clean_psv(data: bytes) -> pd.DataFrame:
     """Read a PSV payload and return the required four-column review dataset."""
+    # utf-8-sig removes the optional BOM that spreadsheet applications add.
     text = data.decode("utf-8-sig")
     frame = pd.read_csv(io.StringIO(text), sep="|", dtype=str, keep_default_na=False)
     field_column = _find_column(frame.columns, ALIASES["field"])
@@ -137,6 +148,7 @@ def clean_psv(data: bytes) -> pd.DataFrame:
     source_column = _find_column(frame.columns, ALIASES["source"])
     score_column = _find_column(frame.columns, ALIASES["score"])
     level_column = _find_column(frame.columns, ALIASES["level"])
+    # Report all missing required columns together so the user can fix the upload once.
     missing = [
         name for name, column in (
             ("Field Name", field_column),
@@ -149,6 +161,7 @@ def clean_psv(data: bytes) -> pd.DataFrame:
     if score_column is None and level_column is None:
         raise ValueError("The PSV must include a confidence score or confidence level column.")
 
+    # Convert every accepted input shape into the app's four-column review shape.
     result = pd.DataFrame({
         "Field Name": frame[field_column].astype(str),
         "Extracted Value": frame[value_column].astype(str),
@@ -161,17 +174,20 @@ def clean_psv(data: bytes) -> pd.DataFrame:
             for index in range(len(frame))
         ],
     })
+    # Obvious type mismatches are always downgraded to Low confidence.
     mismatches = [
         label_value_mismatch(result.iloc[index]["Field Name"], result.iloc[index]["Extracted Value"])
         for index in range(len(result))
     ]
     result.loc[mismatches, "Confidence Level"] = "Low"
+    # Conflicting values for the same normalized field are also low confidence.
     label_values = result.groupby(result["Field Name"].map(_normalise_fact))["Extracted Value"].agg(
         lambda values: {_normalise_fact(value) for value in values if _normalise_fact(value)}
     )
     conflicting_labels = {label for label, values in label_values.items() if len(values) > 1}
     conflict_rows = result["Field Name"].map(_normalise_fact).isin(conflicting_labels)
     result.loc[conflict_rows, "Confidence Level"] = "Low"
+    # Keep low-confidence rows first while preserving their original order.
     result["_sort"] = result["Confidence Level"].map({name: index for index, name in enumerate(CONFIDENCE_ORDER)})
     result["_review_index"] = range(len(result))
     result = result.sort_values(["_sort", "_review_index"], kind="stable")
@@ -180,10 +196,12 @@ def clean_psv(data: bytes) -> pd.DataFrame:
 
 def build_excel(frame: pd.DataFrame) -> bytes:
     """Create a formatted Excel Table with confidence conditional formatting."""
+    # Build in memory so callers can download the workbook without a temp file.
     output = io.BytesIO()
     export = frame[OUTPUT_COLUMNS].copy()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         export.to_excel(writer, index=False, sheet_name="PSV Verification")
+    # Reopen the workbook to apply Excel-specific formatting with openpyxl.
     workbook = load_workbook(output)
     sheet = workbook["PSV Verification"]
     # Neutralise formula/CSV injection: a value such as =HYPERLINK(...) or +CMD(...) coming
@@ -200,6 +218,7 @@ def build_excel(frame: pd.DataFrame) -> bytes:
                                           showLastColumn=False, showRowStripes=True,
                                           showColumnStripes=False)
     sheet.add_table(table)
+    # Apply the same colors users see in the verification interface.
     fills = {
         "High": PatternFill("solid", fgColor="C6EFCE"),
         "Medium": PatternFill("solid", fgColor="FFEB9C"),
@@ -222,6 +241,7 @@ def next_pending_index(
     frame: pd.DataFrame, current: int = -1, verified: set[int] | None = None
 ) -> int | None:
     """Return the next pending Low/Medium row, wrapping once at the end."""
+    # Treat missing verification state as an empty set.
     verified = verified or set()
     pending = [
         index for index in frame.index
@@ -229,5 +249,6 @@ def next_pending_index(
     ]
     if not pending:
         return None
+    # Continue after the current row, then wrap to the first pending row.
     after = [index for index in pending if index > current]
     return (after or pending)[0]

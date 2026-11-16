@@ -47,6 +47,14 @@ from value_groups import (
     ungrouped_fact_ids,
 )
 from extraction_adapter import coerce_nullable_value, confidence_map
+from validated_data import (
+    VALIDATED_DATA_SCHEMA,
+    apply_validated_records,
+    edit_validated_record,
+    list_validated_edit_history,
+    set_review_approval,
+    undo_validated_edit,
+)
 try:
     import rapidfuzz
     import rapidfuzz.fuzz  # noqa: F401  (load the submodules explicitly)
@@ -91,21 +99,12 @@ _value_groups_component = (
     if _VALUE_GROUP_COMPONENT_DIR.is_dir() else None
 )
 def _env(name: str, default: Any = "") -> Any:
-    """Read PARCHI_<name>; fall back to the old PARCHAI_<name> so existing setups keep working."""
-    for key in (f"PARCHI_{name}", f"PARCHAI_{name}"):
-        value = os.getenv(key)
-        if value is not None:
-            return value
-    return default
+    """Read PARCHI_<name> configuration values."""
+    return os.getenv(f"PARCHI_{name}", default)
 
 
-def _legacy_default(new: Path, old: Path) -> Path:
-    """Use the old default file or folder only when it exists and the new one does not."""
-    return old if (not new.exists() and old.exists()) else new
-
-
-DB_PATH = Path(_env("DB", _legacy_default(BASE_DIR / "parchi_v3.db", BASE_DIR / "parchai_v3.db")))
-STORAGE_DIR = Path(_env("STORAGE", _legacy_default(BASE_DIR / "parchi_storage", BASE_DIR / "parchai_storage"))).resolve()
+DB_PATH = Path(_env("DB", BASE_DIR / "parchi_v3.db"))
+STORAGE_DIR = Path(_env("STORAGE", BASE_DIR / "parchi_storage")).resolve()
 CONFIG_PATH = BASE_DIR / ".streamlit" / "secrets.toml"
 
 
@@ -193,9 +192,9 @@ def document_state_label(status: str) -> str:
 def document_state_badge(status: str) -> str:
     label, kind = DOCUMENT_STATE_META.get(status, (status.capitalize(), ""))
     return badge(label, kind)
-PAGES = ["Dockets", "Workspace", "Review", "Organize", "Viewer", "Validation", "Export", "Settings"]
+PAGES = ["Dockets", "Workspace", "Organize", "Viewer", "Validation", "Export", "Settings"]
 PAGE_ICONS = {
-    "Dockets": "▤", "Workspace": "⬆", "Review": "✎", "Organize": "⌘", "Viewer": "▣",
+    "Dockets": "▤", "Workspace": "⬆", "Organize": "⌘", "Viewer": "▣",
     "Validation": "✔", "Export": "⇩", "Settings": "⚙",
 }
 IDENTITY_CONCEPTS = {
@@ -776,6 +775,15 @@ def init_db() -> bool:
         connection.execute("PRAGMA journal_mode = WAL")
         connection.executescript(SCHEMA)
         connection.executescript(VALUE_GROUP_SCHEMA)
+        connection.executescript(VALIDATED_DATA_SCHEMA)
+        review_columns = {row["name"] for row in connection.execute(
+            "PRAGMA table_info(validated_template_records)"
+        )}
+        if review_columns and "review_approved" not in review_columns:
+            connection.execute(
+                "ALTER TABLE validated_template_records "
+                "ADD COLUMN review_approved INTEGER NOT NULL DEFAULT 0"
+            )
         _migrate_global_value_groups(connection)
         value_group_columns = {row["name"] for row in connection.execute("PRAGMA table_info(value_groups)")}
         if "primary_fact_id" not in value_group_columns:
@@ -2820,13 +2828,28 @@ def _render_processing_status(job: Optional[Dict[str, Any]]) -> None:
             title = "Queued for processing"
         else:
             title = "Processing saved documents"
-        message = esc(job.get("message") or "Preparing the saved documents.")
-        st.progress(percent, text=f"Overall document progress · {done}/{total} finished")
-        _render_processing_panel(
-            job, title=f"{title}…", message=message, percent=percent,
-            sub=f"{done} of {total} document(s) finished · you can switch tabs safely; "
-                "facts appear as each document completes.",
+        # Streamlit's native running status icon remains animated after this fragment
+        # finishes rendering. The former CSS-only ring could be swallowed or made
+        # inconspicuous by the app's Markdown/iframe theme styling.
+        status = st.status(f"{title}…", state="running", expanded=True)
+        status.markdown(job.get("message") or "Preparing the saved documents.")
+        status.progress(percent, text=f"Overall document progress · {done}/{total} finished")
+        status.caption(
+            f"{done} of {total} document(s) finished · you can switch tabs safely; "
+            "facts appear as each document completes."
         )
+        rows = queue_rows(job)
+        if rows:
+            queue = pd.DataFrame([{
+                "Document": row["filename"],
+                "Status": document_state_label(row["status"]),
+                "Records": row["facts"] if row["status"] in {"completed", "partial"} else "",
+                "Details": row["message"],
+            } for row in rows])
+            status.dataframe(
+                queue, hide_index=True, width="stretch",
+                height=min(240, max(110, 35 + 34 * len(queue))),
+            )
     elif job["status"] == "error":
         _render_processing_panel(
             job, title="Processing stopped", message=esc(job.get("message") or ""),
@@ -3455,6 +3478,23 @@ def viewer_metadata_records(docket_id: str) -> List[dict]:
     ]
 
 
+def viewer_validated_base_records(docket_id: str) -> List[dict]:
+    """Full occurrence-level editable copy, seeded from but stored apart from Main Metadata."""
+    return [
+        {
+            "document_name": row["filename"],
+            "label": row["label"],
+            "value": row["value"],
+            "confidence_score": int(row["confidence_score"]),
+            "review_status": row["review_status"],
+            "source_label": row["label"],
+            "record_id": row["id"],
+        }
+        for row in fetch_facts(docket_id)
+        if row["concept"] != "page_processing_status"
+    ]
+
+
 def client_template_records(docket_id: str, template: sqlite3.Row) -> Tuple[List[dict], List[str]]:
     """Every Main Metadata occurrence whose label has a SAVED mapping to this template.
 
@@ -3482,20 +3522,58 @@ def client_template_records(docket_id: str, template: sqlite3.Row) -> Tuple[List
                    WHERE f.docket_id = ? AND f.concept != 'page_processing_status'""",
                 (docket_id,),
             ).fetchall()
-            membership = {row["group_id"]: set() for row in connection.execute(
-                "SELECT DISTINCT group_id FROM value_group_members"
-            ).fetchall()}
-            for member in connection.execute("SELECT group_id, fact_id FROM value_group_members"):
-                membership.setdefault(member["group_id"], set()).add(member["fact_id"])
+            membership: Dict[str, List[str]] = {}
+            member_rows = connection.execute(
+                """SELECT m.group_id, f.id AS fact_id
+                   FROM value_group_members m
+                   JOIN facts f ON f.id = m.fact_id
+                   JOIN documents d ON d.id = f.document_id
+                   JOIN value_groups g ON g.id = m.group_id
+                   WHERE f.docket_id = ? AND f.concept != 'page_processing_status'
+                   ORDER BY m.group_id, m.priority,
+                     CASE WHEN f.id = g.primary_fact_id THEN 0 ELSE 1 END,
+                     f.confidence_score DESC, d.filename, f.page_number, f.created_at, f.id""",
+                (docket_id,),
+            ).fetchall()
+            for member in member_rows:
+                membership.setdefault(member["group_id"], []).append(member["fact_id"])
+        records_by_id = {record["id"]: record for record in rows}
         matched = {row["id"]: 0 for row in field_rows}
         for field in field_rows:
             if field["source_type"] == "group":
-                allowed_ids = membership.get(field["source_id"], set())
+                ordered_ids = membership.get(field["source_id"], [])
+                allowed_ids = set(ordered_ids)
             else:
+                ordered_ids = []
                 allowed_ids = {row["id"] for row in rows
                                 if normalize_label(row["label"]) == normalize_label(field["source_id"])}
             source_labels = {normalize_label(source) for source, target in mappings.items()
                              if target == field["destination_label"]}
+            if field["source_type"] == "group":
+                # A saved group contributes only its first prioritized occurrence to
+                # template output; other members remain intact in Main/Review Metadata.
+                primary_record = next((records_by_id[fact_id] for fact_id in ordered_ids
+                                       if fact_id in records_by_id), None)
+                if primary_record is not None:
+                    output.append({
+                        "document_name": primary_record["document_name"],
+                        "label": field["destination_label"], "value": primary_record["value"],
+                        "confidence_score": int(primary_record["confidence_score"]),
+                        "source_label": primary_record["label"], "record_id": primary_record["id"],
+                    })
+                    matched[field["id"]] += 1
+                # Keep ordinary approved mappings that are not already members of this group.
+                for record in rows:
+                    if record["id"] in allowed_ids or normalize_label(record["label"]) not in source_labels:
+                        continue
+                    output.append({
+                        "document_name": record["document_name"],
+                        "label": field["destination_label"], "value": record["value"],
+                        "confidence_score": int(record["confidence_score"]),
+                        "source_label": record["label"], "record_id": record["id"],
+                    })
+                    matched[field["id"]] += 1
+                continue
             for record in rows:
                 if record["id"] not in allowed_ids and normalize_label(record["label"]) not in source_labels:
                     continue
@@ -3530,6 +3608,8 @@ def build_metadata_export(records: List[dict], description: str) -> Tuple[bytes,
         if "source_label" in record:
             item["source_label"] = record.get("source_label", "")
             item["record_id"] = record.get("record_id", "")
+        if "review_approved" in record:
+            item["review_approved"] = bool(record["review_approved"])
         exported.append(item)
     data = json_bytes(exported)
     if json.loads(data.decode("utf-8")) != exported:
@@ -3539,8 +3619,12 @@ def build_metadata_export(records: List[dict], description: str) -> Tuple[bytes,
 
 def build_metadata_psv(records: List[dict], description: str) -> Tuple[bytes, int]:
     headers = list(METADATA_HEADERS)
-    if any("source_label" in record for record in records):
+    has_source = any("source_label" in record for record in records)
+    has_approval = any("review_approved" in record for record in records)
+    if has_source:
         headers += ["source_label", "record_id"]
+    if has_approval:
+        headers += ["review_approved"]
     expected = [headers] + [
         [
             safe_cell(record["document_name"]),
@@ -3548,7 +3632,8 @@ def build_metadata_psv(records: List[dict], description: str) -> Tuple[bytes, in
             safe_cell(record["value"]),
             str(int(record["confidence_score"])),
         ] + ([safe_cell(record.get("source_label", "")), safe_cell(record.get("record_id", ""))]
-             if len(headers) > 4 else [])
+             if has_source else []) + ([str(bool(record.get("review_approved", False))).lower()]
+                                        if has_approval else [])
         for record in records
     ]
     buffer = io.StringIO(newline="")
@@ -3571,6 +3656,9 @@ def build_metadata_xlsx(records: List[dict], description: str) -> Tuple[bytes, i
     if any("source_label" in record for record in records):
         fields += ["source_label", "record_id"]
         headers += ["source_label", "record_id"]
+    if any("review_approved" in record for record in records):
+        fields += ["review_approved"]
+        headers += ["review_approved"]
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Metadata"
@@ -3613,6 +3701,8 @@ def build_metadata_xlsx(records: List[dict], description: str) -> Tuple[bytes, i
         for optional in ("source_label", "record_id"):
             if optional in row:
                 row[optional] = row[optional] or ""
+        if "review_approved" in row:
+            row["review_approved"] = bool(row["review_approved"])
         got.append(row)
     if got != records:
         raise ExportError(f"{description} XLSX integrity check failed after re-reading.")
@@ -3622,6 +3712,7 @@ def build_metadata_xlsx(records: List[dict], description: str) -> Tuple[bytes, i
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 METADATA_FIELDS = ("document_name", "label", "value", "confidence_score")
 METADATA_HEADERS = list(METADATA_FIELDS)
+VALIDATED_METADATA_SCOPE = "__validated_main_metadata__"
 
 # ---------------------------------------------------------------- styling
 def inject_css() -> None:
@@ -3655,6 +3746,16 @@ def inject_css() -> None:
         .chip.warn, .badge.warn { color:var(--warn); border-color:rgba(242,196,109,.45); }
         .chip.bad, .badge.bad { color:var(--bad); border-color:rgba(255,133,133,.45); }
         .chip.accent { color:#c4d1ff; border-color:rgba(108,140,255,.5); }
+        .chip.processing { color:#ffe3a0; border-color:rgba(242,196,109,.65);
+                background:rgba(105,77,20,.22); }
+        .topbar-throbber { width:13px; height:13px; flex:0 0 13px; display:inline-block;
+                border:2px solid rgba(255,227,160,.35); border-top-color:#ffe3a0;
+                border-right-color:#f2c46d; border-radius:50%;
+                animation:parchi-topbar-spin .72s linear infinite; }
+        @keyframes parchi-topbar-spin { to { transform:rotate(360deg); } }
+        @media (prefers-reduced-motion: reduce) {
+            .topbar-throbber { animation:none; border-color:#f2c46d; border-top-color:transparent; }
+        }
 
         /* navigation */
         button[kind="tertiary"], button[data-testid="stBaseButton-tertiary"] {
@@ -3774,18 +3875,78 @@ def render_error_panel(exc: BaseException, where: str) -> None:
 
 # ---------------------------------------------------------------- top navigation
 def active_docket(dockets: List[sqlite3.Row]) -> Optional[sqlite3.Row]:
+    ids = {d["id"] for d in dockets}
     active_id = st.session_state.get("active_docket")
+    if active_id not in ids:
+        try:
+            query_id = st.query_params.get("parchi_docket")
+        except Exception:  # tolerate older Streamlit runtimes and malformed URLs
+            query_id = None
+        active_id = query_id if query_id in ids else None
+        if active_id:
+            st.session_state["active_docket"] = active_id
     return next((d for d in dockets if d["id"] == active_id), None)
+
+
+@st.fragment(run_every=1)
+def render_topbar_status(docket_id: Optional[str]) -> None:
+    """Refresh the Mode/status chips independently of the Workspace extraction fragment."""
+    keys = len(key_pool())
+    cooling = active_cooldown_count()
+    rejected = len(rejected_keys())
+    active_job = processing_job(docket_id) if docket_id else None
+    processing_chip = ""
+    if active_job and active_job["status"] in {"queued", "running"}:
+        processing_chip = (
+            '<span class="chip processing" role="status" aria-live="polite" '
+            'title="Document extraction is active">'
+            '<span class="topbar-throbber" aria-hidden="true"></span>'
+            'Processing documents, please wait</span>'
+        )
+    extra = ""
+    if cooling:
+        extra += f'<span class="chip warn">▲ {cooling} key(s) cooling</span>'
+    if rejected:
+        extra += f'<span class="chip bad">✖ {rejected} invalid key(s)</span>'
+    st.markdown(
+        f'<div class="chips"><span class="chip accent">MODE: GEMINI</span>'
+        f'{processing_chip}<span class="chip ok">✔ {keys} key(s) ready</span>{extra}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 def render_topbar(dockets: List[sqlite3.Row]) -> Optional[sqlite3.Row]:
     if dockets:
         ids = [d["id"] for d in dockets]
         if st.session_state.get("active_docket") not in ids:
-            st.session_state["active_docket"] = ids[0]
-    keys = len(key_pool())
-    cooling = active_cooldown_count()
-    rejected = len(rejected_keys())
+            try:
+                query_id = st.query_params.get("parchi_docket")
+            except Exception:
+                query_id = None
+            st.session_state["active_docket"] = query_id if query_id in ids else ids[0]
+        selected_docket = str(st.session_state["active_docket"])
+        try:
+            if st.query_params.get("parchi_docket") != selected_docket:
+                st.query_params["parchi_docket"] = selected_docket
+        except Exception:
+            pass
+    else:
+        try:
+            if "parchi_docket" in st.query_params:
+                del st.query_params["parchi_docket"]
+        except Exception:
+            pass
+    if st.session_state.get("nav") not in PAGES:
+        try:
+            query_page = st.query_params.get("parchi_page")
+        except Exception:
+            query_page = None
+        st.session_state["nav"] = query_page if query_page in PAGES else PAGES[0]
+    try:
+        if st.query_params.get("parchi_page") != st.session_state["nav"]:
+            st.query_params["parchi_page"] = st.session_state["nav"]
+    except Exception:
+        pass
     current_docket = active_docket(dockets)
 
     brand, docket_col, chips_col = st.columns([3, 3, 3], vertical_alignment="center")
@@ -3811,19 +3972,7 @@ def render_topbar(dockets: List[sqlite3.Row]) -> Optional[sqlite3.Row]:
             st.button("＋ Create your first docket", type="primary", on_click=go_to, args=("Dockets",),
                       **stretch())
     with chips_col:
-        extra = ""
-        active_job = processing_job(st.session_state.get("active_docket")) if st.session_state.get("active_docket") else None
-        if active_job and active_job["status"] in {"queued", "running"}:
-            extra += '<span class="chip accent">⏳ Processing in background</span>'
-        if cooling:
-            extra += f'<span class="chip warn">▲ {cooling} key(s) cooling</span>'
-        if rejected:
-            extra += f'<span class="chip bad">✖ {rejected} invalid key(s)</span>'
-        st.markdown(
-            f'<div class="chips"><span class="chip accent">Mode: Gemini</span>'
-            f'<span class="chip ok">✔ {keys} key(s) ready</span>{extra}</div>',
-            unsafe_allow_html=True,
-        )
+        render_topbar_status(str(current_docket["id"]) if current_docket is not None else None)
 
     current = st.session_state.get("nav", PAGES[0])
     for column, page in zip(st.columns(len(PAGES)), PAGES):
@@ -4361,6 +4510,13 @@ def _render_grouping(active: sqlite3.Row) -> None:
         return
 
     documents, flat = _grouping_facts(active)
+    still_free = {item["id"] for item in flat}
+    draft_key = f"vg_draft_{docket_id}"
+    saved_draft = [
+        str(fact_id) for fact_id in dict.fromkeys(st.session_state.get(draft_key, []))
+        if str(fact_id) in still_free
+    ]
+    st.session_state[draft_key] = saved_draft
     with connect() as connection:
         groups = load_groups(connection, docket_id)
     group_views = [
@@ -4385,10 +4541,18 @@ def _render_grouping(active: sqlite3.Row) -> None:
     result = _value_groups_component(
         documents=documents,
         groups=group_views,
+        draft=saved_draft,
+        storage_key=f"parchi_value_group_draft_{docket_id}",
         reset=int(st.session_state.get("vg_reset", 0)),
         key=f"vg_board_{docket_id}",
     )
     result = result or {}
+    component_draft = result.get("draft")
+    if isinstance(component_draft, list):
+        st.session_state[draft_key] = [
+            str(fact_id) for fact_id in dict.fromkeys(component_draft)
+            if str(fact_id) in still_free
+        ]
     action = result.get("action")
     event_id = str(result.get("event_id") or "")
     event_key = f"vg_last_event_{docket_id}"
@@ -4398,8 +4562,14 @@ def _render_grouping(active: sqlite3.Row) -> None:
         try:
             with connect() as connection:
                 if action == "create_group":
+                    selected_ids = result.get("fact_ids")
+                    if not isinstance(selected_ids, list) or not selected_ids:
+                        selected_ids = result.get("draft")
+                    if not isinstance(selected_ids, list) or not selected_ids:
+                        selected_ids = st.session_state.get(draft_key, [])
                     create_group(connection, docket_id, str(result.get("name") or ""),
-                                 result.get("fact_ids") or [])
+                                 [str(i) for i in dict.fromkeys(selected_ids or [])
+                                  if str(i) in still_free])
                 elif action == "add_member":
                     add_member(connection, docket_id, str(result.get("group_id") or ""),
                                str(result.get("fact_id") or ""))
@@ -4416,8 +4586,17 @@ def _render_grouping(active: sqlite3.Row) -> None:
                     delete_group(connection, docket_id, str(result.get("group_id") or ""))
         except GroupError as exc:
             queue_flash("error", str(exc))
+        except sqlite3.Error as exc:
+            LOG.exception("value group action failed for docket %s", docket_id)
+            queue_flash("error", f"Could not save the group in the database: {clean_text(exc)[:200]}. "
+                        "Your selected occurrences are still in Group Values; correct the issue and retry.")
+        except Exception as exc:  # keep the draft visible if a component/backend error occurs
+            LOG.exception("unexpected value group action failure for docket %s", docket_id)
+            queue_flash("error", f"Could not save the group: {clean_text(exc)[:200]}. "
+                        "Your selected occurrences are still in Group Values; retry after correcting the issue.")
         else:
             if action == "create_group":
+                st.session_state[draft_key] = []
                 st.session_state["vg_reset"] = int(st.session_state.get("vg_reset", 0)) + 1
             messages = {
                 "create_group": "Group saved. Its records stay in Main Metadata untouched.",
@@ -4429,10 +4608,6 @@ def _render_grouping(active: sqlite3.Row) -> None:
             }
             queue_flash("success", messages[action])
         st.rerun()
-    # The component keeps its last value after a save, so drop anything that is no longer
-    # ungrouped. Otherwise saved records linger in the count and can be "saved" twice.
-    still_free = {item["id"] for item in flat}
-    draft = [str(i) for i in dict.fromkeys(result.get("draft") or []) if i in still_free]
 
 def _render_create(active: sqlite3.Row, metadata: List[dict]) -> None:
     """Create an ordered template from live group or label sources."""
@@ -4800,10 +4975,118 @@ def viewer_frame(rows: List[dict], show_status: bool = False) -> None:
     )
 
 
+def viewer_template_editor(docket_id: str, template_id: str, rows: List[dict]) -> None:
+    """Editable Review Metadata view backed only by the review-data sidecar."""
+    has_status = any("review_status" in row for row in rows)
+    data = [{
+            "Document Name": row["document_name"],
+            "Label": row["label"],
+            "Value": row["value"],
+            "Confidence Score": int(row["confidence_score"]),
+            "Approved": bool(row.get("review_approved", False)),
+            "Source Label": row.get("source_label", ""),
+            "Record ID": row["record_id"],
+            **({"Review Status": row.get("review_status", "")} if has_status else {}),
+        } for row in rows]
+    columns = ["Approved", "Document Name", "Label", "Value", "Confidence Score", "Source Label", "Record ID"]
+    if has_status:
+        columns.append("Review Status")
+    frame = pd.DataFrame(data, columns=columns)
+    styled_frame = frame.style.map(confidence_score_style, subset=["Confidence Score"])
+    revision_key = f"viewer_editor_revision_{docket_id}_{template_id}"
+    revision = int(st.session_state.get(revision_key, 0))
+    edited = st.data_editor(
+        styled_frame,
+        key=f"viewer_editor_{docket_id}_{template_id}_{revision}",
+        hide_index=True,
+        num_rows="fixed",
+        width="stretch",
+        height=min(720, max(180, 44 + 36 * len(frame))),
+        column_config={
+            "Approved": st.column_config.CheckboxColumn("Approved", help="Approve this label and value."),
+            "Document Name": st.column_config.TextColumn("Document Name"),
+            "Label": st.column_config.TextColumn("Label", required=True),
+            "Value": st.column_config.TextColumn("Value"),
+            "Confidence Score": st.column_config.NumberColumn("Confidence Score"),
+            "Source Label": st.column_config.TextColumn("Source Label"),
+            "Record ID": None,
+            **({"Review Status": st.column_config.TextColumn("Review Status")} if has_status else {}),
+        },
+        disabled=["Document Name", "Confidence Score", "Source Label", "Record ID"]
+                 + (["Review Status"] if has_status else []),
+    )
+    baseline_by_id = {row["record_id"]: row for row in rows}
+    changes = []
+    approval_changes = []
+    for _, edited_row in edited.iterrows():
+        record_id = str(edited_row["Record ID"])
+        baseline = baseline_by_id.get(record_id)
+        if baseline is None:
+            continue
+        label_cell = edited_row["Label"]
+        value_cell = edited_row["Value"]
+        label = "" if pd.isna(label_cell) else str(label_cell)
+        value = "" if pd.isna(value_cell) else str(value_cell)
+        if label != str(baseline["label"]) or value != str(baseline["value"]):
+            changes.append((record_id, label, value))
+        approved = bool(edited_row["Approved"])
+        if approved != bool(baseline.get("review_approved", False)):
+            approval_changes.append((record_id, approved))
+    if changes or approval_changes:
+        try:
+            with connect() as connection:
+                for record_id, label, value in changes:
+                    edit_validated_record(connection, docket_id, template_id, rows,
+                                          record_id, label, value)
+                for record_id, approved in approval_changes:
+                    set_review_approval(connection, docket_id, template_id, rows,
+                                        record_id, approved)
+        except (ValueError, sqlite3.Error) as exc:
+            st.error(f"Could not save Viewer edits: {clean_text(exc)}", icon="🚫")
+        else:
+            st.session_state[revision_key] = revision + 1
+            queue_flash("success", f"Saved {len(changes)} edit(s) and {len(approval_changes)} approval change(s). "
+                        "Original Main Metadata is unchanged.")
+            st.rerun()
+
+
+def render_viewer_edit_history(docket_id: str) -> None:
+    with connect() as connection:
+        history = list_validated_edit_history(connection, docket_id)
+    st.markdown("### Edit History")
+    if not history:
+        st.caption("No Viewer edits have been made.")
+        return
+    st.caption("Each field edit is recorded separately. Undo restores only that field edit; "
+               "Main Metadata remains unchanged.")
+    for item in history:
+        detail_col, time_col, action_col = st.columns([5, 1.3, 1.1], vertical_alignment="center")
+        scope_name = ("Review Metadata" if item["template_id"] == VALIDATED_METADATA_SCOPE
+                      else f"template {item['template_id'][:8]}")
+        detail_col.write(f"{item['document_name'] or 'Unknown document'} · "
+                         f"{item['source_label'] or 'Record'} · {item['field_name'].title()}")
+        detail_col.caption(f"{item['old_value']} → {item['new_value']} · "
+                           f"record {item['record_id'][:8]} · {scope_name}")
+        time_col.caption(display_time(item["created_at"]))
+        if item["undone_at"]:
+            action_col.caption(f"Undone · {display_time(item['undone_at'])}")
+        elif action_col.button("Undo", key=f"viewer_undo_{item['id']}"):
+            try:
+                with connect() as connection:
+                    undo_validated_edit(connection, docket_id, item["id"])
+            except (ValueError, sqlite3.Error) as exc:
+                st.error(f"Could not undo this edit: {clean_text(exc)}", icon="🚫")
+            else:
+                revision_key = f"viewer_editor_revision_{docket_id}_{item['template_id']}"
+                st.session_state[revision_key] = int(st.session_state.get(revision_key, 0)) + 1
+                queue_flash("success", "The selected Viewer edit was undone. Main Metadata is unchanged.")
+                st.rerun()
+
+
 def page_viewer(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
     page_header(
         "Viewer",
-        "View the complete Main Metadata file or a Client Template as a table — duplicates, "
+        "Edit Review Metadata separately from the untouched original — duplicates, "
         "conflicting values, document names and confidence scores are all preserved.",
         active["name"] if active else None,
     )
@@ -4824,22 +5107,31 @@ def page_viewer(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
         empty_state("No metadata available", "Save and process documents in the Workspace first.")
         return
 
-    view_options = ["Main Metadata"]
+    view_options = ["Review Metadata", "Original Main Metadata"]
     if templates:
         view_options.append("Client Template")
     selected_view = st.selectbox(
         "Table to view",
         view_options,
-        key="viewer_table",
-        help="Main Metadata lists every extracted record. Client Template lists every record "
-             "mapped onto one saved template.",
+        index=0,
+        key="viewer_table_mode_v2",
+        help="Review Metadata is editable and saved separately. Original Main Metadata is read-only. "
+             "Client Template shows records mapped to a saved template.",
     )
 
-    if selected_view == "Main Metadata":
+    if selected_view == "Review Metadata":
+        baseline_rows = viewer_validated_base_records(docket_id)
+        with connect() as connection:
+            rows = apply_validated_records(
+                connection, docket_id, VALIDATED_METADATA_SCOPE, baseline_rows
+            )
+        st.caption(f"Editable review copy · {len(rows)} occurrence(s). Approve each reviewed label and value "
+                   "are editable; the original Main Metadata remains untouched.")
+        editor_template_id = VALIDATED_METADATA_SCOPE
+    elif selected_view == "Original Main Metadata":
         rows = viewer_metadata_records(docket_id)
-        st.caption(f"All extracted records · {len(rows)} row(s), including duplicates, "
-                   "conflicting values, and pending or rejected records. Manage review "
-                   "statuses in the Review tab.")
+        st.caption(f"Original extraction · {len(rows)} row(s), including duplicates, conflicting "
+                   "values, and pending or rejected records. This view is read-only.")
     else:
         template_names = [template["name"] for template in templates]
         selected_name = st.selectbox("Client template", template_names, key="viewer_template")
@@ -4853,7 +5145,9 @@ def page_viewer(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
                      "damaged). Other templates and the Main Metadata view still work.", icon="🚫")
             return
         with st.spinner("Applying template mappings…"):
-            rows, missing = client_template_records(docket_id, template)
+            baseline_rows, missing = client_template_records(docket_id, template)
+        with connect() as connection:
+            rows = apply_validated_records(connection, docket_id, template["id"], baseline_rows)
         if missing:
             st.warning(
                 "No extracted record mapped to: " + ", ".join(missing) + ". "
@@ -4867,8 +5161,15 @@ def page_viewer(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
                     icon="ℹ️")
         st.caption(f"Mapped records · {len(rows)} row(s); duplicate and conflicting values each "
                    "remain a separate row with its own document name and confidence score.")
+        editor_template_id = template["id"]
 
-    viewer_frame(rows, show_status=(selected_view == "Main Metadata"))
+    if selected_view == "Original Main Metadata":
+        viewer_frame(rows, show_status=True)
+    elif rows:
+        st.caption("Only Label, Value and Approved are editable. These changes apply to Review Metadata; "
+                   "edited records receive confidence 100, while source facts remain untouched.")
+        viewer_template_editor(docket_id, editor_template_id, rows)
+    render_viewer_edit_history(docket_id)
 
 
 def page_validation(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
@@ -4892,8 +5193,8 @@ def page_validation(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -
     )
 
 def page_export(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
-    page_header("Export", "Download the Main Metadata File or a Client Template. Files are generated here from "
-                          "saved mappings. This page never changes them.", active["name"] if active else None)
+    page_header("Export", "Download untouched Main Metadata or the separately reviewed Review Metadata. "
+                          "Files use the saved template mappings.", active["name"] if active else None)
     if not need_docket(active):
         return
     if active["fact_count"] == 0:
@@ -4938,13 +5239,30 @@ def page_export(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
     with st.container(border=True):
         export_panel("Main Metadata", "The complete, unfiltered four-field record set.",
                      metadata_records(active["id"]), [], "main_metadata")
+    validated_base = viewer_validated_base_records(active["id"])
+    with connect() as connection:
+        validated = apply_validated_records(
+            connection, active["id"], VALIDATED_METADATA_SCOPE, validated_base
+        )
+    review_export = [
+        {**{field: row[field] for field in METADATA_FIELDS},
+         "review_approved": bool(row.get("review_approved", False))}
+        for row in validated
+    ]
+    with st.container(border=True):
+        export_panel("Review Metadata", "The full editable metadata copy, including saved Viewer edits. "
+                     "Unedited occurrences retain their original confidence scores.",
+                     review_export, [], "review_metadata")
     templates = list_templates(active["id"])
     with st.container(border=True):
         if templates:
             names = [row["name"] for row in templates]
             chosen_name = st.selectbox("Client template", names, key="export_template_choice")
             template = next(row for row in templates if row["name"] == chosen_name)
-            records, missing = client_template_records(active["id"], template)
+            baseline_records, missing = client_template_records(active["id"], template)
+            with connect() as connection:
+                records = apply_validated_records(connection, active["id"], template["id"],
+                                                  baseline_records)
             mapped_ids = {record.get("record_id") for record in records if record.get("record_id")}
             unmatched_sources = [
                 {"record_id": fact["id"], "document_name": fact["filename"],
@@ -4954,7 +5272,7 @@ def page_export(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
                 if fact["concept"] != "page_processing_status" and fact["id"] not in mapped_ids
             ]
             export_panel(f"Client Template · {template['name']}",
-                         "Mapped occurrences keep their source document, original label and record ID.",
+                         "Mapped occurrences keep their source document, original source label and record ID.",
                          records, missing, "client_template")
             if unmatched_sources:
                 with st.expander(f"Unmatched occurrences remain in Main Metadata ({len(unmatched_sources)})"):
@@ -4966,8 +5284,6 @@ def page_export(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
 
 def page_settings(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
     page_header("Settings", "Gemini key pool, model fallback, storage and integrity checks.", None)
-    if active:
-        render_processing_loader(active["id"])
     entries = key_pool()
     config = load_config()
 
@@ -5047,7 +5363,6 @@ def page_settings(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> 
 RENDERERS = {
     "Dockets": page_dockets,
     "Workspace": page_workspace,
-    "Review": page_review,
     "Organize": page_organize,
     "Viewer": page_viewer,
     "Validation": page_validation,
@@ -5060,13 +5375,15 @@ def main() -> None:
     st.set_page_config(page_title="Parchi AI", page_icon="📄", layout="wide",
                        initial_sidebar_state="collapsed")
     inject_css()
-    page = st.session_state.get("nav", PAGES[0])
-    if page not in RENDERERS:
-        page = PAGES[0]
     try:
         init_db()
         dockets = list_dockets()
         active = render_topbar(dockets)
+        # render_topbar restores both docket and page from the URL after a browser
+        # refresh, so a live run returns to the same workspace and loader.
+        page = st.session_state.get("nav", PAGES[0])
+        if page not in RENDERERS:
+            page = PAGES[0]
         render_flash()
         # Live processing banner on every page: throbber, overall progress and the
         # per-document queue for the active docket's run (see render_processing_loader).
