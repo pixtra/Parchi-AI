@@ -2870,28 +2870,17 @@ def _render_processing_status(job: Optional[Dict[str, Any]]) -> None:
             title = "Queued for processing"
         else:
             title = "Processing saved documents"
-        # Streamlit's native running status icon remains animated after this fragment
-        # finishes rendering. The former CSS-only ring could be swallowed or made
-        # inconspicuous by the app's Markdown/iframe theme styling.
-        status = st.status(f"{title}…", state="running", expanded=True)
-        status.markdown(job.get("message") or "Preparing the saved documents.")
-        status.progress(percent, text=f"Overall document progress · {done}/{total} finished")
-        status.caption(
-            f"{done} of {total} document(s) finished · you can switch tabs safely; "
-            "facts appear as each document completes."
+        # Keep progress outside st.status so hosted Streamlit cannot hide it inside a
+        # collapsed status container. The custom panel also keeps the spinner visible.
+        st.progress(percent, text=f"Overall document progress · {done}/{total} finished")
+        _render_processing_panel(
+            job,
+            title=f"{title}…",
+            message=esc(job.get("message") or "Preparing the saved documents."),
+            percent=percent,
+            sub=(f"{done} of {total} document(s) finished · "
+                 "you can switch tabs safely; facts appear as each document completes."),
         )
-        rows = queue_rows(job)
-        if rows:
-            queue = pd.DataFrame([{
-                "Document": row["filename"],
-                "Status": document_state_label(row["status"]),
-                "Records": row["facts"] if row["status"] in {"completed", "partial"} else "",
-                "Details": row["message"],
-            } for row in rows])
-            status.dataframe(
-                queue, hide_index=True, width="stretch",
-                height=min(240, max(110, 35 + 34 * len(queue))),
-            )
     elif job["status"] == "error":
         _render_processing_panel(
             job, title="Processing stopped", message=esc(job.get("message") or ""),
@@ -2963,6 +2952,38 @@ def _render_processing_panel(job: Dict[str, Any], title: str, message: str,
         + queue_html,
         unsafe_allow_html=True,
     )
+
+
+def _render_processing_inline(job: Dict[str, Any]) -> None:
+    """Show the active run beside the process button in Workspace."""
+    # Read the shared worker snapshot so the inline indicator updates with the queue.
+    total = max(0, int(job.get("total_docs") or 0))
+    done = max(0, min(int(job.get("done_docs") or 0), total)) if total else 0
+    percent = round(100 * done / total) if total else 0
+    # Put the spinner and plain-language message directly beside the disabled button.
+    st.markdown(
+        _LOADER_CSS
+        + '<div class="pp-loader" role="status" aria-live="polite">'
+        + '<div class="pp-spinner" aria-label="Processing"></div>'
+        + '<div><div class="pp-title">Processing documents, please wait</div>'
+        + f'<div class="pp-msg">{done} of {total} document(s) finished</div></div></div>',
+        unsafe_allow_html=True,
+    )
+    # Use Streamlit's native progress control so the percentage remains readable.
+    st.progress(percent, text=f"Overall progress · {done}/{total} finished")
+
+
+def _render_processing_recovered() -> None:
+    """Show an honest fallback when SQLite says active but the worker snapshot is absent."""
+    st.markdown(
+        _LOADER_CSS
+        + '<div class="pp-loader" role="status" aria-live="polite">'
+        + '<div class="pp-spinner" aria-label="Processing"></div>'
+        + '<div><div class="pp-title">Processing documents, please wait</div>'
+        + '<div class="pp-msg">The documents are queued or processing.</div></div></div>',
+        unsafe_allow_html=True,
+    )
+    st.progress(0, text="Waiting for live worker progress…")
 
 
 def _watch_processing_progress(job: Optional[Dict[str, Any]]) -> None:
@@ -3243,7 +3264,14 @@ def render_process_panel(docket_id: str) -> None:
     """Workspace step 2: choose saved documents and start extraction on them.
     Reruns every second while idle too, so the state counts and progress stay live."""
     job = processing_job(docket_id)
-    active = bool(job and job["status"] in {"queued", "running"})
+    # Read document states as well as the in-memory worker state. A hosted rerun can
+    # briefly lose the worker snapshot while SQLite still correctly says queued/processing.
+    initial_documents = list_documents(docket_id)
+    database_active = any(
+        document["status"] in {"queued", "processing", "saving"}
+        for document in initial_documents
+    )
+    active = bool(job and job["status"] in {"queued", "running"}) or database_active
     # Surface a finished run into the main page exactly once, so the results panel
     # and the stored-documents table refresh without waiting for a manual rerun.
     if st.session_state.pop("clear_process_pick", False):
@@ -3260,7 +3288,13 @@ def render_process_panel(docket_id: str) -> None:
     # renders on every page above this panel.
     with st.container(border=True):
         st.markdown("#### 2 · Process saved documents")
+        # Re-read after any worker update so the badges and process choices are current.
         documents = list_documents(docket_id)
+        database_active = any(
+            document["status"] in {"queued", "processing", "saving"}
+            for document in documents
+        )
+        active = bool(job and job["status"] in {"queued", "running"}) or database_active
         if documents:
             counts: Dict[str, int] = {}
             for d in documents:
@@ -3280,7 +3314,19 @@ def render_process_panel(docket_id: str) -> None:
                    "pooled Gemini keys. Saved, failed and partially processed documents are listed; "
                    "re-running a partial document replaces its earlier results.")
         processable = [d for d in documents if d["status"] in PROCESSABLE_STATES]
-        if not processable and not active:
+        if active:
+            # Keep the visual indicator beside the controls while processing is active.
+            action_col, progress_col = st.columns([1.35, 4], vertical_alignment="center")
+            action_col.button("Processing documents…", disabled=True, key="processing_active_button",
+                              **stretch())
+            with progress_col:
+                if job and job["status"] in {"queued", "running"}:
+                    _render_processing_inline(job)
+                else:
+                    # Preserve the truthful state message if the worker snapshot is
+                    # temporarily unavailable but persisted document states are active.
+                    _render_processing_recovered()
+        elif not processable:
             st.info("No documents are waiting to be processed. Save files in step 1 above first.")
         elif processable:
             labels = {
@@ -3317,6 +3363,7 @@ def render_process_panel(docket_id: str) -> None:
                 st.session_state["clear_process_pick"] = True
                 if queued_count or immediate_results:
                     st.rerun(scope="app")
+        # Keep the detailed queue below the controls while the compact indicator stays beside them.
         _render_processing_status(job)
         for failed in [r for r in st.session_state.get("last_results") or [] if r["status"] == "failed"]:
             st.error(f"{failed['filename']}: {failed['message']}", icon="🚫")
@@ -3880,8 +3927,16 @@ def render_topbar_status(docket_id: Optional[str]) -> None:
     cooling = active_cooldown_count()
     rejected = len(rejected_keys())
     active_job = processing_job(docket_id) if docket_id else None
+    database_active = False
+    if docket_id:
+        # The database remains authoritative if a hosted rerun temporarily loses the
+        # in-memory worker snapshot.
+        database_active = any(
+            document["status"] in {"queued", "processing", "saving"}
+            for document in list_documents(docket_id)
+        )
     processing_chip = ""
-    if active_job and active_job["status"] in {"queued", "running"}:
+    if (active_job and active_job["status"] in {"queued", "running"}) or database_active:
         processing_chip = (
             '<span class="chip processing" role="status" aria-live="polite" '
             'title="Document extraction is active">'
