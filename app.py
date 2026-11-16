@@ -105,6 +105,11 @@ _value_groups_component = (
     components.declare_component("parchi_value_groups", path=str(_VALUE_GROUP_COMPONENT_DIR))
     if _VALUE_GROUP_COMPONENT_DIR.is_dir() else None
 )
+_TEMPLATE_MAPPING_COMPONENT_DIR = BASE_DIR / "template_mapping_component"
+_template_mapping_component = (
+    components.declare_component("parchi_template_mapping_v2", path=str(_TEMPLATE_MAPPING_COMPONENT_DIR))
+    if _TEMPLATE_MAPPING_COMPONENT_DIR.is_dir() else None
+)
 def _env(name: str, default: Any = "") -> Any:
     """Read PARCHI_<name> configuration values."""
     return os.getenv(f"PARCHI_{name}", default)
@@ -221,7 +226,7 @@ def document_state_label(status: str) -> str:
 def document_state_badge(status: str) -> str:
     label, kind = DOCUMENT_STATE_META.get(status, (status.capitalize(), ""))
     return badge(label, kind)
-PAGES = ["Dockets", "Workspace", "Organize", "Viewer", "Validation", "Export", "Settings"]
+PAGES = ["Dockets", "Workspace", "Validation", "Organize", "Export", "Settings"]
 PAGE_ICONS = {
     "Dockets": "▤", "Workspace": "⬆", "Organize": "⌘", "Viewer": "▣",
     "Validation": "✔", "Export": "⇩", "Settings": "⚙",
@@ -898,6 +903,27 @@ def delete_document(docket_id: str, document_id: str) -> Optional[str]:
     return row["storage_path"]
 
 
+def rename_document(docket_id: str, document_id: str, filename: str) -> None:
+    """Rename the display filename without changing the stored original or its facts."""
+    clean = clean_text(filename).strip()
+    if not clean:
+        raise ValueError("Document name cannot be empty.")
+    if len(clean) > 255:
+        raise ValueError("Document name must be 255 characters or fewer.")
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT 1 FROM documents WHERE id = ? AND docket_id = ?",
+            (document_id, docket_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("That document no longer exists in this docket.")
+        connection.execute(
+            "UPDATE documents SET filename = ? WHERE id = ? AND docket_id = ?",
+            (clean, document_id, docket_id),
+        )
+        connection.execute("UPDATE dockets SET updated_at = ? WHERE id = ?", (utc_now(), docket_id))
+
+
 def list_dockets() -> List[sqlite3.Row]:
     with connect() as connection:
         return connection.execute(
@@ -1085,6 +1111,32 @@ def template_field_rows(template_id: str) -> List[sqlite3.Row]:
             "SELECT * FROM template_fields WHERE template_id = ? ORDER BY position, id",
             (template_id,),
         ).fetchall()
+
+
+def remap_template_field(template_id: str, destination: str, source_type: str,
+                         source_id: str, source_name: str) -> None:
+    """Persist one visual mapping while retaining every other template field."""
+    fields = [dict(row) for row in template_field_rows(template_id)]
+    if not fields:
+        with connect() as connection:
+            template = connection.execute(
+                "SELECT labels_json FROM templates WHERE id = ?", (template_id,)
+            ).fetchone()
+        labels = json.loads(template["labels_json"]) if template else []
+        fields = [
+            {"source_type": "label", "source_id": f"__unmapped__:{label}",
+             "source_name": "Unmapped", "destination_label": label, "position": index}
+            for index, label in enumerate(labels)
+        ]
+    target = normalize_label(destination)
+    found = False
+    for field in fields:
+        if normalize_label(field["destination_label"]) == target:
+            field.update(source_type=source_type, source_id=source_id, source_name=source_name)
+            found = True
+    if not found:
+        raise ValueError("That template label no longer exists. Refresh and try again.")
+    save_template_fields(template_id, fields)
 
 
 def append_template_labels(docket_id: str, template_id: str, labels: List[str]) -> List[str]:
@@ -2906,9 +2958,6 @@ def _render_processing_status(job: Optional[Dict[str, Any]]) -> None:
             title = "Queued for processing"
         else:
             title = "Processing saved documents"
-        # Keep progress outside st.status so hosted Streamlit cannot hide it inside a
-        # collapsed status container. The custom panel also keeps the spinner visible.
-        st.progress(percent, text=f"Overall document progress · {done}/{total} finished")
         _render_processing_panel(
             job,
             title=f"{title}…",
@@ -2929,7 +2978,6 @@ def _render_processing_status(job: Optional[Dict[str, Any]]) -> None:
         for row in rows:
             counts[row["status"]] = counts.get(row["status"], 0) + 1
         facts = sum(row["facts"] for row in rows)
-        st.progress(100, text="Overall document progress · complete")
         summary = " · ".join(
             f"{document_state_label(status)}: {counts[status]}"
             for status in ("completed", "partial", "failed") if status in counts
@@ -3005,8 +3053,6 @@ def _render_processing_inline(job: Dict[str, Any]) -> None:
         + f'<div class="pp-msg">{done} of {total} document(s) finished</div></div></div>',
         unsafe_allow_html=True,
     )
-    # Use Streamlit's native progress control so the percentage remains readable.
-    st.progress(percent, text=f"Overall progress · {done}/{total} finished")
 
 
 def _render_processing_recovered() -> None:
@@ -3019,7 +3065,6 @@ def _render_processing_recovered() -> None:
         + '<div class="pp-msg">The documents are queued or processing.</div></div></div>',
         unsafe_allow_html=True,
     )
-    st.progress(0, text="Waiting for live worker progress…")
 
 
 def _watch_processing_progress(job: Optional[Dict[str, Any]]) -> None:
@@ -3032,7 +3077,15 @@ def _watch_processing_progress(job: Optional[Dict[str, Any]]) -> None:
     mid-run doesn't trigger a pointless rerun."""
     if not job:
         return
-    progress_mark = (job["id"], job.get("done_docs", 0))
+    # Include the persisted fact count, not only the worker counter. A document is
+    # saved before the worker increments done_docs, and this makes the UI refresh
+    # immediately when facts become durable in SQLite.
+    with connect() as connection:
+        fact_count = int(connection.execute(
+            "SELECT COUNT(*) FROM facts WHERE docket_id = ? AND concept != 'page_processing_status'",
+            (job["docket_id"],),
+        ).fetchone()[0])
+    progress_mark = (job["id"], job.get("done_docs", 0), fact_count)
     if progress_mark == st.session_state.get("last_seen_progress"):
         return
     st.session_state["last_seen_progress"] = progress_mark
@@ -3831,6 +3884,10 @@ def inject_css() -> None:
         }
 
         /* navigation */
+        .nav-bottom-spacing { height: 14px; }
+        .document-card-icon { width:180px; height:96px; display:grid; place-items:center;
+            border:1px dashed var(--line); border-radius:8px; background:var(--panel2);
+            font-size:38px; margin-bottom:10px; }
         button[kind="tertiary"], button[data-testid="stBaseButton-tertiary"] {
             color: var(--muted) !important; font-weight: 600 !important; background: transparent !important;
             border: 1px solid transparent !important; border-radius: 8px !important; }
@@ -3973,11 +4030,13 @@ def render_topbar_status(docket_id: Optional[str]) -> None:
         )
     processing_chip = ""
     if (active_job and active_job["status"] in {"queued", "running"}) or database_active:
+        total = max(0, int((active_job or {}).get("total_docs") or 0))
+        done = max(0, min(int((active_job or {}).get("done_docs") or 0), total)) if total else 0
         processing_chip = (
             '<span class="chip processing" role="status" aria-live="polite" '
             'title="Document extraction is active">'
             '<span class="topbar-throbber" aria-hidden="true"></span>'
-            'Processing documents, please wait</span>'
+            f'Processing Documents {done}/{total}</span>'
         )
     extra = ""
     if cooling:
@@ -4045,8 +4104,7 @@ def render_topbar(dockets: List[sqlite3.Row]) -> Optional[sqlite3.Row]:
                 unsafe_allow_html=True,
             )
         else:
-            st.button("＋ Create your first docket", type="primary", on_click=go_to, args=("Dockets",),
-                      **stretch())
+            st.empty()
     with chips_col:
         render_topbar_status(str(current_docket["id"]) if current_docket is not None else None)
 
@@ -4056,7 +4114,7 @@ def render_topbar(dockets: List[sqlite3.Row]) -> Optional[sqlite3.Row]:
             st.button(f"{PAGE_ICONS[page]}  {page}", key=f"nav_{page}",
                       type="primary" if page == current else "tertiary",
                       on_click=go_to, args=(page,), **stretch())
-    st.divider()
+    st.markdown('<div class="nav-bottom-spacing"></div>', unsafe_allow_html=True)
     return active_docket(dockets)
 
 
@@ -4117,6 +4175,15 @@ def delete_document_callback(docket_id: str, document_id: str, filename: str) ->
         queue_flash("success", f"“{filename}” and its extracted facts were removed.")
     else:
         queue_flash("warning", "That document was already removed.")
+
+
+@guarded
+def rename_document_callback(docket_id: str, document_id: str, input_key: str) -> None:
+    try:
+        rename_document(docket_id, document_id, st.session_state.get(input_key, ""))
+        queue_flash("success", "Document renamed.")
+    except ValueError as exc:
+        queue_flash("error", str(exc))
 
 
 @guarded
@@ -4204,84 +4271,63 @@ def page_workspace(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) ->
                     "Save files in step 1 above. They stay available here until you process or remove them.")
         return
 
-    st.dataframe(
-        [
-            {
-                "Document": d["filename"],
-                "State": document_state_label(d["status"]),
-                "Type": d["document_type"],
-                "Pages": d["page_count"],
-                "Processed": f"{d['processed_units']}/{d['page_count']}",
-                "Completeness": d["completeness_status"],
-                "Size": fmt_size(d["size_bytes"]),
-                "Extraction": d["extraction_mode"],
-                "Added": display_time(d["created_at"]),
-                "File on disk": "✔" if resolve_stored_safe(d["storage_path"]) else "missing",
-            }
-            for d in documents
-        ],
-        hide_index=True,
-        **stretch(),
-    )
-
-    st.markdown("#### 4 · Document actions")
-    by_id = {d["id"]: d for d in documents}
-    chosen_id = st.selectbox(
-        "Choose a document",
-        list(by_id),
-        format_func=lambda i: f"{by_id[i]['filename']} — {document_state_label(by_id[i]['status'])}",
-        key="file_pick",
-        help="Select the document you want to inspect, download, process or remove.",
-    )
-    chosen = by_id[chosen_id]
-    with st.container(border=True):
-        badge_col, hint_col = st.columns([3, 1])
-        badge_col.markdown(
-            f"**{esc(chosen['filename'])}** · {document_state_badge(chosen['status'])}",
-            unsafe_allow_html=True,
-        )
-        hint_col.caption(f"{document_state_label(chosen['status'])}")
-        st.caption(f"{chosen['mime_type']} · {chosen['page_count']} page(s)/sheet(s) · "
-                   f"{fmt_size(chosen['size_bytes'])} · added {display_time(chosen['created_at'])}")
-        data, problem = read_verified(chosen["storage_path"], chosen["sha256"])
-        action_cols = st.columns([2, 1, 2], vertical_alignment="center")
-        with action_cols[0]:
-            if chosen["status"] in PROCESSABLE_STATES:
-                if st.button(
-                    "Process this document",
-                    type="primary",
-                    key=f"process_one_{chosen_id}",
-                    disabled=processing_active(docket_id),
-                    help="Run Gemini extraction on the stored original now.",
-                    **stretch(),
-                ):
-                    queue_saved_documents(docket_id, [chosen_id])
-                    st.rerun(scope="app")
-            elif chosen["status"] in ("queued", "processing", "saving"):
-                st.button("Process this document", disabled=True,
-                          help="This document is already queued or processing.", **stretch())
-            else:
-                st.button("Process this document", disabled=True,
-                          help="Already processed. Remove it and save it again to re-extract.",
-                          **stretch())
-        with action_cols[1]:
-            if data is not None:
-                st.download_button("Download", data, file_name=chosen["filename"],
-                                   mime=chosen["mime_type"], **stretch())
-            else:
-                st.button("Unavailable", disabled=True, help=problem, **stretch())
-        with action_cols[2]:
-            with st.popover("Remove document", **stretch()):
-                st.markdown(f"Remove **{chosen['filename']}**?")
-                st.caption("Deletes the stored original, its pages and every fact extracted from it. "
-                           "Other documents are unaffected.")
-                confirm_key = f"confirm_doc_{chosen_id}"
-                st.checkbox("I understand", key=confirm_key)
-                st.button("Remove permanently", type="primary", key=f"remove_doc_{chosen_id}",
-                          disabled=not st.session_state.get(confirm_key, False),
-                          on_click=delete_document_callback, args=(docket_id, chosen_id, chosen["filename"]))
-        if problem:
-            st.error(problem, icon="🚫")
+    st.markdown("**Documents**")
+    for start in range(0, len(documents), 2):
+        card_cols = st.columns(2, gap="medium")
+        for slot, document in enumerate(documents[start:start + 2]):
+            with card_cols[slot]:
+                with st.container(border=True):
+                    path = resolve_stored_safe(document["storage_path"])
+                    if path is not None and extension_of(path.name) in {"png", "jpg", "jpeg"}:
+                        st.image(path.read_bytes(), width=180)
+                    elif path is not None and extension_of(path.name) == "pdf" and fitz is not None:
+                        try:
+                            st.image(render_pdf_page(str(path), 1, path.stat().st_mtime), width=180)
+                        except Exception:
+                            st.caption("PDF preview unavailable")
+                    else:
+                        st.markdown("<div class='document-card-icon'>📄</div>", unsafe_allow_html=True)
+                    title_col, state_col = st.columns([3, 2], vertical_alignment="center")
+                    title_col.markdown(f"**{esc(document['filename'])}**", unsafe_allow_html=True)
+                    state_col.markdown(document_state_badge(document["status"]), unsafe_allow_html=True)
+                    st.caption(f"{document['mime_type']} · {document['page_count']} page(s)/sheet(s) · "
+                               f"{fmt_size(document['size_bytes'])} · "
+                               f"{document['processed_units']}/{document['page_count']} processed")
+                    rename_key = f"rename_document_{document['id']}"
+                    st.text_input("Document name", value=document["filename"], key=rename_key,
+                                  max_chars=255)
+                    rename_col, download_col, process_col, delete_col = st.columns(4)
+                    rename_col.button("Rename", key=f"rename_document_button_{document['id']}",
+                                      on_click=rename_document_callback,
+                                      args=(docket_id, document["id"], rename_key), **stretch())
+                    data, problem = read_verified(document["storage_path"], document["sha256"])
+                    if data is not None:
+                        download_col.download_button("Download", data, file_name=document["filename"],
+                                                     mime=document["mime_type"],
+                                                     key=f"download_document_{document['id']}", **stretch())
+                    else:
+                        download_col.button("Unavailable", disabled=True, key=f"unavailable_{document['id']}", **stretch())
+                    can_process = document["status"] in PROCESSABLE_STATES
+                    if can_process:
+                        if process_col.button("Process", type="primary",
+                                              key=f"process_one_{document['id']}",
+                                              disabled=processing_active(docket_id), **stretch()):
+                            queue_saved_documents(docket_id, [document["id"]])
+                            st.rerun(scope="app")
+                    else:
+                        process_col.button("Processed", disabled=True,
+                                           key=f"processed_{document['id']}", **stretch())
+                    with delete_col.popover("Delete", **stretch()):
+                        st.caption("Deletes the original, pages and extracted facts.")
+                        confirm_key = f"card_confirm_doc_{document['id']}"
+                        st.checkbox("I understand", key=confirm_key)
+                        st.button("Delete permanently", type="primary",
+                                  key=f"card_remove_doc_{document['id']}",
+                                  disabled=not st.session_state.get(confirm_key, False),
+                                  on_click=delete_document_callback,
+                                  args=(docket_id, document["id"], document["filename"]))
+                    if problem:
+                        st.error(problem, icon="🚫")
 
     with st.expander("5 · Docket actions"):
         st.caption("Rename or delete this docket. Deleting removes all of its documents and stored files.")
@@ -4642,7 +4688,13 @@ def _render_apply(active: sqlite3.Row, metadata: List[dict]) -> None:
                                   key=f"org_apply_pick_{docket_id}")
     template = next(row for row in templates if row["name"] == selected)
     template_id = template["id"]
-    template_labels = json.loads(template["labels_json"])
+    raw_template_labels = json.loads(template["labels_json"])
+    template_labels = [
+        str(item.get("label") or item.get("destination_label") or "").strip()
+        if isinstance(item, dict) else str(item).strip()
+        for item in raw_template_labels
+    ]
+    template_labels = [label for label in template_labels if label]
     fact_rows = fetch_facts(docket_id)
     document_names = {}
     for fact in fact_rows:
@@ -4657,6 +4709,10 @@ def _render_apply(active: sqlite3.Row, metadata: List[dict]) -> None:
     if not chosen:
         st.info("Select at least one document.")
         return
+    if not template_labels:
+        st.error("This template has no destination labels. Edit the template in Organize → Manage saved templates.",
+                 icon="🚫")
+        return
 
     chosen_records = [
         {"document_name": fact["filename"], "label": fact["label"], "value": fact["value"],
@@ -4664,119 +4720,83 @@ def _render_apply(active: sqlite3.Row, metadata: List[dict]) -> None:
         for fact in fact_rows if fact["document_id"] in set(chosen)
         and fact["concept"] != "page_processing_status"
     ]
-    labels = unique_labels(chosen_records)
-    sources_map = documents_by_label(chosen_records)
-
-    def from_docs(source: str) -> str:
-        names = sources_map.get(normalize_label(source), [])
-        return ", ".join(names) if names else "—"
-
-    current = approved_mappings(docket_id, template_id)
-    current_normalized = {normalize_label(source): target for source, target in current.items()}
-    rejected = rejected_suggestions(docket_id, template_id)
-    rejected_normalized = {(normalize_label(source), normalize_label(target))
-                           for source, target in rejected}
-
-    suggested: Dict[str, List[Dict[str, Any]]] = {}
-    unmatched: List[str] = []
-    for source in labels:
-        exact_target = exact_template_label(source, template_labels)
-        if exact_target is not None:
-            if normalize_label(source) not in current_normalized:
-                save_mapping(docket_id, template_id, source, exact_target, "exact")
-            continue
-        if normalize_label(source) in current_normalized:
-            continue
-        options = [m for m in fuzzy_suggestions(source, template_labels)
-                   if (normalize_label(source), normalize_label(m["label"])) not in rejected_normalized]
-        if options:
-            suggested[source] = options
-        else:
-            unmatched.append(source)
-
-    details = mapping_details(docket_id, template_id)
-
-    st.info(
-        "**How mapping works:** the left label (**source**) comes from Main Metadata, "
-        "the right label (**target**) is a field in your template. "
-        "The output file uses the target name."
-    )
-
-    decided_tab, suggested_tab, unmatched_tab = st.tabs([
-        f"Decided ({len(details)})",
-        f"Suggested ({sum(len(v) for v in suggested.values())})",
-        f"Unmatched ({len(unmatched)})",
-    ])
-
-    with decided_tab:
-        st.subheader("Decided")
-        if not details:
-            st.caption("No mappings yet.")
-        for source, info in sorted(details.items(), key=lambda item: item[0].casefold()):
-            text_col, unmap_col = st.columns([5, 1], vertical_alignment="center")
-            text_col.markdown(
-                f"**{source}**  →  **{info['target']}**  \n"
-                f"<small>from: {esc(from_docs(source))}</small>",
-                unsafe_allow_html=True,
-            )
-            if unmap_col.button("Unmap", key=f"tpl_unmap_{docket_id}_{template_id}_{key_id(source)}",
-                                **stretch()):
-                delete_mapping(docket_id, template_id, source, info["target"])
+    # Manual mapping board: the same three-column pill language used by Value Groups.
+    # The database remains authoritative; the component only reports one explicit drop.
+    if _template_mapping_component is not None:
+        fields = template_field_rows(template_id)
+        # Older templates may predate template_fields. Materialize their labels as
+        # explicit unmapped placeholders so the mapping board is never blank.
+        if not fields:
+            fields = [
+                {"destination_label": str(label), "source_type": "label",
+                 "source_id": f"__unmapped__:{label}", "source_name": "Unmapped",
+                 "position": index}
+                for index, label in enumerate(template_labels)
+            ]
+        with connect() as connection:
+            groups = load_groups(connection, docket_id)
+        chosen_set = set(chosen)
+        board_documents = []
+        for document_id in chosen:
+            document_facts = [
+                {"id": fact["id"], "label": fact["label"], "value": fact["value"],
+                 "score": int(fact["confidence_score"]), "document_id": document_id,
+                 "document": document_names[document_id]}
+                for fact in fact_rows if fact["document_id"] == document_id
+                and fact["concept"] != "page_processing_status"
+            ]
+            board_documents.append({"id": document_id, "name": document_names[document_id],
+                                    "facts": document_facts})
+        board_groups = []
+        for group in groups:
+            # Always send the complete current group list. Group membership can span
+            # several selected documents, so filtering by one document here made
+            # newly-created or cross-document groups disappear from the board.
+            primary = group["members"][0] if group["members"] else None
+            board_groups.append({"id": group["id"], "name": group["name"],
+                                 "primary": group["primary_label"],
+                                 "score": primary.confidence_score if primary else 0})
+        mappings = {}
+        for field in fields:
+            if str(field["source_id"]).startswith("__unmapped__:"):
+                continue
+            mappings[field["destination_label"]] = {
+                "id": field["source_id"], "kind": field["source_type"],
+                "label": field["source_name"], "value": "",
+            }
+        board = _template_mapping_component(
+            labels=[{"label": field["destination_label"]} for field in fields],
+            mappings=mappings, documents=board_documents, groups=board_groups,
+            key=f"template_mapping_v2_{docket_id}_{template_id}",
+        ) or {}
+        board_action = board.get("action")
+        if board_action in {"map", "remove_mapping"}:
+            try:
+                if board_action == "map":
+                    source_type = "group" if board.get("source_type") == "group" else "label"
+                    source_id = str(board.get("group_id") or board.get("fact_id") or board.get("source") or "")
+                    source_name = str(board.get("name") or board.get("source") or "")
+                    remap_template_field(template_id, str(board.get("target") or ""),
+                                         source_type, source_id, source_name)
+                    queue_flash("success", "Template mapping saved.")
+                else:
+                    target = str(board.get("target") or "")
+                    remap_template_field(template_id, target, "label",
+                                         f"__unmapped__:{target}", "Unmapped")
+                    queue_flash("success", "Mapping removed.")
+            except (ValueError, sqlite3.Error) as exc:
+                st.error(f"Could not save this mapping: {clean_text(exc)}", icon="🚫")
+            else:
                 st.rerun()
-
-    with suggested_tab:
-        st.subheader("Suggested")
-        if not suggested:
-            st.caption("No suggestions.")
-        for source, options in suggested.items():
-            for match in options:
-                target = match["label"]
-                pid = key_id(f"{source}\u241f{target}")
-                text_col, approve_col, reject_col = st.columns([4, 1, 1], vertical_alignment="center")
-                text_col.markdown(
-                    f"**{source}**  →  **{target}**  ({match['score']:.0f}%)  \n"
-                    f"<small>from: {esc(from_docs(source))}</small>",
-                    unsafe_allow_html=True,
-                )
-                if approve_col.button("Approve", key=f"tpl_approve_{docket_id}_{template_id}_{pid}",
-                                      **stretch()):
-                    save_mapping(docket_id, template_id, source, target, "user-approved")
-                    st.rerun()
-                if reject_col.button("Reject", key=f"tpl_reject_{docket_id}_{template_id}_{pid}",
-                                     **stretch()):
-                    reject_suggestion(docket_id, template_id, source, target)
-                    delete_mapping(docket_id, template_id, source, target)
-                    st.rerun()
-
-    with unmatched_tab:
-        st.subheader("Unmatched")
-        if not unmatched:
-            st.caption("Nothing unmatched.")
-        for source in unmatched:
-            label_col, target_col, map_col, add_col = st.columns([2, 2, 1, 1.5], vertical_alignment="bottom")
-            label_col.markdown(f"**{source}**  \n<small>from: {esc(from_docs(source))}</small>",
-                               unsafe_allow_html=True)
-            occurrences = [record for record in chosen_records
-                           if normalize_label(record["label"]) == normalize_label(source)]
-            with st.expander(f"Inspect {len(occurrences)} occurrence(s) · {source}"):
-                st.dataframe(
-                    [{"Source document": row["document_name"], "Original label": row["label"],
-                      "Value": row["value"], "Confidence score": row["confidence_score"]}
-                     for row in occurrences],
-                    hide_index=True, **stretch(),
-                )
-            target = target_col.selectbox(f"Field for {source}", template_labels,
-                                          key=f"tpl_manual_t_{docket_id}_{template_id}_{key_id(source)}",
-                                          label_visibility="collapsed")
-            if map_col.button("Map", key=f"tpl_manual_b_{docket_id}_{template_id}_{key_id(source)}",
-                              **stretch()):
-                save_mapping(docket_id, template_id, source, target, "manual")
-                st.rerun()
-            if add_col.button("Add as field", key=f"tpl_add_{docket_id}_{template_id}_{key_id(source)}",
-                              **stretch()):
-                append_template_labels(docket_id, template_id, [source])
-                queue_flash("success", f"“{source}” added to {template['name']}.")
-                st.rerun()
+        st.markdown("#### Manual mapping board")
+        st.caption("Drag one Main Metadata occurrence or grouped value into each template placeholder. "
+                   "Drop a replacement onto an occupied placeholder to replace it.")
+    else:
+        st.error("The template mapping board is unavailable. Ensure template_mapping_component/index.html "
+                 "is deployed beside app.py.", icon="🚫")
+    # The three-column board is now the complete Apply Existing Template workflow.
+    # Do not render the legacy Decided/Suggested/Unmatched panels beneath it.
+    return
 
 def _render_manage(active: sqlite3.Row, metadata: List[dict]) -> None:
     """Rename a template, change its fields, or delete it."""
@@ -5045,7 +5065,7 @@ def render_viewer_edit_history(docket_id: str) -> None:
 
 def page_viewer(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
     page_header(
-        "Viewer",
+        "Validation",
         "Edit Review Metadata separately from the untouched original — duplicates, "
         "conflicting values, document names and confidence scores are all preserved.",
         active["name"] if active else None,
@@ -5130,6 +5150,23 @@ def page_viewer(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
                    "edited records receive confidence 100, while source facts remain untouched.")
         viewer_template_editor(docket_id, editor_template_id, rows)
     render_viewer_edit_history(docket_id)
+
+    with st.expander("Validation checks", expanded=False):
+        st.caption("Deterministic completeness, evidence, consistency and arithmetic checks for this docket.")
+        with st.spinner("Running validation checks…"):
+            report = validation_report(docket_id)
+        counts = {band: sum(row["severity"] == band for row in report) for band in BANDS}
+        check_cols = st.columns(3)
+        check_cols[0].metric("Red issues", counts["Red"])
+        check_cols[1].metric("Yellow issues", counts["Yellow"])
+        check_cols[2].metric("Green", counts["Green"])
+        if counts["Red"] == 0 and counts["Yellow"] == 0:
+            st.success("No unresolved issues. This docket is ready to export.", icon="✅")
+        st.dataframe(
+            [{"Severity": f"{BAND_META[row['severity']][1]} {row['severity']}",
+              "Check": row["check"], "Details": row["message"]} for row in report],
+            hide_index=True, **stretch(),
+        )
 
 
 def page_validation(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
@@ -5325,9 +5362,8 @@ def page_settings(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> 
 RENDERERS = {
     "Dockets": page_dockets,
     "Workspace": page_workspace,
+    "Validation": page_viewer,
     "Organize": page_organize,
-    "Viewer": page_viewer,
-    "Validation": page_validation,
     "Export": page_export,
     "Settings": page_settings,
 }

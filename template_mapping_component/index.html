@@ -1,0 +1,136 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+:root{color-scheme:dark;--panel:#171c25;--panel2:#202734;--line:#2c3545;--ink:#eef2f8;--muted:#a4afc1;--accent:#6c8cff;--warn:#f2c46d}
+*{box-sizing:border-box}html,body{margin:0;padding:0;background:transparent}body{font:14px/1.4 system-ui;color:var(--ink)}
+.board{display:grid;grid-template-columns:minmax(150px,1fr) minmax(220px,1.35fr) minmax(300px,2fr);gap:12px;align-items:stretch}
+.panel{min-width:0;background:linear-gradient(155deg,#191f29,var(--panel));border:1px solid var(--line);border-radius:12px;padding:12px}
+.head{font-weight:700;margin-bottom:5px}.sub{color:var(--muted);font-size:12px;margin-bottom:10px}.stack{display:flex;flex-direction:column;gap:8px;max-height:540px;overflow:auto;padding-right:4px}
+.template-label{min-height:46px;height:46px;padding:11px 10px;border:1px solid #53617c;border-radius:9px;background:var(--panel2);font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mapping-slot{position:relative;min-height:46px;height:46px;padding:7px;border:1.5px dashed #657391;border-radius:9px;background:rgba(16,20,27,.5);display:flex;align-items:center;gap:6px;transition:.12s}
+.mapping-slot:before{content:"→";position:absolute;left:-20px;color:var(--accent);font-size:18px;font-weight:700;line-height:1}
+.mapping-slot.over{border-color:var(--warn);background:rgba(242,196,109,.12)}.empty{color:var(--muted);font-size:12px}.remove{margin-left:auto;border:0;background:transparent;color:#ffc2c7;cursor:pointer;font-size:17px}
+.pill{display:inline-block;max-width:100%;padding:7px 10px;border:1px solid #617ce0;border-radius:999px;background:#222a3a;cursor:grab;touch-action:none;user-select:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pill.group{border-color:#b38bda}.pill.dragging{opacity:.4}.doc{padding:8px;border:1px solid #303a4b;border-radius:9px;background:var(--panel2)}.doc-title{color:var(--muted);font-size:12px;margin-bottom:6px}.pills{display:flex;flex-wrap:wrap;gap:6px}.group-title{color:var(--muted);font-size:12px;margin-top:5px}
+@media(max-width:900px){.board{grid-template-columns:1fr}.stack{max-height:none}}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+(function(){
+  "use strict";
+  let args={};
+  let dragged=null;
+  let highlighted=null;
+  const root=document.getElementById("root");
+
+  function node(tag, className, text){
+    const item=document.createElement(tag);
+    if(className)item.className=className;
+    if(text!==undefined)item.textContent=text;
+    return item;
+  }
+  function send(value){
+    window.parent.postMessage({isStreamlitMessage:true,type:"streamlit:setComponentValue",value:value,dataType:"json"},"*");
+  }
+  function event(action){
+    send(Object.assign({event_id:String(Date.now())+"-"+Math.random()},action));
+  }
+  function makePill(item, kind){
+    const pill=node("div",kind==="group"?"pill group":"pill",
+      String(item.label||item.name||"")+(item.value?" · "+String(item.value):""));
+    pill.dataset.id=String(item.id);
+    pill.addEventListener("pointerdown",function(ev){
+      ev.preventDefault();
+      dragged={id:String(item.id),kind:kind,source:kind==="group"?String(item.id):String(item.label||""),name:String(item.name||item.label||"")};
+      pill.classList.add("dragging");
+      try{pill.setPointerCapture(ev.pointerId)}catch(_){ }
+    });
+    return pill;
+  }
+  function clearHighlight(){
+    if(highlighted)highlighted.classList.remove("over");
+    highlighted=null;
+  }
+  function finishDrag(ev){
+    if(!dragged)return;
+    const target=document.elementFromPoint(ev.clientX,ev.clientY);
+    const slot=target&&target.closest(".mapping-slot");
+    if(slot){
+      event({action:"map",target:slot.dataset.target,source:dragged.source,
+        source_type:dragged.kind,name:dragged.name,
+        fact_id:dragged.kind==="label"?dragged.id:null,
+        group_id:dragged.kind==="group"?dragged.id:null});
+    }
+    clearHighlight();
+    document.querySelectorAll(".dragging").forEach(item=>item.classList.remove("dragging"));
+    dragged=null;
+  }
+  function render(){
+    root.replaceChildren();
+    const board=node("div","board");
+    const labelPanel=node("section","panel");
+    const mappingPanel=node("section","panel");
+    const sourcePanel=node("section","panel");
+    labelPanel.append(node("div","head","Template Labels"),node("div","sub","Fixed destination fields"));
+    mappingPanel.append(node("div","head","Mapping"),node("div","sub","Drop one pill into each field"));
+    sourcePanel.append(node("div","head","Main Metadata Labels"),node("div","sub","Press and drag a pill"));
+    const labels=node("div","stack");
+    const slots=node("div","stack");
+    const sources=node("div","stack");
+    const templateLabels=Array.isArray(args.labels)?args.labels:[];
+    const currentMappings=args.mappings||{};
+
+    templateLabels.forEach(function(template){
+      const label=String(template.label||"");
+      labels.append(node("div","template-label",label));
+      const slot=node("div","mapping-slot");
+      slot.dataset.target=label;
+      const current=currentMappings[label];
+      if(current){
+        slot.append(makePill(current,current.kind==="group"?"group":"label"));
+        const remove=node("button","remove","×");
+        remove.type="button";remove.title="Remove mapping";
+        remove.onclick=function(){event({action:"remove_mapping",target:label});};
+        slot.append(remove);
+      }else{
+        slot.append(node("span","empty","Drop pill here"));
+      }
+      slot.addEventListener("pointermove",function(){
+        if(!dragged)return;
+        clearHighlight();slot.classList.add("over");highlighted=slot;
+      });
+      slots.append(slot);
+    });
+
+    (Array.isArray(args.documents)?args.documents:[]).forEach(function(document){
+      const card=node("div","doc");
+      card.append(node("div","doc-title",String(document.name||"Document")));
+      const pills=node("div","pills");
+      (Array.isArray(document.facts)?document.facts:[]).forEach(function(fact){pills.append(makePill(fact,"label"));});
+      card.append(pills);sources.append(card);
+    });
+    const groups=Array.isArray(args.groups)?args.groups:[];
+    if(groups.length){
+      sources.append(node("div","group-title","Grouped Values"));
+      const groupPills=node("div","pills");
+      groups.forEach(function(group){
+        groupPills.append(makePill({id:group.id,label:group.name,value:group.primary||"",name:group.name},"group"));
+      });
+      sources.append(groupPills);
+    }
+    labelPanel.append(labels);mappingPanel.append(slots);sourcePanel.append(sources);board.append(labelPanel,mappingPanel,sourcePanel);root.append(board);
+    window.parent.postMessage({isStreamlitMessage:true,type:"streamlit:setFrameHeight",height:document.body.scrollHeight+8},"*");
+  }
+  document.addEventListener("pointerup",finishDrag);
+  document.addEventListener("pointercancel",finishDrag);
+  document.addEventListener("pointermove",function(ev){if(dragged)ev.preventDefault();},{passive:false});
+  window.addEventListener("message",function(ev){if(ev.data&&ev.data.type==="streamlit:render"){args=ev.data.args||{};render();}});
+  window.parent.postMessage({isStreamlitMessage:true,type:"streamlit:componentReady",apiVersion:1},"*");
+})();
+</script>
+</body>
+</html>
