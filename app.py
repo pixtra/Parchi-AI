@@ -76,9 +76,9 @@ except ImportError:
     Image = None
 
 try:
-    import fitz  # PyMuPDF
+    import pymupdf
 except ImportError:
-    fitz = None
+    pymupdf = None
 
 try:
     from google import genai
@@ -668,9 +668,9 @@ def validate_upload(filename: str, data: bytes) -> Optional[str]:
                 return "The workbook contains no worksheets."
         except Exception as exc:  # noqa: BLE001
             return f"The workbook could not be opened ({exc.__class__.__name__})."
-    if extension == "pdf" and fitz is not None:
+    if extension == "pdf" and pymupdf is not None:
         try:
-            with fitz.open(stream=data, filetype="pdf") as document:
+            with pymupdf.open(stream=data, filetype="pdf") as document:
                 if document.needs_pass:
                     return "The PDF is password-protected. Remove the password and upload it again."
                 if document.page_count == 0:
@@ -1300,10 +1300,10 @@ def decode_text(data: bytes) -> str:
 def read_pages(filename: str, data: bytes) -> List[Dict[str, Any]]:
     extension = extension_of(filename)
     if extension == "pdf":
-        if fitz is None:
+        if pymupdf is None:
             raise RuntimeError("PyMuPDF is not installed (pip install pymupdf).")
         pages = []
-        with fitz.open(stream=data, filetype="pdf") as document:
+        with pymupdf.open(stream=data, filetype="pdf") as document:
             for index, page in enumerate(document, start=1):
                 text = clean_text(page.get_text("text")).strip()
                 pages.append({"page_number": index, "sheet_name": "", "text": text, "readable": bool(text)})
@@ -1324,14 +1324,14 @@ def read_pages(filename: str, data: bytes) -> List[Dict[str, Any]]:
 
 
 def split_pdf(data: bytes, pages_per_part: int) -> List[Tuple[int, int, bytes]]:
-    with fitz.open(stream=data, filetype="pdf") as source:
+    with pymupdf.open(stream=data, filetype="pdf") as source:
         total = source.page_count
         if total <= pages_per_part:
             return [(0, total, data)]
         parts = []
         for start in range(0, total, pages_per_part):
             end = min(start + pages_per_part, total)
-            with fitz.open() as part:
+        with pymupdf.open() as part:
                 part.insert_pdf(source, from_page=start, to_page=end - 1)
                 parts.append((start, end - start, part.tobytes()))
         return parts
@@ -1818,7 +1818,7 @@ class MalformedResponse(Exception):
 
 
 def make_units(doc: Dict[str, Any], label: Optional[str] = None) -> List[Dict[str, Any]]:
-    if extension_of(doc["filename"]) == "pdf" and fitz is not None:
+    if extension_of(doc["filename"]) == "pdf" and pymupdf is not None:
         parts = split_pdf(doc["data"], CHUNK_PAGES)
         part_meta = [(start, count, blob, doc["mime"], "." + extension_of(doc["filename"]),
                       None) for start, count, blob in parts]
@@ -4280,7 +4280,7 @@ def page_workspace(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) ->
                     path = resolve_stored_safe(document["storage_path"])
                     if path is not None and extension_of(path.name) in {"png", "jpg", "jpeg"}:
                         st.image(path.read_bytes(), width=180)
-                    elif path is not None and extension_of(path.name) == "pdf" and fitz is not None:
+                    elif path is not None and extension_of(path.name) == "pdf" and pymupdf is not None:
                         try:
                             st.image(render_pdf_page(str(path), 1, path.stat().st_mtime), width=180)
                         except Exception:
@@ -4345,9 +4345,9 @@ def page_workspace(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) ->
 
 @st.cache_data(show_spinner=False, max_entries=48)
 def render_pdf_page(path: str, page_number: int, mtime: float) -> bytes:
-    with fitz.open(path) as document:
+    with pymupdf.open(path) as document:
         index = min(max(1, page_number), document.page_count) - 1
-        return document[index].get_pixmap(matrix=fitz.Matrix(1.5, 1.5)).tobytes("png")
+        return document[index].get_pixmap(matrix=pymupdf.Matrix(1.5, 1.5)).tobytes("png")
 
 
 def source_preview(fact: sqlite3.Row) -> None:
@@ -4361,7 +4361,7 @@ def source_preview(fact: sqlite3.Row) -> None:
     try:
         if extension in ("png", "jpg", "jpeg"):
             st.image(path.read_bytes(), caption=f"{fact['filename']}", **stretch())
-        elif extension == "pdf" and fitz is not None:
+        elif extension == "pdf" and pymupdf is not None:
             image = render_pdf_page(str(path), fact["page_number"], path.stat().st_mtime)
             st.image(image, caption=f"{fact['filename']} · page {fact['page_number']}", **stretch())
         elif extension == "txt":
