@@ -1761,6 +1761,10 @@ class OversizedBatch(Exception):
     """Output was truncated or input was too large; the batch must be split."""
 
 
+class MalformedResponse(Exception):
+    """Gemini returned a response that could not be parsed as the required JSON."""
+
+
 def make_units(doc: Dict[str, Any], label: Optional[str] = None) -> List[Dict[str, Any]]:
     if extension_of(doc["filename"]) == "pdf" and fitz is not None:
         parts = split_pdf(doc["data"], CHUNK_PAGES)
@@ -2062,6 +2066,7 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
 
     labels = [unit["label"] for unit in batch]
     errors: List[str] = []
+    parse_failure: Optional[str] = None
     uploads: Dict[str, Tuple[Any, List[Any]]] = {}
     try:
         pool_pass = 0
@@ -2138,10 +2143,16 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
                     finally:
                         set_gemini_activity(False)
 
-                    if "MAX_TOKENS" in finish_reason(response):
+                    response_reason = finish_reason(response)
+                    response_text = response.text or ""
+                    LOG.info(
+                        "Gemini response diagnostics for %s · %s: finish_reason=%s, chars=%d",
+                        masked, model, response_reason or "unknown", len(response_text),
+                    )
+                    if "MAX_TOKENS" in response_reason:
                         raise OversizedBatch("response was truncated at the output token limit")
                     try:
-                        parsed = parse_batch_payload(response.text or "", labels)
+                        parsed = parse_batch_payload(response_text, labels)
                         token_scores = _token_confidences(response)
                         for unit in batch:
                             bucket = parsed[0].get(unit["label"])
@@ -2153,9 +2164,18 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
                                 if candidates:
                                     fact["_token_probability"] = candidates.pop(0)
                     except ValueError as exc:  # json.JSONDecodeError is a ValueError
-                        LOG.warning("Gemini extraction schema/payload parse failed for %s · %s: %s",
-                                    masked, model, str(exc)[:300])
-                        errors.append(f"{masked} · {model}: invalid JSON ({str(exc)[:120]})")
+                        parse_failure = str(exc)
+                        LOG.warning(
+                            "Gemini extraction schema/payload parse failed for %s · %s: "
+                            "finish_reason=%s, chars=%d, error=%s",
+                            masked, model, response_reason or "unknown", len(response_text),
+                            str(exc)[:300],
+                        )
+                        errors.append(
+                            f"{masked} · {model}: invalid JSON "
+                            f"(finish_reason={response_reason or 'unknown'}, chars={len(response_text)}, "
+                            f"{str(exc)[:120]})"
+                        )
                         continue
                     record_key_success(keys, entry["id"])
                     return parsed, f"{masked} · {model}"
@@ -2167,6 +2187,11 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
             set_gemini_activity(True, f"Every pooled key is cooling down; retrying in {int(wait)}s")
             time.sleep(wait)
             set_gemini_activity(False)
+        if parse_failure is not None:
+            raise MalformedResponse(
+                "Gemini returned malformed JSON after trying the configured pool: "
+                + "; ".join(errors[-3:])
+            )
         raise RuntimeError("; ".join(errors[-6:]) or "every key and model failed")
     finally:
         for client, handles in uploads.values():
@@ -2223,6 +2248,17 @@ def process_units(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -> No
             process_units(batch[middle:], keys)
             return
         unit_failed(batch[0], f"part too large to process even alone ({str(exc)[:150]})")
+        return
+    except MalformedResponse as exc:
+        # A malformed batched response can be caused by output complexity even when
+        # the request itself was accepted. Split it before declaring the documents
+        # failed, while retaining the original failure for the single-unit case.
+        if len(batch) > 1:
+            middle = len(batch) // 2
+            process_units(batch[:middle], keys)
+            process_units(batch[middle:], keys)
+            return
+        unit_failed(batch[0], f"Gemini returned invalid JSON ({str(exc)[:250]})")
         return
     except Exception as exc:  # noqa: BLE001
         for unit in batch:
