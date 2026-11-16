@@ -1625,21 +1625,41 @@ def clear_cooldowns() -> None:
 
 
 def _config_gemini_keys() -> List[Tuple[str, str]]:
-    """Keys from the application configuration file (parchi.config.json).
+    """Keys from the local config file and Streamlit's hosted secrets store.
 
     Supports "gemini_api_keys": ["key1", "key2"] and a single "gemini_api_key": "…".
-    Loaded fresh on every pool lookup, so editing the file needs no app restart.
+    Loaded fresh on every pool lookup, so editing the file or hosted secrets needs no
+    app restart when the hosting platform reloads its secrets.
     """
-    config = load_config()
     found: List[Tuple[str, str]] = []
-    raw_list = config.get("gemini_api_keys", [])
-    if isinstance(raw_list, str):
-        raw_list = re.split(r"[\n,;]+", raw_list)
-    if isinstance(raw_list, list):
-        found.extend((str(item).strip(), "config file") for item in raw_list)
-    single = str(config.get("gemini_api_key", "") or "").strip()
-    if single:
-        found.append((single, "config file"))
+
+    def add_from(source_config: Any, source_name: str) -> None:
+        """Extract supported key shapes from one dictionary-like secret source."""
+        if not hasattr(source_config, "get"):
+            return
+        raw_list = source_config.get("gemini_api_keys", [])
+        if isinstance(raw_list, str):
+            raw_list = re.split(r"[\n,;]+", raw_list)
+        if isinstance(raw_list, (list, tuple)):
+            found.extend((str(item).strip(), source_name) for item in raw_list)
+        single = str(source_config.get("gemini_api_key", "") or "").strip()
+        if single:
+            found.append((single, source_name))
+
+    # Read the checked-in/local configuration path first.
+    add_from(load_config(), "config file")
+
+    # Streamlit Cloud exposes dashboard secrets through st.secrets, even when there
+    # is no readable .streamlit/secrets.toml file inside the deployed filesystem.
+    try:
+        hosted_secrets = dict(st.secrets)
+    except Exception:
+        hosted_secrets = {}
+    add_from(hosted_secrets, "Streamlit secrets")
+
+    # Also accept a [general] section, which is a common way users organize secrets.
+    general = hosted_secrets.get("general") if isinstance(hosted_secrets, dict) else None
+    add_from(general, "Streamlit secrets")
     return found
 
 
@@ -3170,8 +3190,9 @@ def queue_saved_documents(docket_id: str, document_ids: List[str]) -> Tuple[int,
     if not keys:
         queue_flash(
             "error",
-            f"No Gemini API keys are configured. Add 4–5 keys to “gemini_api_keys” in "
-            f"{CONFIG_PATH.name} (see Settings) before processing.",
+            "No Gemini API keys are configured. Add 4–5 keys to “gemini_api_keys” in "
+            f"{CONFIG_PATH.name} or the hosting provider's Streamlit secrets (see Settings) "
+            "before processing.",
         )
         return 0, []
     existing = processing_job(docket_id)
@@ -5138,7 +5159,8 @@ def page_settings(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> 
     st.markdown("#### Gemini API key pool")
     st.caption(
         "Keys come from the application configuration — the “gemini_api_keys” list in "
-        f"`{CONFIG_PATH.name}` — or the `GEMINI_API_KEYS`/`GEMINI_API_KEY` environment variables. "
+        f"`{CONFIG_PATH.name}`, the hosting provider's Streamlit secrets, or the "
+        "`GEMINI_API_KEYS`/`GEMINI_API_KEY` environment variables. "
         "Keys are always masked here, rotated round-robin while processing, and never appear "
         "in logs. A quota or rate-limit error pauses the affected key and model for a minute; "
         "an invalid or rejected key is parked for an hour. Editing the config file takes "
@@ -5149,11 +5171,12 @@ def page_settings(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> 
     for bad in rejected_keys():
         st.error(f"A key from “{bad['source']}” ending {bad['masked']} was ignored because it is not a valid "
                  "API key (it must be a complete ASCII key beginning with “AQ.” or “AIza”, with no spaces). "
-                 f"Check the value in `{CONFIG_PATH.name}` or the GEMINI_API_KEY(S) variable.", icon="🚫")
+                 f"Check `{CONFIG_PATH.name}`, the hosting provider's Streamlit secrets, "
+                 "or the GEMINI_API_KEY(S) variable.", icon="🚫")
     if not entries:
         st.warning(
             "No valid Gemini keys configured. Add 4–5 keys to “gemini_api_keys” in "
-            f"`{CONFIG_PATH.name}` before processing documents.",
+            f"`{CONFIG_PATH.name}` or the hosting provider's Streamlit secrets before processing documents.",
             icon="⚠️",
         )
     else:
