@@ -1,3 +1,5 @@
+"""Regression tests for key pooling and manual group priority behavior."""
+
 import sqlite3
 import unittest
 from types import SimpleNamespace
@@ -16,6 +18,7 @@ from value_groups import (
 
 
 class PoolingTests(unittest.TestCase):
+    """Verify that key rotation skips cooling and invalid credentials."""
     def setUp(self):
         self.keys = [{"id": "a"}, {"id": "b"}, {"id": "c"}]
         app._KEY_ROTATION_INDEX = 0
@@ -76,6 +79,7 @@ class PoolingTests(unittest.TestCase):
 
 
 class GroupPriorityTests(unittest.TestCase):
+    """Verify that the first saved member controls manual group priority."""
     def setUp(self):
         self.db = sqlite3.connect(":memory:")
         self.db.row_factory = sqlite3.Row

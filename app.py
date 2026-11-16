@@ -167,7 +167,6 @@ MIME_TYPES = {
     "csv": "text/csv",
 }
 BANDS = ("Green", "Yellow", "Red")
-REVIEW_STATUSES = ("pending", "approved", "rejected")
 # Document lifecycle: saved → queued → processing → completed / partial / failed.
 # "pending" documents exist only in pre-split databases and mean "saved, not processed".
 DOCUMENT_STATES = ("saved", "pending", "queued", "saving", "processing", "completed", "partial", "failed")
@@ -1204,13 +1203,6 @@ def rejected_suggestions(docket_id: str, template_id: str) -> set:
             (template_id,),
         ).fetchall()
     return {(row["source_label"], row["requested_label"]) for row in rows}
-
-
-def fact_history(fact_id: str) -> List[sqlite3.Row]:
-    with connect() as connection:
-        return connection.execute(
-            "SELECT * FROM fact_history WHERE fact_id = ? ORDER BY changed_at DESC", (fact_id,)
-        ).fetchall()
 
 
 # ---------------------------------------------------------------- reading documents
@@ -3280,59 +3272,6 @@ def render_process_panel(docket_id: str) -> None:
         if active:
             st.caption("A run is active, so the process buttons are disabled to avoid duplicate submissions.")
 
-# ---------------------------------------------------------------- review operations
-def update_fact(fact_id: str, value: str, status: str, reason: str) -> None:
-    value = clean_text(value)
-    with connect() as connection:
-        row = connection.execute(
-            """SELECT f.*, p.text AS page_text, p.readable AS page_readable
-               FROM facts f LEFT JOIN pages p
-                 ON p.document_id = f.document_id AND p.page_number = f.page_number
-               WHERE f.id = ?""",
-            (fact_id,),
-        ).fetchone()
-        if row is None:
-            raise ValueError("That fact no longer exists.")
-        now = utc_now()
-        if row["value"] != value or row["review_status"] != status:
-            connection.execute(
-                """INSERT INTO fact_history (id, fact_id, old_value, new_value, old_status,
-                   new_status, changed_at, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (str(uuid.uuid4()), fact_id, row["value"], value,
-                 row["review_status"], status, now, reason),
-            )
-        corrected = int(bool(row["corrected"]) or value != row["original_value"])
-        if status in ("approved", "rejected"):
-            # A human decision changes the review status only: the model's per-occurrence
-            # confidence score is preserved exactly as extracted (band follows the score).
-            score = clamp_confidence(row["confidence_score"], 50)
-            band = band_for(score)
-            reasons = [r for r in json.loads(row["confidence_reasons"] or "[]")
-                       if r not in {"HUMAN_APPROVED", "HUMAN_REJECTED"}]
-            reasons.append("HUMAN_APPROVED" if status == "approved" else "HUMAN_REJECTED")
-        else:
-            page_text = row["page_text"] if row["page_readable"] else None
-            assessment = assess(value, row["source_evidence"], page_text)
-            band, score, reasons = assessment["band"], assessment["score"], assessment["reasons"]
-        if corrected:
-            reasons = list(dict.fromkeys(reasons + ["HUMAN_EDITED"]))
-        connection.execute(
-            """UPDATE facts SET value = ?, corrected = ?, confidence_band = ?, confidence_score = ?,
-               confidence_reasons = ?, review_status = ?, updated_at = ? WHERE id = ?""",
-            (value, corrected, band, score, json.dumps(reasons), status, now, fact_id),
-        )
-        connection.execute("UPDATE dockets SET updated_at = ? WHERE id = ?", (now, row["docket_id"]))
-
-
-def approve_green(docket_id: str) -> int:
-    count = 0
-    for fact in fetch_facts(docket_id):
-        if fact["confidence_band"] == "Green" and fact["review_status"] == "pending":
-            update_fact(fact["id"], fact["value"], "approved", "bulk approve Green")
-            count += 1
-    return count
-
-
 # ---------------------------------------------------------------- validation
 def _number(value: str) -> Optional[float]:
     if "%" in value:
@@ -3844,11 +3783,6 @@ def band_badge(band: str) -> str:
     return badge(band, kind, icon)
 
 
-def status_badge(status: str) -> str:
-    kind, icon = STATUS_META.get(status, ("", ""))
-    return badge(status.capitalize(), kind, icon)
-
-
 def page_header(title: str, subtitle: str, docket_name: Optional[str]) -> None:
     crumb = f"{esc(docket_name)} › " if docket_name else ""
     st.markdown(
@@ -4049,20 +3983,6 @@ def clear_cooldowns_callback() -> None:
     queue_flash("success", "Cooldowns cleared.")
 
 
-@guarded
-def approve_green_callback(docket_id: str) -> None:
-    queue_flash("success", f"Approved {approve_green(docket_id)} Green fact(s).")
-
-
-@guarded
-def save_review_callback(fact_id: str, value_key: str, status_key: str) -> None:
-    try:
-        update_fact(fact_id, st.session_state[value_key], st.session_state[status_key], "human review")
-        queue_flash("success", "Review saved to history.")
-    except ValueError as exc:
-        queue_flash("error", str(exc))
-
-
 # ---------------------------------------------------------------- pages
 def page_dockets(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
     page_header("Dockets", "Each docket groups the supplier documents for one shipment, supplier or period.", None)
@@ -4235,11 +4155,6 @@ def page_workspace(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) ->
                   on_click=delete_docket_callback, args=(docket_id, active["name"]))
 
 
-def fact_label(fact: sqlite3.Row) -> str:
-    return (f"{fact['filename']} · p.{fact['page_number']} · {fact['label']} · "
-            f"{fact['confidence_band']} · {fact['review_status']}")
-
-
 @st.cache_data(show_spinner=False, max_entries=48)
 def render_pdf_page(path: str, page_number: int, mtime: float) -> bytes:
     with fitz.open(path) as document:
@@ -4285,103 +4200,6 @@ def source_preview(fact: sqlite3.Row) -> None:
         st.warning(f"The preview could not be rendered ({exc.__class__.__name__}). "
                    "Download the original from the Workspace instead.", icon="⚠️")
 
-
-def page_review(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
-    page_header("Review", "Verify extracted values against the source evidence. Every change is recorded.",
-                active["name"] if active else None)
-    if not need_docket(active):
-        return
-    docket_id = active["id"]
-    facts = fetch_facts(docket_id)
-    if not facts:
-        empty_state("Nothing to review yet", "Process documents in the Workspace to extract facts.")
-        return
-
-    documents = sorted({f["filename"] for f in facts})
-    doc_col, band_col, status_col = st.columns(3)
-    doc_filter = doc_col.selectbox("Document", ["All documents"] + documents, key="review_doc")
-    with band_col:
-        st.markdown(
-            "**Confidence band** "
-            + " ".join(
-                badge(f"{band} — {meaning}", kind, icon)
-                for band, (kind, icon), meaning in zip(
-                    BANDS, BAND_META.values(), ("high", "medium", "low")
-                )
-            ),
-            unsafe_allow_html=True,
-        )
-        band_filter = st.pills(
-            "Confidence band",
-            list(BANDS),
-            selection_mode="multi",
-            default=list(BANDS),
-            key="review_band",
-            label_visibility="collapsed",
-            help="Green = high confidence (score > 80), Yellow = medium (66–80), Red = low (≤ 65).",
-        ) or []
-    status_filter = status_col.selectbox("Review status", ["All"] + list(REVIEW_STATUSES), key="review_status")
-
-    visible = [
-        f for f in facts
-        if (doc_filter == "All documents" or f["filename"] == doc_filter)
-        and f["confidence_band"] in band_filter
-        and (status_filter == "All" or f["review_status"] == status_filter)
-    ]
-    green_pending = sum(f["confidence_band"] == "Green" and f["review_status"] == "pending" for f in facts)
-    summary_col, bulk_col = st.columns([3, 1], vertical_alignment="center")
-    band_counts = {band: sum(f["confidence_band"] == band for f in visible) for band in BANDS}
-    summary_col.markdown(
-        f"Showing **{len(visible)}** of {len(facts)} facts: "
-        + " ".join(badge(f"{band} {count}", BAND_META[band][0], BAND_META[band][1])
-                   for band, count in band_counts.items()),
-        unsafe_allow_html=True,
-    )
-    bulk_col.button(f"Approve Green pending ({green_pending})", on_click=approve_green_callback,
-                    args=(docket_id,), disabled=green_pending == 0, **stretch())
-
-    if not visible:
-        st.info("No facts match the current filters. Widen the confidence or status filters.")
-        return
-
-    by_id = {f["id"]: f for f in visible}
-    fact_id = st.selectbox("Fact", list(by_id), format_func=lambda i: fact_label(by_id[i]), key="review_fact")
-    fact = by_id[fact_id]
-
-    editor_col, preview_col = st.columns([3, 2])
-    with editor_col:
-        with st.container(border=True):
-            st.markdown(f"**{fact['label']}** · concept `{fact['concept']}`")
-            st.markdown(band_badge(fact["confidence_band"]) + " " + status_badge(fact["review_status"]),
-                        unsafe_allow_html=True)
-            reasons = ", ".join(json.loads(fact["confidence_reasons"])) or "none"
-            st.caption(f"Score {fact['confidence_score']} · Reasons: {reasons} · "
-                       f"Original value: {fact['original_value'] or '(empty)'}")
-            st.markdown("**Source evidence**")
-            st.code(fact["source_evidence"] or "None captured", language=None)
-            # The version suffix makes widget state reset after a save or bulk approval.
-            version = f"{fact_id}_{fact['updated_at']}"
-            value_key, status_key = f"edit_{version}", f"status_{version}"
-            st.text_area("Value", fact["value"], key=value_key)
-            st.selectbox("Review status", list(REVIEW_STATUSES),
-                         index=list(REVIEW_STATUSES).index(fact["review_status"]), key=status_key)
-            st.button("Save review", type="primary", on_click=save_review_callback,
-                      args=(fact_id, value_key, status_key))
-    with preview_col:
-        with st.container(border=True):
-            source_preview(fact)
-
-    history = fact_history(fact_id)
-    with st.expander(f"Change history ({len(history)})"):
-        if history:
-            st.dataframe(
-                [{"When": display_time(h["changed_at"]), "Old value": h["old_value"],
-                  "New value": h["new_value"], "Status": f"{h['old_status']} → {h['new_status']}",
-                  "Reason": h["reason"]} for h in history],
-                hide_index=True, **stretch(),
-            )
-        else:
-            st.caption("No changes recorded yet.")
 
 FUZZY_MIN_SCORE = 70
 

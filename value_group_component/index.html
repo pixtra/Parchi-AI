@@ -241,11 +241,15 @@
       scroll: true,
       scrollSensitivity: 60,
       scrollSpeed: 12,
-      // Group Values is a temporary draft. Spilling its pills outside the board removes
-      // only those IDs from the draft; the saved document facts remain untouched.
-      removeOnSpill: zone.id === "draft",
-      onSpill: () => {
-        if (zone.id === "draft") requestAnimationFrame(emit);
+      // Do not enable SortableJS's automatic spill removal. In an iframe it can treat
+      // a normal drag interruption as a spill and remove a pill unexpectedly.
+      removeOnSpill: false,
+      onSpill: event => {
+        // Remove a draft pill only when Sortable confirms that the drop happened outside
+        // every valid drop zone. Moving within the board leaves the pill untouched.
+        if (zone.id !== "draft" || !event.dragEl) return;
+        if (event.dragEl.parentNode) event.dragEl.parentNode.removeChild(event.dragEl);
+        requestAnimationFrame(emit);
       },
       onStart: () => document.querySelectorAll(".zone").forEach(z => z.classList.add("drag-target")),
       onEnd: (event) => {

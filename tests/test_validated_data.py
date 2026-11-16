@@ -1,4 +1,6 @@
 import json
+"""Regression tests for the separate Review Metadata sidecar."""
+
 import sqlite3
 import tempfile
 import unittest
@@ -18,6 +20,7 @@ from validated_data import (
 
 
 class ValidatedDataTests(unittest.TestCase):
+    """Verify edits, approvals, undo, and source-fact immutability."""
     def setUp(self):
         self.db = sqlite3.connect(":memory:")
         self.db.row_factory = sqlite3.Row

@@ -1,3 +1,5 @@
+"""Regression tests for nullable extraction values and confidence sidecars."""
+
 import json
 
 from app import parse_batch_payload
@@ -5,6 +7,7 @@ from extraction_adapter import coerce_nullable_value, confidence_map
 
 
 def test_nullable_gemini_fields_preserve_original_fact_shape_and_confidence():
+    # Simulate Gemini returning clear, blurry, and handwritten occurrences.
     payload = {
         "documents": [{
             "document": "invoice.pdf",
@@ -19,6 +22,7 @@ def test_nullable_gemini_fields_preserve_original_fact_shape_and_confidence():
         "cross_references": [],
     }
 
+    # Parse through the same adapter used by the extraction pipeline.
     documents, references = parse_batch_payload(json.dumps(payload), ["invoice.pdf"])
     records = documents["invoice.pdf"]["facts"]
 
@@ -35,6 +39,7 @@ def test_nullable_gemini_fields_preserve_original_fact_shape_and_confidence():
 
 
 def test_nullable_numeric_values_coerce_and_zero_confidence():
+    # Numeric nulls become schema-safe zero values with zero confidence.
     assert coerce_nullable_value(None, str, 40) == ("", 40.0)
     assert coerce_nullable_value(None, int, 40) == (0, 0.0)
     assert coerce_nullable_value(None, float, 40) == (0.0, 0.0)
