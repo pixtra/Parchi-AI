@@ -26,6 +26,13 @@ from itertools import islice
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
+# Python 3.11+ provides TOML support in the standard library.  The fallback keeps
+# local installations that still use the repository's historical JSON config working.
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - only relevant on Python 3.10 and earlier
+    tomllib = None
+
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
@@ -109,7 +116,7 @@ CONFIG_PATH = BASE_DIR / ".streamlit" / "secrets.toml"
 
 
 def load_config() -> Dict[str, Any]:
-    """Application configuration, e.g. {"gemini_api_keys": [...], "gemini_models": [...]}.
+    """Read Gemini configuration from standard TOML or legacy JSON.
 
     Read fresh on every call so API keys edited in the file take effect on the next
     request without restarting the app. A malformed file is reported (never crashes
@@ -121,12 +128,35 @@ def load_config() -> Dict[str, Any]:
         return {}
     except OSError as exc:
         return {"_error": f"Could not read {CONFIG_PATH.name} ({exc.__class__.__name__})."}
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        return {"_error": f"{CONFIG_PATH.name} is not valid JSON (line {exc.lineno}): {exc.msg}."}
+    # Hosted Streamlit environments create this file as TOML, so parse that format first.
+    if tomllib is not None:
+        try:
+            data = tomllib.loads(raw)
+        except tomllib.TOMLDecodeError as toml_error:
+            # Older local deployments used JSON despite the .toml filename. Keep them
+            # working while producing a useful TOML error for invalid hosted secrets.
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                return {
+                    "_error": (
+                        f"{CONFIG_PATH.name} is not valid TOML "
+                        f"(line {toml_error.lineno}, column {toml_error.colno}): {toml_error.msg}."
+                    )
+                }
+    else:
+        # Python 3.10 has no built-in TOML parser; legacy JSON remains supported there.
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            return {
+                "_error": (
+                    f"{CONFIG_PATH.name} requires TOML on this Python version; "
+                    f"the legacy JSON fallback failed at line {exc.lineno}: {exc.msg}."
+                )
+            }
     if not isinstance(data, dict):
-        return {"_error": f"{CONFIG_PATH.name} must contain one JSON object."}
+        return {"_error": f"{CONFIG_PATH.name} must contain one top-level configuration object."}
     return data
 
 

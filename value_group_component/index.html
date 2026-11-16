@@ -46,6 +46,9 @@
   .pill .val { color: var(--muted); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px; }
   .pill .score { font-size: 11px; color: #9db4ff; white-space: nowrap; }
   .draft .pill { border-color: var(--warn); }
+  .remove-draft { border:0; background:transparent; color:#ffc2c7; cursor:pointer; padding:0 2px;
+          font:inherit; font-size:14px; line-height:1; }
+  .remove-draft:hover { color:#fff; }
   .pill.sortable-ghost { opacity: .35; }
   .pill.sortable-drag { box-shadow: 0 8px 20px rgba(0,0,0,.45); }
   .empty { color: var(--muted); font-size: 12.5px; padding: 4px 2px; }
@@ -126,7 +129,7 @@
     if (text !== undefined) node.textContent = text;   // never interpret extracted text as HTML
     return node;
   }
-  function pill(item) {
+  function pill(item, removable = false) {
     const p = el("div", "pill");
     p.dataset.id = item.id;
     p.dataset.document = item.document_id;
@@ -134,6 +137,21 @@
     p.appendChild(el("span", "lbl", item.label));
     p.appendChild(el("span", "val", item.value));
     p.appendChild(el("span", "score", item.score + "%"));
+    if (removable) {
+      // Removing a draft is an explicit click, so an interrupted drag cannot delete it.
+      const remove = el("button", "remove-draft", "×");
+      remove.type = "button";
+      remove.title = "Remove from Group Values";
+      remove.setAttribute("aria-label", "Remove from Group Values");
+      remove.addEventListener("pointerdown", event => event.stopPropagation());
+      remove.addEventListener("click", event => {
+        event.preventDefault();
+        event.stopPropagation();
+        p.remove();
+        emit();
+      });
+      p.appendChild(remove);
+    }
     return p;
   }
   function groupColour(id) {
@@ -233,6 +251,8 @@
         },
       },
       draggable: ".pill",
+      filter: zone.id === "draft" ? ".remove-draft" : undefined,
+      preventOnFilter: false,
       forceFallback: true,        // pointer-driven drag: identical in every browser, inside the iframe
       fallbackTolerance: 3,
       animation: 120,
@@ -241,16 +261,9 @@
       scroll: true,
       scrollSensitivity: 60,
       scrollSpeed: 12,
-      // Do not enable SortableJS's automatic spill removal. In an iframe it can treat
-      // a normal drag interruption as a spill and remove a pill unexpectedly.
+      // Never remove records because of a spill. Sortable can report a spill when a
+      // pointer briefly crosses the iframe boundary during an otherwise valid drag.
       removeOnSpill: false,
-      onSpill: event => {
-        // Remove a draft pill only when Sortable confirms that the drop happened outside
-        // every valid drop zone. Moving within the board leaves the pill untouched.
-        if (zone.id !== "draft" || !event.dragEl) return;
-        if (event.dragEl.parentNode) event.dragEl.parentNode.removeChild(event.dragEl);
-        requestAnimationFrame(emit);
-      },
       onStart: () => document.querySelectorAll(".zone").forEach(z => z.classList.add("drag-target")),
       onEnd: (event) => {
         document.querySelectorAll(".zone").forEach(z => z.classList.remove("drag-target", "drag-over"));
@@ -295,9 +308,10 @@
       lastReset = currentArgs.reset;
       draft = validDraft(currentArgs.draft, all);
       lastSent = null;
-    } else if (Array.isArray(currentArgs.draft)) {
-      draft = validDraft(currentArgs.draft, all);
     } else {
+      // Streamlit may rerun before it receives the component's latest drag event.
+      // Keep the in-browser draft in that case instead of replacing it with a stale
+      // server snapshot that can be empty.
       draft = validDraft(draft, all);
     }
     persistDraft(draft);
@@ -324,7 +338,7 @@
     // New group draft follows all document pills.
     const dropBody = el("div", "zone draft");
     dropBody.id = "draft";
-    draft.forEach(id => dropBody.appendChild(pill(all[id])));
+    draft.forEach(id => dropBody.appendChild(pill(all[id], true)));
     if (!draft.length) dropBody.appendChild(el("div", "empty", "Drag records here from any document."));
     sortable(dropBody);
     const draftPanel = panel("Group Values", draft.length, dropBody);
