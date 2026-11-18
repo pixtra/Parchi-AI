@@ -3,6 +3,6 @@ pandas
 Pillow
 PyMuPDF
 streamlit
-google-genai
+google-genai>=3.2.0
 rapidfuzz
 keyring

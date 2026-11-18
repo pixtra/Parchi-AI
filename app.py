@@ -189,6 +189,9 @@ TOKENS_PER_PAGE = int(_env("TOKENS_PER_PAGE", "1500"))
 MAX_BATCH_TOKENS = int(_env("MAX_BATCH_TOKENS", "400000"))
 MAX_PARTS_PER_BATCH = int(_env("MAX_PARTS_PER_BATCH", "12"))
 MAX_UPLOAD_BYTES = int(_env("MAX_UPLOAD_MB", "50")) * 1024 * 1024
+# Gemini supports inline PDF payloads below 50 MB.  Keep a small margin for the
+# surrounding JSON/request overhead so the inline path does not cross the limit.
+INLINE_BATCH_BYTES = 48 * 1024 * 1024
 KEY_COOLDOWN_SECONDS = 60
 AUTH_COOLDOWN_SECONDS = 3600
 SUPPORTED_TYPES = ["pdf", "png", "jpg", "jpeg", "txt", "xlsx", "csv"]
@@ -226,10 +229,10 @@ def document_state_label(status: str) -> str:
 def document_state_badge(status: str) -> str:
     label, kind = DOCUMENT_STATE_META.get(status, (status.capitalize(), ""))
     return badge(label, kind)
-PAGES = ["Dockets", "Workspace", "Validation", "Organize", "Export", "Settings"]
+PAGES = ["Dockets", "Workspace", "Validation", "Groups", "Organize", "Export", "Settings"]
 PAGE_ICONS = {
     "Dockets": "▤", "Workspace": "⬆", "Organize": "⌘", "Viewer": "▣",
-    "Validation": "✔", "Export": "⇩", "Settings": "⚙",
+    "Validation": "✔", "Groups": "◈", "Export": "⇩", "Settings": "⚙",
 }
 IDENTITY_CONCEPTS = {
     "invoice_number", "po_number", "purchase_order_number", "challan_number",
@@ -341,6 +344,7 @@ CREATE TABLE IF NOT EXISTS facts (
     source_evidence TEXT NOT NULL,
     confidence_band TEXT NOT NULL,
     confidence_score INTEGER NOT NULL,
+    decisions_score INTEGER,
     confidence_reasons TEXT NOT NULL,
     review_status TEXT NOT NULL,
     corrected INTEGER NOT NULL DEFAULT 0,
@@ -810,6 +814,9 @@ def init_db() -> bool:
         connection.executescript(SCHEMA)
         connection.executescript(VALUE_GROUP_SCHEMA)
         connection.executescript(VALIDATED_DATA_SCHEMA)
+        fact_columns = {row["name"] for row in connection.execute("PRAGMA table_info(facts)")}
+        if "decisions_score" not in fact_columns:
+            connection.execute("ALTER TABLE facts ADD COLUMN decisions_score INTEGER")
         review_columns = {row["name"] for row in connection.execute(
             "PRAGMA table_info(validated_template_records)"
         )}
@@ -983,7 +990,8 @@ def fetch_metadata(docket_id: str) -> List[sqlite3.Row]:
     with connect() as connection:
         return connection.execute(
             """SELECT d.filename AS document_name, f.label AS label, f.value AS value,
-                      f.confidence_score AS confidence_score, f.review_status AS review_status
+                      f.confidence_score AS confidence_score, f.decisions_score AS decisions_score,
+                      f.review_status AS review_status
                FROM facts f JOIN documents d ON d.id = f.document_id
                WHERE f.docket_id = ? AND f.concept != 'page_processing_status'
                ORDER BY d.filename, f.page_number, f.created_at""",
@@ -2120,6 +2128,10 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
     errors: List[str] = []
     parse_failure: Optional[str] = None
     uploads: Dict[str, Tuple[Any, List[Any]]] = {}
+    # Keep compatibility with lightweight unit fixtures and older callers that only
+    # provide an already-uploaded handle; those continue through the File API path.
+    use_inline = all("data" in unit for unit in batch) and \
+        sum(len(unit["data"]) for unit in batch) <= INLINE_BATCH_BYTES
     try:
         pool_pass = 0
         while True:
@@ -2135,7 +2147,12 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
                         continue
                     if entry["id"] not in uploads:
                         try:
-                            uploads[entry["id"]] = upload_parts(entry, batch)
+                            if use_inline:
+                                # Small documents are sent directly in the request. This
+                                # avoids Gemini File API processing/ACTIVE polling entirely.
+                                uploads[entry["id"]] = (make_client(entry["key"]), [])
+                            else:
+                                uploads[entry["id"]] = upload_parts(entry, batch)
                         except Exception as exc:  # noqa: BLE001
                             errors.append(f"{masked} upload: {scrub(exc, entry['key'])}")
                             cooldown = classify_error(exc)
@@ -2145,9 +2162,14 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
                     client, handles = uploads[entry["id"]]
 
                     contents: List[Any] = []
-                    for number, (unit, handle) in enumerate(zip(batch, handles), start=1):
+                    for number, unit in enumerate(batch, start=1):
                         contents.append(f"=== DOCUMENT: P{number} | {unit['label']} ===")
-                        contents.append(handle)
+                        if use_inline:
+                            contents.append(types.Part.from_bytes(
+                                data=unit["data"], mime_type=unit["mime"]
+                            ))
+                        else:
+                            contents.append(handles[number - 1])
                         ocr_context = "\n".join(
                             str(page.get("text") or "") for page in unit.get("pages_slice", [])
                         )
@@ -2165,7 +2187,8 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
                     set_gemini_activity(True, f"Gemini request in progress · {model}")
                     try:
                         config_args = dict(response_mime_type="application/json", temperature=0.1,
-                                           max_output_tokens=MAX_OUTPUT_TOKENS)
+                                           max_output_tokens=MAX_OUTPUT_TOKENS,
+                                           response_schema=EXTRACTION_RESPONSE_SCHEMA)
                         try:
                             response = client.models.generate_content(
                                 model=model, contents=contents,
@@ -2502,11 +2525,11 @@ def finalize_document(docket_id: str, doc: Dict[str, Any], status: str,
             connection.execute(
                 """INSERT INTO facts (id, docket_id, document_id, page_number, label, concept,
                    value, original_value, source_evidence, confidence_band, confidence_score,
-                   confidence_reasons, review_status, corrected, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   decisions_score, confidence_reasons, review_status, corrected, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (str(uuid.uuid4()), docket_id, doc["id"], page_number, clean_text(item["label"]),
                  clean_text(item["concept"]), value, value, evidence,
-                 assessment["band"], assessment["score"], json.dumps(assessment["reasons"]),
+                 assessment["band"], assessment["score"], None, json.dumps(assessment["reasons"]),
                  "pending", 0, now, now),
             )
         connection.execute(
@@ -2528,6 +2551,79 @@ def finalize_document(docket_id: str, doc: Dict[str, Any], status: str,
             "SELECT COUNT(*) FROM facts WHERE document_id = ? "
             "AND concept != 'page_processing_status'", (doc["id"],)
         ).fetchone()[0])
+
+
+def score_decisions_batch(docket_id: str, document_ids: List[str], keys: List[Dict[str, str]]) -> None:
+    """Score one completed extraction batch with one Gemini Decisions request.
+
+    This only writes the nullable comparison column. Main extraction confidence and
+    every extracted occurrence remain unchanged when the Decisions call fails.
+    """
+    if genai is None or types is None or not keys:
+        return
+    with connect() as connection:
+        rows = connection.execute(
+            """SELECT f.id, d.filename, f.label, f.value, f.source_evidence
+               FROM facts f JOIN documents d ON d.id = f.document_id
+               WHERE f.docket_id = ? AND f.document_id IN ({})
+                 AND f.concept != 'page_processing_status'
+               ORDER BY f.created_at, f.id""".format(
+                ",".join("?" for _ in document_ids)
+            ), [docket_id, *document_ids],
+        ).fetchall()
+    if not rows or len(rows) > 1000:
+        LOG.warning("Skipping Decisions scoring for docket %s: %d occurrences (limit 1000)",
+                    docket_id, len(rows))
+        return
+    input_text = "\n".join(
+        f"Occurrence {index}: document={row['filename']}; label={row['label']}; "
+        f"value={row['value']}; evidence={row['source_evidence']}"
+        for index, row in enumerate(rows)
+    )
+    questions = {
+        f"q_{index}": {
+            "type": "noul",
+            "instructions": f"Is the extracted value for Occurrence {index} correct according to its supplied evidence?",
+            "criteria": {
+                "true_description": "The label, value, and evidence agree and the value is a reliable transcription.",
+                "false_description": "The value is missing, contradicted, ambiguous, or not supported by the evidence.",
+            },
+        }
+        for index in range(len(rows))
+    }
+    client = None
+    try:
+        client = genai.Client(
+            api_key=keys[0]["key"],
+            http_options=types.HttpOptions(api_version="v1beta", timeout=GEMINI_TIMEOUT_MS),
+        )
+        if not hasattr(client, "decisions"):
+            LOG.warning(
+                "Gemini Decisions is unavailable in the installed google-genai SDK; "
+                "upgrade to google-genai>=3.2.0. Existing confidence scores were preserved."
+            )
+            return
+        result = client.decisions.create(
+            model="gemini-decision-1", input=input_text, questions=questions,
+        )
+        answers = getattr(result, "answers", {}) or {}
+        updates = []
+        for index, row in enumerate(rows):
+            answer = answers.get(f"q_{index}")
+            probability = getattr(answer, "noul", None) if answer is not None else None
+            if probability is not None:
+                updates.append((max(0, min(100, round(float(probability) * 100))), row["id"]))
+        if updates:
+            with connect() as connection:
+                connection.executemany("UPDATE facts SET decisions_score = ? WHERE id = ?", updates)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("Gemini Decisions scoring failed for docket %s: %s", docket_id, scrub(exc, keys[0]["key"]))
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _fact_group_key(label: str, concept: str) -> str:
@@ -2840,6 +2936,10 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
                 results.append(job_result(doc["filename"], "failed", message))
                 _job_doc_update(job_id, doc["id"], status="failed", facts=0, message=message)
                 mark_done()
+        # Score the whole completed extraction batch in one Decisions request. This
+        # deliberately runs after all document facts are durable and never blocks or
+        # overwrites the existing confidence_score column.
+        score_decisions_batch(docket_id, [doc["id"] for doc in documents], keys)
         with PROCESSING_LOCK:
             PROCESSING_JOBS[job_id].update(
                 status="complete", phase="complete", gemini_active=False,
@@ -2909,6 +3009,17 @@ _LOADER_CSS = """
 </style>
 """
 
+# Machine-enforced response contract; parsing remains defensive for models that stop
+# with a response which does not satisfy structured output.
+EXTRACTION_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "documents": {"type": "array", "items": {"type": "object"}},
+        "cross_references": {"type": "array", "items": {"type": "object"}},
+    },
+    "required": ["documents", "cross_references"],
+}
+
 
 PROCESSING_SUMMARY_SECONDS = 90
 
@@ -2949,8 +3060,7 @@ def _render_processing_status(job: Optional[Dict[str, Any]]) -> None:
     if not job:
         return
     if job["status"] in {"queued", "running"}:
-        total = max(0, int(job.get("total_docs") or 0))
-        done = max(0, min(int(job.get("done_docs") or 0), total)) if total else 0
+        done, total = processing_counts(job["docket_id"], job)
         percent = round(100 * done / total) if total else 0
         if job.get("gemini_active"):
             title = "Gemini is extracting facts"
@@ -3041,8 +3151,7 @@ def _render_processing_panel(job: Dict[str, Any], title: str, message: str,
 def _render_processing_inline(job: Dict[str, Any]) -> None:
     """Show the active run beside the process button in Workspace."""
     # Read the shared worker snapshot so the inline indicator updates with the queue.
-    total = max(0, int(job.get("total_docs") or 0))
-    done = max(0, min(int(job.get("done_docs") or 0), total)) if total else 0
+    done, total = processing_counts(job["docket_id"], job)
     percent = round(100 * done / total) if total else 0
     # Put the spinner and plain-language message directly beside the disabled button.
     st.markdown(
@@ -3342,10 +3451,41 @@ def queue_saved_documents(docket_id: str, document_ids: List[str]) -> Tuple[int,
             "results": results, "total_docs": len(payloads), "done_docs": 0, "finished_at": 0.0,
             "docs": docs,
         }
+    # Keep the run denominator in the Streamlit session as a fallback for hosted
+    # reruns where the in-memory worker snapshot is briefly unavailable.
+    st.session_state[f"processing_run_{docket_id}"] = {
+        "ids": [payload["document"]["id"] for payload in payloads],
+        "total": len(payloads),
+    }
     PROCESSING_EXECUTOR.submit(_run_processing_job, job_id, docket_id, payloads, keys, results)
     queue_flash("success", f"Queued {len(payloads)} document(s) for Gemini extraction. "
                            "Progress appears in step 2; you can switch tabs safely.")
     return len(payloads), results
+
+
+def processing_counts(docket_id: str, job: Optional[Dict[str, Any]]) -> Tuple[int, int]:
+    """Return completed/total counts using the worker, then durable session/DB state."""
+    total = int((job or {}).get("total_docs") or 0)
+    done = int((job or {}).get("done_docs") or 0)
+    run = st.session_state.get(f"processing_run_{docket_id}") or {}
+    run_ids = [str(item) for item in run.get("ids") or []]
+    if total <= 0:
+        total = int(run.get("total") or len(run_ids))
+    if run_ids:
+        placeholders = ",".join("?" for _ in run_ids)
+        with connect() as connection:
+            done = int(connection.execute(
+                f"SELECT COUNT(*) FROM documents WHERE id IN ({placeholders}) "
+                "AND status IN ('completed', 'partial', 'failed')", run_ids,
+            ).fetchone()[0])
+    elif total <= 0 and docket_id:
+        with connect() as connection:
+            total = int(connection.execute(
+                "SELECT COUNT(*) FROM documents WHERE docket_id = ? "
+                "AND status IN ('queued', 'processing', 'saving', 'completed', 'partial', 'failed')",
+                (docket_id,),
+            ).fetchone()[0])
+    return max(0, min(done, total)) if total else 0, max(0, total)
 
 
 @st.fragment(run_every=1)
@@ -3598,6 +3738,7 @@ def viewer_metadata_records(docket_id: str) -> List[dict]:
             "label": row["label"],
             "value": row["value"],
             "confidence_score": int(row["confidence_score"]),
+            "decisions_score": row["decisions_score"],
             "review_status": row["review_status"],
         }
         for row in fetch_metadata(docket_id)
@@ -3612,6 +3753,7 @@ def viewer_validated_base_records(docket_id: str) -> List[dict]:
             "label": row["label"],
             "value": row["value"],
             "confidence_score": int(row["confidence_score"]),
+            "decisions_score": row["decisions_score"],
             "review_status": row["review_status"],
             "source_label": row["label"],
             "record_id": row["id"],
@@ -3642,8 +3784,11 @@ def client_template_records(docket_id: str, template: sqlite3.Row) -> Tuple[List
     output: List[dict] = []
     if field_rows:
         with connect() as connection:
+            fact_columns = {row["name"] for row in connection.execute("PRAGMA table_info(facts)")}
+            decisions_select = "f.decisions_score" if "decisions_score" in fact_columns else "NULL"
             rows = connection.execute(
-                """SELECT f.id, f.label, d.filename AS document_name, f.value, f.confidence_score
+                f"""SELECT f.id, f.label, d.filename AS document_name, f.value, f.confidence_score,
+                          {decisions_select} AS decisions_score
                    FROM facts f JOIN documents d ON d.id = f.document_id
                    WHERE f.docket_id = ? AND f.concept != 'page_processing_status'""",
                 (docket_id,),
@@ -3685,6 +3830,7 @@ def client_template_records(docket_id: str, template: sqlite3.Row) -> Tuple[List
                         "document_name": primary_record["document_name"],
                         "label": field["destination_label"], "value": primary_record["value"],
                         "confidence_score": int(primary_record["confidence_score"]),
+                        "decisions_score": primary_record["decisions_score"],
                         "source_label": primary_record["label"], "record_id": primary_record["id"],
                     })
                     matched[field["id"]] += 1
@@ -3696,6 +3842,7 @@ def client_template_records(docket_id: str, template: sqlite3.Row) -> Tuple[List
                         "document_name": record["document_name"],
                         "label": field["destination_label"], "value": record["value"],
                         "confidence_score": int(record["confidence_score"]),
+                        "decisions_score": record["decisions_score"],
                         "source_label": record["label"], "record_id": record["id"],
                     })
                     matched[field["id"]] += 1
@@ -3707,6 +3854,7 @@ def client_template_records(docket_id: str, template: sqlite3.Row) -> Tuple[List
                     "document_name": record["document_name"],
                     "label": field["destination_label"], "value": record["value"],
                     "confidence_score": int(record["confidence_score"]),
+                    "decisions_score": record["decisions_score"],
                     "source_label": record["label"], "record_id": record["id"],
                 })
                 matched[field["id"]] += 1
@@ -4030,8 +4178,7 @@ def render_topbar_status(docket_id: Optional[str]) -> None:
         )
     processing_chip = ""
     if (active_job and active_job["status"] in {"queued", "running"}) or database_active:
-        total = max(0, int((active_job or {}).get("total_docs") or 0))
-        done = max(0, min(int((active_job or {}).get("done_docs") or 0), total)) if total else 0
+        done, total = processing_counts(docket_id, active_job) if docket_id else (0, 0)
         processing_chip = (
             '<span class="chip processing" role="status" aria-live="polite" '
             'title="Document extraction is active">'
@@ -4618,6 +4765,27 @@ def _render_grouping(active: sqlite3.Row) -> None:
 def _render_create(active: sqlite3.Row, metadata: List[dict]) -> None:
     """Create an ordered template from live group or label sources."""
     docket_id = active["id"]
+    all_labels = unique_labels(metadata)
+    with st.container(border=True):
+        st.markdown("**Default template from Main Metadata**")
+        st.caption("Select all currently available Main Metadata labels. This creates a normal editable template and never changes Main Metadata.")
+        default_name = st.text_input("Default template name", value="Main Metadata — All Labels",
+                                     key=f"org_default_name_{docket_id}", max_chars=120)
+        if st.button("Create from all Main Metadata labels", key=f"org_default_save_{docket_id}",
+                     disabled=not all_labels or not default_name.strip(), **stretch()):
+            try:
+                template_id = save_template(docket_id, default_name, all_labels)
+                save_template_fields(template_id, [
+                    {"source_type": "label", "source_id": label, "source_name": label,
+                     "destination_label": label, "position": index + 1}
+                    for index, label in enumerate(all_labels)
+                ])
+            except ValueError as exc:
+                st.error(str(exc), icon="🚫")
+            else:
+                queue_flash("success", f"Created “{clean_text(default_name).strip()}” from Main Metadata labels.")
+                st.rerun()
+    st.markdown("#### Custom Client Template")
     with connect() as connection:
         groups = load_groups(connection, docket_id)
         all_rows = connection.execute(
@@ -4774,7 +4942,11 @@ def _render_apply(active: sqlite3.Row, metadata: List[dict]) -> None:
             try:
                 if board_action == "map":
                     source_type = "group" if board.get("source_type") == "group" else "label"
-                    source_id = str(board.get("group_id") or board.get("fact_id") or board.get("source") or "")
+                    source_id = (
+                        str(board.get("group_id") or "")
+                        if source_type == "group"
+                        else str(board.get("source") or "")
+                    )
                     source_name = str(board.get("name") or board.get("source") or "")
                     remap_template_field(template_id, str(board.get("target") or ""),
                                          source_type, source_id, source_name)
@@ -4879,7 +5051,19 @@ def _render_manage(active: sqlite3.Row, metadata: List[dict]) -> None:
             st.rerun()
 
 
-ORGANIZE_MODES = ("Group values", "Create new template", "Apply existing template")
+ORGANIZE_MODES = ("Create new template", "Apply existing template")
+
+
+def page_groups(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
+    page_header("Groups", "Manually group equivalent extracted occurrences without changing Main Metadata.",
+                active["name"] if active else None)
+    if not need_docket(active):
+        return
+    metadata = metadata_records(active["id"])
+    if not metadata:
+        st.info("Process documents first. Once Main Metadata has facts, groups can be created here.")
+        return
+    _render_grouping(active)
 
 
 def page_organize(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
@@ -4900,14 +5084,11 @@ def page_organize(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> 
     mode = st.radio("Workflow", list(ORGANIZE_MODES), horizontal=True, key="org_mode",
                     label_visibility="collapsed")
     if mode == ORGANIZE_MODES[0]:
-        _render_grouping(active)
-    elif mode == ORGANIZE_MODES[1]:
         _render_create(active, metadata)
     else:
         _render_apply(active, metadata)
-    if mode != ORGANIZE_MODES[0]:
-        with st.expander("Manage saved templates"):
-            _render_manage(active, metadata)
+    with st.expander("Manage saved templates"):
+        _render_manage(active, metadata)
 
 
 def confidence_score_style(value: object) -> str:
@@ -4921,7 +5102,7 @@ def confidence_score_style(value: object) -> str:
     return "background-color: #8c3540; color: #fff1f2; font-weight: 700"
 
 
-VIEWER_COLUMNS = ["Document Name", "Label", "Value", "Confidence Score"]
+VIEWER_COLUMNS = ["Document Name", "Label", "Value", "Confidence Score", "Decisions Score"]
 
 
 def viewer_frame(rows: List[dict], show_status: bool = False) -> None:
@@ -4939,6 +5120,7 @@ def viewer_frame(rows: List[dict], show_status: bool = False) -> None:
                 "Label": record["label"],
                 "Value": record["value"],
                 "Confidence Score": clamp_confidence(record["confidence_score"], 50),
+                "Decisions Score": record.get("decisions_score"),
                 "Source Label": record.get("source_label", ""),
                 "Record ID": record.get("record_id", ""),
                 "Review Status": record.get("review_status", ""),
@@ -4948,7 +5130,7 @@ def viewer_frame(rows: List[dict], show_status: bool = False) -> None:
         columns=columns,
     )
     st.dataframe(
-        frame.style.map(confidence_score_style, subset=["Confidence Score"]),
+        frame.style.map(confidence_score_style, subset=["Confidence Score", "Decisions Score"]),
         hide_index=True,
         width="stretch",
         height=min(720, max(180, 44 + 36 * len(frame))),
@@ -4963,16 +5145,17 @@ def viewer_template_editor(docket_id: str, template_id: str, rows: List[dict]) -
             "Label": row["label"],
             "Value": row["value"],
             "Confidence Score": int(row["confidence_score"]),
+            "Decisions Score": row.get("decisions_score"),
             "Approved": bool(row.get("review_approved", False)),
             "Source Label": row.get("source_label", ""),
             "Record ID": row["record_id"],
             **({"Review Status": row.get("review_status", "")} if has_status else {}),
         } for row in rows]
-    columns = ["Approved", "Document Name", "Label", "Value", "Confidence Score", "Source Label", "Record ID"]
+    columns = ["Approved", "Document Name", "Label", "Value", "Confidence Score", "Decisions Score", "Source Label", "Record ID"]
     if has_status:
         columns.append("Review Status")
     frame = pd.DataFrame(data, columns=columns)
-    styled_frame = frame.style.map(confidence_score_style, subset=["Confidence Score"])
+    styled_frame = frame.style.map(confidence_score_style, subset=["Confidence Score", "Decisions Score"])
     revision_key = f"viewer_editor_revision_{docket_id}_{template_id}"
     revision = int(st.session_state.get(revision_key, 0))
     edited = st.data_editor(
@@ -4988,11 +5171,12 @@ def viewer_template_editor(docket_id: str, template_id: str, rows: List[dict]) -
             "Label": st.column_config.TextColumn("Label", required=True),
             "Value": st.column_config.TextColumn("Value"),
             "Confidence Score": st.column_config.NumberColumn("Confidence Score"),
+            "Decisions Score": st.column_config.NumberColumn("Decisions Score"),
             "Source Label": st.column_config.TextColumn("Source Label"),
             "Record ID": None,
             **({"Review Status": st.column_config.TextColumn("Review Status")} if has_status else {}),
         },
-        disabled=["Document Name", "Confidence Score", "Source Label", "Record ID"]
+        disabled=["Document Name", "Confidence Score", "Decisions Score", "Source Label", "Record ID"]
                  + (["Review Status"] if has_status else []),
     )
     baseline_by_id = {row["record_id"]: row for row in rows}
@@ -5363,6 +5547,7 @@ RENDERERS = {
     "Dockets": page_dockets,
     "Workspace": page_workspace,
     "Validation": page_viewer,
+    "Groups": page_groups,
     "Organize": page_organize,
     "Export": page_export,
     "Settings": page_settings,
