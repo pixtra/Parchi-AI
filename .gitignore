@@ -13,9 +13,21 @@ parchai_storage/
 .env
 .env.*
 !.env.example
-
+    
 # Generated exports
 *.xlsx
 *.csv
 *.psv
+*.jpg
+*.pdf
+*.txt
+*.json
+*.jpeg
+*.docx
+*.tally
+*.heic
+*.webp
+
 .streamlit/secrets.toml
+tests/
+test_docs/

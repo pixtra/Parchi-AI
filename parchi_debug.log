@@ -1,0 +1,61 @@
+2026-11-19 22:37:50.712 Uvicorn server started on :::8501
+
+  You can now view your Streamlit app in your browser.
+
+  Local URL: http://localhost:8501
+  Network URL: http://192.168.29.232:8501
+
+  Help agents write better Streamlit apps?
+  Install the official Streamlit skills by running streamlit skills in your terminal.
+
+2026-11-19 22:37:55,751 INFO parchi: [TRACE 2026-11-19T17:07:55+00:00] PROCESS_BUTTON_CLICK docket=f98b8172-1345-40c8-a8a0-0a43c30e1b41 mode=all selected=5
+2026-11-19 22:37:55,751 INFO parchi: [TRACE 2026-11-19T17:07:55+00:00] PROCESS_CLICK docket=f98b8172-1345-40c8-a8a0-0a43c30e1b41 requested_document_ids=5aa78d2c-7ab6-41ce-9044-b0fcae9aefaa,331313af-b912-4cdd-8a4a-908586d0e62b,8553a59b-37c5-4728-9a92-db7074391181,e43b7af7-2e2e-4aa7-a868-82f31c057b1a,7edd54b8-fb82-4137-a197-6d62e1ae01fe
+2026-11-19 22:37:55,752 INFO parchi: [TRACE 2026-11-19T17:07:55+00:00] KEY_POOL_READY docket=f98b8172-1345-40c8-a8a0-0a43c30e1b41 valid_keys=7 models=gemini-3.8-flash,gemini-3.6-flash,gemini-3.1-flash-lite elapsed=0.00s
+2026-11-19 22:37:55,755 INFO parchi: [TRACE 2026-11-19T17:07:55+00:00] QUEUE_DOCUMENT_CHECK filename=tax-invoice.jpg status=saved bytes=1586987
+2026-11-19 22:37:55,861 INFO parchi: [TRACE 2026-11-19T17:07:55+00:00] DOCUMENT_QUEUED filename=tax-invoice.jpg document_id=5aa78d2c-7ab6-41ce-9044-b0fcae9aefaa
+2026-11-19 22:37:55,864 INFO parchi: [TRACE 2026-11-19T17:07:55+00:00] QUEUE_DOCUMENT_CHECK filename=ewaybill.jpg status=saved bytes=1127780
+2026-11-19 22:37:55,970 INFO parchi: [TRACE 2026-11-19T17:07:55+00:00] DOCUMENT_QUEUED filename=ewaybill.jpg document_id=331313af-b912-4cdd-8a4a-908586d0e62b
+2026-11-19 22:37:55,972 INFO parchi: [TRACE 2026-11-19T17:07:55+00:00] QUEUE_DOCUMENT_CHECK filename=transport-certificate.jpg status=saved bytes=1144337
+2026-11-19 22:37:56,062 INFO parchi: [TRACE 2026-11-19T17:07:56+00:00] DOCUMENT_QUEUED filename=transport-certificate.jpg document_id=8553a59b-37c5-4728-9a92-db7074391181
+2026-11-19 22:37:56,064 INFO parchi: [TRACE 2026-11-19T17:07:56+00:00] QUEUE_DOCUMENT_CHECK filename=slip1.jpg status=saved bytes=727007
+2026-11-19 22:37:56,154 INFO parchi: [TRACE 2026-11-19T17:07:56+00:00] DOCUMENT_QUEUED filename=slip1.jpg document_id=e43b7af7-2e2e-4aa7-a868-82f31c057b1a
+2026-11-19 22:37:56,157 INFO parchi: [TRACE 2026-11-19T17:07:56+00:00] QUEUE_DOCUMENT_CHECK filename=transport-infoslip.jpg status=saved bytes=2201953
+2026-11-19 22:37:56,246 INFO parchi: [TRACE 2026-11-19T17:07:56+00:00] DOCUMENT_QUEUED filename=transport-infoslip.jpg document_id=7edd54b8-fb82-4137-a197-6d62e1ae01fe
+2026-11-19 22:37:56,247 INFO parchi: [TRACE 2026-11-19T17:07:56+00:00] WORKER_SUBMITTED job_id=51af39f0-6f75-4502-bdc3-39413b33e428 docket=f98b8172-1345-40c8-a8a0-0a43c30e1b41 documents=5 elapsed=0.50s
+2026-11-19 22:37:56,247 INFO parchi: [TRACE 2026-11-19T17:07:56+00:00] PROCESS_BUTTON_RESULT docket=f98b8172-1345-40c8-a8a0-0a43c30e1b41 queued=5 immediate_results=0
+2026-11-19 22:37:56,306 INFO parchi: [TIMING] Document START 1/5 filename=tax-invoice.jpg pages=1
+2026-11-19 22:37:56,413 INFO parchi: [TRACE 2026-11-19T17:07:56+00:00] DOCUMENT_UNITS_READY filename=tax-invoice.jpg units=1 batches=1
+2026-11-19 22:37:56,413 INFO parchi: [TRACE 2026-11-19T17:07:56+00:00] DOCUMENT_BATCH_START filename=tax-invoice.jpg batch=1/1 parts=1
+2026-11-19 22:37:56,413 INFO parchi: [TRACE 2026-11-19T17:07:56+00:00] UNIT_BATCH_START parts=1 labels=tax-invoice.jpg
+2026-11-19 22:37:56,511 INFO parchi: [TIMING] Gemini request START model=gemini-3.8-flash parts=1 labels=tax-invoice.jpg
+2026-11-19 22:37:57,550 INFO parchi: [TIMING] Gemini request START model=gemini-3.8-flash parts=1 labels=tax-invoice.jpg
+2026-11-19 22:38:03,703 INFO parchi: [TIMING] Gemini request START model=gemini-3.8-flash parts=1 labels=tax-invoice.jpg
+2026-11-19 22:38:09,095 INFO parchi: [TIMING] Gemini request START model=gemini-3.8-flash parts=1 labels=tax-invoice.jpg
+2026-11-19 22:38:09,557 INFO parchi: [TIMING] Gemini request START model=gemini-3.8-flash parts=1 labels=tax-invoice.jpg
+2026-11-19 22:38:14,543 INFO parchi: [TIMING] Gemini request START model=gemini-3.8-flash parts=1 labels=tax-invoice.jpg
+2026-11-19 22:38:15,481 INFO parchi: [TIMING] Gemini request START model=gemini-3.8-flash parts=1 labels=tax-invoice.jpg
+2026-11-19 22:38:16,393 INFO parchi: [TIMING] Gemini request START model=gemini-3.6-flash parts=1 labels=tax-invoice.jpg
+2026-11-19 22:41:16,787 INFO parchi: [TIMING] Gemini request START model=gemini-3.6-flash parts=1 labels=tax-invoice.jpg
+2026-11-19 22:42:51,892 INFO parchi: [TIMING] Gemini response END for ••••OgtA · gemini-3.6-flash: elapsed=95.10s finish_reason=STOP, chars=29000
+2026-11-19 22:42:51,906 INFO parchi: [TRACE 2026-11-19T17:12:51+00:00] UNIT_BATCH_END parts=1 complete=1 missing=0 elapsed=295.49s
+2026-11-19 22:42:52,035 INFO parchi: [TIMING] Document SAVE END filename=tax-invoice.jpg status=completed facts=55 elapsed=295.73s
+2026-11-19 22:42:52,035 INFO parchi: [TIMING] Document START 2/5 filename=ewaybill.jpg pages=1
+2026-11-19 22:42:52,143 INFO parchi: [TRACE 2026-11-19T17:12:52+00:00] DOCUMENT_UNITS_READY filename=ewaybill.jpg units=1 batches=1
+2026-11-19 22:42:52,143 INFO parchi: [TRACE 2026-11-19T17:12:52+00:00] DOCUMENT_BATCH_START filename=ewaybill.jpg batch=1/1 parts=1
+2026-11-19 22:42:52,143 INFO parchi: [TRACE 2026-11-19T17:12:52+00:00] UNIT_BATCH_START parts=1 labels=ewaybill.jpg
+2026-11-19 22:42:52,151 INFO parchi: [TIMING] Gemini request START model=gemini-3.8-flash parts=1 labels=ewaybill.jpg
+2026-11-19 22:43:01,803 INFO parchi: [TIMING] Gemini request START model=gemini-3.8-flash parts=1 labels=ewaybill.jpg
+2026-11-19 22:43:02,561 INFO parchi: [TIMING] Gemini request START model=gemini-3.8-flash parts=1 labels=ewaybill.jpg
+2026-11-19 22:43:03,570 INFO parchi: [TIMING] Gemini request START model=gemini-3.6-flash parts=1 labels=ewaybill.jpg
+2026-11-19 22:44:14,907 INFO parchi: [TIMING] Gemini response END for ••••CKng · gemini-3.6-flash: elapsed=71.34s finish_reason=STOP, chars=30225
+2026-11-19 22:44:14,914 INFO parchi: [TRACE 2026-11-19T17:14:14+00:00] UNIT_BATCH_END parts=1 complete=1 missing=0 elapsed=82.77s
+2026-11-19 22:44:15,242 INFO parchi: [TIMING] Document SAVE END filename=ewaybill.jpg status=completed facts=1 elapsed=83.21s
+2026-11-19 22:44:15,242 INFO parchi: [TIMING] Document START 3/5 filename=transport-certificate.jpg pages=1
+2026-11-19 22:44:15,349 INFO parchi: [TRACE 2026-11-19T17:14:15+00:00] DOCUMENT_UNITS_READY filename=transport-certificate.jpg units=1 batches=1
+2026-11-19 22:44:15,350 INFO parchi: [TRACE 2026-11-19T17:14:15+00:00] DOCUMENT_BATCH_START filename=transport-certificate.jpg batch=1/1 parts=1
+2026-11-19 22:44:15,350 INFO parchi: [TRACE 2026-11-19T17:14:15+00:00] UNIT_BATCH_START parts=1 labels=transport-certificate.jpg
+2026-11-19 22:44:15,357 INFO parchi: [TIMING] Gemini request START model=gemini-3.8-flash parts=1 labels=transport-certificate.jpg
+2026-11-19 22:44:18,749 INFO parchi: [TIMING] Gemini request START model=gemini-3.8-flash parts=1 labels=transport-certificate.jpg
+2026-11-19 22:44:19,362 INFO parchi: [TIMING] Gemini request START model=gemini-3.8-flash parts=1 labels=transport-certificate.jpg
+2026-11-19 22:44:25,102 INFO parchi: [TIMING] Gemini request START model=gemini-3.6-flash parts=1 labels=transport-certificate.jpg
+2026-11-19 22:47:25,396 INFO parchi: [TIMING] Gemini request START model=gemini-3.6-flash parts=1 labels=transport-certificate.jpg

@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import sqlite3
+import sys
 import tempfile
 import time
 import threading
@@ -182,8 +183,19 @@ GEMINI_MODELS = tuple(
     )
     if str(m).strip()
 )
-GEMINI_TIMEOUT_MS = 180_000
-MAX_OUTPUT_TOKENS = int(_env("MAX_OUTPUT_TOKENS", "32768"))
+GEMINI_TIMEOUT_MS = int(_env("GEMINI_TIMEOUT_MS", "7000"))
+# Hard wall-clock budget for one document/unit extraction. A failed key must never
+# make the user wait through every model and cooldown window indefinitely.
+EXTRACTION_DEADLINE_SECONDS = float(_env("EXTRACTION_DEADLINE_SECONDS", "15"))
+DECISIONS_TIMEOUT_MS = int(_env("DECISIONS_TIMEOUT_MS", "5000"))
+# Log probabilities are not supported by the configured Flash models and cause an
+# avoidable failed request before every real extraction request. Keep the existing
+# token-confidence adapter available, but require explicit opt-in for models that
+# actually support response logprobs.
+ENABLE_LOGPROBS = str(_env("ENABLE_LOGPROBS", "0")).strip().lower() in {"1", "true", "yes", "on"}
+# Exhaustive extraction can legitimately require more than 32k output tokens for
+# dense scans.  Keep this configurable, but use the larger Gemini ceiling by default.
+MAX_OUTPUT_TOKENS = int(_env("MAX_OUTPUT_TOKENS", "65536"))
 CHUNK_PAGES = int(_env("CHUNK_PAGES", "10"))
 TOKENS_PER_PAGE = int(_env("TOKENS_PER_PAGE", "1500"))
 MAX_BATCH_TOKENS = int(_env("MAX_BATCH_TOKENS", "400000"))
@@ -396,6 +408,10 @@ Rules:
 - Use specific contextual labels such as Supplier Name, Invoice Number, Invoice Date,
   Gross Weight or Taxable Amount when the document establishes that meaning. Do not invent
   context when it is genuinely ambiguous.
+- Every fact MUST contain a non-empty human-readable "label". Never use "Unlabelled field",
+  "Unlabeled field", "Unknown", or an empty label. If the printed label is unclear, use
+  "Unclear <best contextual description>" and preserve the uncertainty in evidence and
+  confidence rather than emitting a placeholder.
 - Write labels in clear, concise language that names what the field means. Prefer precise
   names ("Supplier GSTIN", "Net Weight", "Challan Date") over vague or overly generic text
   ("Number", "Detail 1", "Other"). Read the surrounding headings, table column headers and
@@ -1605,8 +1621,28 @@ def install_secret_redaction() -> None:
     emits our records and on every root handler (ancestor logger filters do not
     apply to propagated records, so handler-level filtering is required)."""
     redaction = _SecretRedactionFilter()
+    # Streamlit may install its own root handler after module import and leave the
+    # application logger at WARNING. Explicitly enable INFO so extraction diagnostics
+    # are visible in the terminal running `streamlit run`.
+    LOG.setLevel(logging.INFO)
+    root = logging.getLogger()
+    root.setLevel(min(root.level or logging.INFO, logging.INFO))
+    # Streamlit's root logger configuration differs between local and hosted
+    # versions. Keep a dedicated stderr handler on our logger so extraction traces
+    # cannot disappear because a framework handler filters INFO records.
+    if not any(getattr(handler, "_parchi_trace_handler", False) for handler in LOG.handlers):
+        trace_handler = logging.StreamHandler(sys.stderr)
+        trace_handler._parchi_trace_handler = True
+        trace_handler.setLevel(logging.INFO)
+        trace_handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s: %(message)s"
+        ))
+        trace_handler.addFilter(redaction)
+        LOG.addHandler(trace_handler)
+    LOG.propagate = False
     LOG.addFilter(redaction)
-    for handler in logging.getLogger().handlers:
+    for handler in root.handlers:
+        handler.setLevel(logging.INFO)
         handler.addFilter(redaction)
 
 
@@ -1940,6 +1976,10 @@ def parse_batch_payload(text: str, labels: List[str]) -> Tuple[Dict[str, Dict[st
 
     def match(name: str) -> Optional[str]:
         name = re.sub(r"^\s*P\d+\s*\|\s*", "", name or "", flags=re.IGNORECASE).strip()
+        # A single-part request is unambiguous even when a model returns an empty
+        # document field.  Never apply this fallback to a multi-part request.
+        if not name and len(labels) == 1:
+            return labels[0]
         if name in labels:
             return name
         key = name.lower()
@@ -1960,16 +2000,41 @@ def parse_batch_payload(text: str, labels: List[str]) -> Tuple[Dict[str, Dict[st
     by_label: Dict[str, Dict[str, Any]] = {}
     for doc in payload["documents"]:
         if not isinstance(doc, dict):
-            continue
+            raise ValueError("response contains a non-object document entry")
         label = match(str(doc.get("document", "")))
         if label is None:
-            continue
+            # An unrecognised document entry means the model did not follow the
+            # per-part identity contract.  Do not silently discard its facts.
+            raise ValueError(
+                f"response contains an unrecognised document identifier: "
+                f"{str(doc.get('document', ''))[:120]}"
+            )
         bucket = by_label.setdefault(label, {"document_type": str(doc.get("document_type") or ""), "facts": []})
         document_type = bucket["document_type"]
         for item in doc.get("facts") or []:
             if not isinstance(item, dict):
-                continue
-            name = str(item.get("label") or "Unlabelled field").strip()
+                raise ValueError(
+                    f"response contains a non-object fact in document {label}"
+                )
+            # Gemini occasionally uses a semantically equivalent key despite the
+            # requested JSON contract. Accept those legacy variants, but never accept
+            # a placeholder as a real extracted label.
+            raw_label = str(
+                item.get("label")
+                or item.get("field_name")
+                or item.get("name")
+                or item.get("key")
+                or ""
+            ).strip()
+            if not raw_label or _normalised_phrase(raw_label) in {
+                "unlabelled field", "unlabeled field", "unknown field", "unknown"
+            }:
+                LOG.warning(
+                    "Gemini returned a fact without a usable label for %s; fact keys=%s",
+                    label, sorted(str(key) for key in item.keys()),
+                )
+                raise ValueError(f"response contains a fact without a usable label in document {label}")
+            name = raw_label
             value, _ = coerce_nullable_value(item.get("value"), str)
             value = value.strip()
             ambiguity_notes = str(item.get("ambiguity_notes") or "").strip()
@@ -1988,7 +2053,7 @@ def parse_batch_payload(text: str, labels: List[str]) -> Tuple[Dict[str, Dict[st
                 evidence,
                 item.get("confidence_score"),
             )
-            fact["_source_label"] = str(item.get("label") or "Unlabelled field").strip()
+            fact["_source_label"] = raw_label
             fact["_legibility"] = legibility if legibility in {"CLEAR", "BLURRY", "HANDWRITTEN", "MISSING"} else "CLEAR"
             fact["_ambiguity_notes"] = ambiguity_notes
             fact["_box_2d"] = box_2d
@@ -2125,6 +2190,7 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
         raise RuntimeError("No valid Gemini API keys are configured.")
 
     labels = [unit["label"] for unit in batch]
+    deadline = time.monotonic() + EXTRACTION_DEADLINE_SECONDS
     errors: List[str] = []
     parse_failure: Optional[str] = None
     uploads: Dict[str, Tuple[Any, List[Any]]] = {}
@@ -2138,6 +2204,11 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
             pool_pass += 1
             for model in GEMINI_MODELS:
                 for entry in rotated_keys(keys):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"extraction deadline exceeded after {EXTRACTION_DEADLINE_SECONDS:.0f}s"
+                        )
                     masked = entry["masked"]
                     if cooldown_remaining(entry["id"]) > 0:
                         errors.append(f"{masked}: cooling down")
@@ -2158,8 +2229,16 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
                             cooldown = classify_error(exc)
                             if cooldown:
                                 set_cooldown(entry["id"], cooldown)
+                                LOG.warning(
+                                    "[TRACE %s] KEY_COOLDOWN key=%s model=%s seconds=%d reason=%s",
+                                    utc_now(), masked, model, cooldown,
+                                    "authentication/quota/rate-limit",
+                                )
                             continue
                     client, handles = uploads[entry["id"]]
+                    request_started = time.monotonic()
+                    LOG.info("[TIMING] Gemini request START model=%s parts=%d labels=%s",
+                             model, len(batch), ", ".join(unit["label"] for unit in batch))
 
                     contents: List[Any] = []
                     for number, unit in enumerate(batch, start=1):
@@ -2189,21 +2268,38 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
                         config_args = dict(response_mime_type="application/json", temperature=0.1,
                                            max_output_tokens=MAX_OUTPUT_TOKENS,
                                            response_schema=EXTRACTION_RESPONSE_SCHEMA)
-                        try:
-                            response = client.models.generate_content(
-                                model=model, contents=contents,
-                                config=types.GenerateContentConfig(**config_args,
-                                                                  response_logprobs=True, logprobs=1),
-                            )
-                        except Exception as logprob_exc:
-                            # Older models/endpoints may not support response log probabilities.
-                            LOG.info("Gemini log probabilities unavailable; retrying without them: %s",
-                                     str(logprob_exc)[:200])
+                        if ENABLE_LOGPROBS:
+                            try:
+                                response = client.models.generate_content(
+                                    model=model, contents=contents,
+                                    config=types.GenerateContentConfig(
+                                        **config_args, response_logprobs=True, logprobs=1
+                                    ),
+                                )
+                            except Exception as logprob_exc:
+                                # Explicit opt-in remains backwards compatible for a
+                                # model that supports logprobs, but a rejected optional
+                                # feature must never prevent the normal request.
+                                LOG.info(
+                                    "Gemini log probabilities unavailable; retrying without them: %s",
+                                    str(logprob_exc)[:200],
+                                )
+                                response = client.models.generate_content(
+                                    model=model, contents=contents,
+                                    config=types.GenerateContentConfig(**config_args),
+                                )
+                        else:
                             response = client.models.generate_content(
                                 model=model, contents=contents,
                                 config=types.GenerateContentConfig(**config_args),
                             )
                     except Exception as exc:  # noqa: BLE001
+                        elapsed = time.monotonic() - request_started
+                        LOG.warning(
+                            "[TIMING] Gemini request FAILED model=%s key=%s elapsed=%.2fs "
+                            "error=%s",
+                            model, masked, elapsed, scrub(exc, entry["key"]),
+                        )
                         if is_size_error(exc):
                             raise OversizedBatch(scrub(exc, entry["key"]))
                         errors.append(f"{masked} · {model}: {scrub(exc, entry['key'])}")
@@ -2214,6 +2310,11 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
                             set_cooldown(entry["id"], cooldown)
                         elif cooldown:
                             set_cooldown(f"{entry['id']}:{model}", cooldown)
+                        if cooldown:
+                            LOG.warning(
+                                "[TRACE %s] KEY_COOLDOWN key=%s model=%s seconds=%d",
+                                utc_now(), masked, model, cooldown,
+                            )
                         continue
                     finally:
                         set_gemini_activity(False)
@@ -2221,8 +2322,10 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
                     response_reason = finish_reason(response)
                     response_text = response.text or ""
                     LOG.info(
-                        "Gemini response diagnostics for %s · %s: finish_reason=%s, chars=%d",
-                        masked, model, response_reason or "unknown", len(response_text),
+                        "[TIMING] Gemini response END for %s · %s: elapsed=%.2fs "
+                        "finish_reason=%s, chars=%d",
+                        masked, model, time.monotonic() - request_started,
+                        response_reason or "unknown", len(response_text),
                     )
                     if "MAX_TOKENS" in response_reason:
                         raise OversizedBatch("response was truncated at the output token limit")
@@ -2257,7 +2360,9 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
             # Full pool pass without a usable candidate: if keys are only rate- or
             # quota-limited, wait for the soonest recovery and go around again.
             wait = earliest_cooldown(keys)
-            if wait <= 0 or wait > MAX_COOLDOWN_WAIT or pool_pass >= MAX_POOL_PASSES:
+            remaining = deadline - time.monotonic()
+            if wait <= 0 or wait > MAX_COOLDOWN_WAIT or pool_pass >= MAX_POOL_PASSES \
+                    or wait >= remaining:
                 break
             set_gemini_activity(True, f"Every pooled key is cooling down; retrying in {int(wait)}s")
             time.sleep(wait)
@@ -2279,6 +2384,7 @@ def unit_failed(unit: Dict[str, Any], message: str) -> None:
     unit["doc_type"] = None
     unit["status"] = "failed"
     unit["message"] = f"Not extracted: {message}"
+    LOG.error("Extraction unit failed: %s | %s", unit.get("label", "unknown"), message)
 
 
 def apply_batch_result(batch: List[Dict[str, Any]], parsed: Any, used: str) -> None:
@@ -2314,6 +2420,9 @@ def apply_batch_result(batch: List[Dict[str, Any]], parsed: Any, used: str) -> N
 
 
 def process_units(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -> None:
+    started = time.monotonic()
+    LOG.info("[TRACE %s] UNIT_BATCH_START parts=%d labels=%s", utc_now(), len(batch),
+             ", ".join(unit.get("label", "unknown") for unit in batch))
     try:
         parsed, used = call_gemini_batch(batch, keys)
     except OversizedBatch as exc:
@@ -2322,7 +2431,7 @@ def process_units(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -> No
             process_units(batch[:middle], keys)
             process_units(batch[middle:], keys)
             return
-        unit_failed(batch[0], f"part too large to process even alone ({str(exc)[:150]})")
+        unit_failed(batch[0], f"part too large to process even alone ({type(exc).__name__}: {str(exc)[:250]})")
         return
     except MalformedResponse as exc:
         # A malformed batched response can be caused by output complexity even when
@@ -2333,13 +2442,34 @@ def process_units(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -> No
             process_units(batch[:middle], keys)
             process_units(batch[middle:], keys)
             return
-        unit_failed(batch[0], f"Gemini returned invalid JSON ({str(exc)[:250]})")
+        unit_failed(batch[0], f"Gemini returned invalid JSON ({type(exc).__name__}: {str(exc)[:350]})")
         return
     except Exception as exc:  # noqa: BLE001
+        LOG.exception(
+            "Extraction request failed for %s",
+            ", ".join(unit.get("label", "unknown") for unit in batch),
+        )
+        detail = f"{type(exc).__name__}: {clean_text(exc)[:400]}"
         for unit in batch:
-            unit_failed(unit, clean_text(exc)[:300])
+            unit_failed(unit, detail)
         return
-    apply_batch_result(batch, parsed, used)
+    # A model can return valid JSON while omitting one part of a multi-part
+    # request.  Apply the complete parts immediately, then retry only the
+    # missing parts.  This preserves successful extraction and prevents silent
+    # loss of facts from a partially compliant response.
+    by_label, _ = parsed
+    complete = [unit for unit in batch if unit["label"] in by_label]
+    missing = [unit for unit in batch if unit["label"] not in by_label]
+    if complete:
+        apply_batch_result(complete, (by_label, []), used)
+    if missing:
+        if len(missing) == len(batch) and len(batch) == 1:
+            unit_failed(missing[0], "model returned no entry for this part")
+        else:
+            for unit in missing:
+                process_units([unit], keys)
+    LOG.info("[TRACE %s] UNIT_BATCH_END parts=%d complete=%d missing=%d elapsed=%.2fs",
+             utc_now(), len(batch), len(complete), len(missing), time.monotonic() - started)
 
 
 # ---------------------------------------------------------------- ingestion
@@ -2575,6 +2705,8 @@ def score_decisions_batch(docket_id: str, document_ids: List[str], keys: List[Di
         LOG.warning("Skipping Decisions scoring for docket %s: %d occurrences (limit 1000)",
                     docket_id, len(rows))
         return
+    started = time.monotonic()
+    LOG.info("[TIMING] Decisions scoring START docket=%s occurrences=%d", docket_id, len(rows))
     input_text = "\n".join(
         f"Occurrence {index}: document={row['filename']}; label={row['label']}; "
         f"value={row['value']}; evidence={row['source_evidence']}"
@@ -2595,7 +2727,7 @@ def score_decisions_batch(docket_id: str, document_ids: List[str], keys: List[Di
     try:
         client = genai.Client(
             api_key=keys[0]["key"],
-            http_options=types.HttpOptions(api_version="v1beta", timeout=GEMINI_TIMEOUT_MS),
+            http_options=types.HttpOptions(api_version="v1beta", timeout=DECISIONS_TIMEOUT_MS),
         )
         if not hasattr(client, "decisions"):
             LOG.warning(
@@ -2603,9 +2735,13 @@ def score_decisions_batch(docket_id: str, document_ids: List[str], keys: List[Di
                 "upgrade to google-genai>=3.2.0. Existing confidence scores were preserved."
             )
             return
+        LOG.info("[TIMING] Decisions client ready docket=%s elapsed=%.2fs",
+                 docket_id, time.monotonic() - started)
         result = client.decisions.create(
             model="gemini-decision-1", input=input_text, questions=questions,
         )
+        LOG.info("[TIMING] Decisions response received docket=%s elapsed=%.2fs",
+                 docket_id, time.monotonic() - started)
         answers = getattr(result, "answers", {}) or {}
         updates = []
         for index, row in enumerate(rows):
@@ -2616,8 +2752,11 @@ def score_decisions_batch(docket_id: str, document_ids: List[str], keys: List[Di
         if updates:
             with connect() as connection:
                 connection.executemany("UPDATE facts SET decisions_score = ? WHERE id = ?", updates)
+        LOG.info("[TIMING] Decisions scoring END docket=%s updates=%d elapsed=%.2fs",
+                 docket_id, len(updates), time.monotonic() - started)
     except Exception as exc:  # noqa: BLE001
-        LOG.warning("Gemini Decisions scoring failed for docket %s: %s", docket_id, scrub(exc, keys[0]["key"]))
+        LOG.warning("[TIMING] Gemini Decisions scoring FAILED docket=%s elapsed=%.2fs error=%s",
+                    docket_id, time.monotonic() - started, scrub(exc, keys[0]["key"]))
     finally:
         if client is not None:
             try:
@@ -2880,6 +3019,9 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
             )
 
         for document_index, doc in enumerate(documents, start=1):
+            document_started = time.monotonic()
+            LOG.info("[TIMING] Document START %d/%d filename=%s pages=%d",
+                     document_index, len(documents), doc["filename"], doc["page_count"])
             set_document_status(doc["id"], "processing")
             _job_doc_update(job_id, doc["id"], filename=doc["filename"], status="processing",
                             facts=0, message="Sending to Gemini…")
@@ -2908,7 +3050,11 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
                 # A Gemini request can therefore never contain units from another
                 # uploaded document.
                 batches = pack_batches([u for u in units if u["status"] is None])
+                LOG.info("[TRACE %s] DOCUMENT_UNITS_READY filename=%s units=%d batches=%d",
+                         utc_now(), doc["filename"], len(units), len(batches))
                 for request_index, batch in enumerate(batches, start=1):
+                    LOG.info("[TRACE %s] DOCUMENT_BATCH_START filename=%s batch=%d/%d parts=%d",
+                             utc_now(), doc["filename"], request_index, len(batches), len(batch))
                     progress(
                         f"{doc['filename']}: request {request_index}/{len(batches)}"
                     )
@@ -2924,6 +3070,9 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
                     items,
                     " | ".join(messages),
                 )
+                LOG.info("[TIMING] Document SAVE END filename=%s status=%s facts=%d elapsed=%.2fs",
+                         doc["filename"], outcome["status"], outcome["appended_count"],
+                         time.monotonic() - document_started)
                 results.append(outcome)
                 _job_doc_update(job_id, doc["id"], status=outcome["status"],
                                 facts=outcome["appended_count"], message=outcome["message"])
@@ -2939,7 +3088,10 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
         # Score the whole completed extraction batch in one Decisions request. This
         # deliberately runs after all document facts are durable and never blocks or
         # overwrites the existing confidence_score column.
+        LOG.info("[TIMING] Entering Decisions scoring docket=%s documents=%d",
+                 docket_id, len(documents))
         score_decisions_batch(docket_id, [doc["id"] for doc in documents], keys)
+        LOG.info("[TIMING] Finished Decisions scoring docket=%s", docket_id)
         with PROCESSING_LOCK:
             PROCESSING_JOBS[job_id].update(
                 status="complete", phase="complete", gemini_active=False,
@@ -3014,7 +3166,30 @@ _LOADER_CSS = """
 EXTRACTION_RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
-        "documents": {"type": "array", "items": {"type": "object"}},
+        "documents": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "document": {"type": "string"},
+                    "document_type": {"type": "string"},
+                    "facts": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string"},
+                            },
+                            # Keep value and audit fields permissive because blurry
+                            # fields may legitimately return null or omit optional
+                            # vision metadata. The label itself is never optional.
+                            "required": ["label"],
+                        },
+                    },
+                },
+                "required": ["document", "document_type", "facts"],
+            },
+        },
         "cross_references": {"type": "array", "items": {"type": "object"}},
     },
     "required": ["documents", "cross_references"],
@@ -3228,13 +3403,22 @@ def processing_active(docket_id: Optional[str]) -> bool:
 def save_uploaded_document(docket_id: str, upload: Any) -> Dict[str, Any]:
     """Store ONE uploaded file without processing it. Saving and extraction are
     deliberately independent: the document lands in the Workspace as “saved”."""
+    started = time.monotonic()
     filename = upload_name(upload)
+    LOG.info("[TRACE %s] UPLOAD_RECEIVED docket=%s filename=%s", utc_now(), docket_id, filename)
     data = upload_data(upload)
+    LOG.info("[TRACE %s] UPLOAD_BYTES_READ filename=%s bytes=%d elapsed=%.2fs",
+             utc_now(), filename, len(data), time.monotonic() - started)
     problem = validate_upload(filename, data)
     if problem:
+        LOG.warning("[TRACE %s] UPLOAD_REJECTED filename=%s reason=%s", utc_now(), filename, problem)
         return job_result(filename, "failed", problem)
     try:
+        LOG.info("[TRACE %s] PREPARE_DOCUMENT_START filename=%s", utc_now(), filename)
         doc, skipped = prepare_document(docket_id, filename, data, "Gemini")
+        LOG.info("[TRACE %s] PREPARE_DOCUMENT_END filename=%s pages=%s elapsed=%.2fs",
+                 utc_now(), filename, doc.get("page_count") if doc else "skipped",
+                 time.monotonic() - started)
     except Exception as exc:  # noqa: BLE001
         LOG.exception("could not store %s", filename)
         return job_result(filename, "failed",
@@ -3242,6 +3426,8 @@ def save_uploaded_document(docket_id: str, upload: Any) -> Dict[str, Any]:
     if doc is None:
         return skipped  # identical to an already-completed document
     set_document_status(doc["id"], "saved")
+    LOG.info("[TRACE %s] UPLOAD_SAVED filename=%s document_id=%s elapsed=%.2fs",
+             utc_now(), filename, doc["id"], time.monotonic() - started)
     return job_result(filename, "saved",
                       f"Stored {doc['page_count']} page(s)/sheet(s). Not processed yet.")
 
@@ -3405,7 +3591,13 @@ def _prune_finished_jobs() -> None:
 def queue_saved_documents(docket_id: str, document_ids: List[str]) -> Tuple[int, List[Dict[str, Any]]]:
     """Queue saved documents for background extraction, from stored bytes only.
     Returns (count queued, immediate failure results) and flashes suitable messages."""
+    queue_started = time.monotonic()
+    LOG.info("[TRACE %s] PROCESS_CLICK docket=%s requested_document_ids=%s",
+             utc_now(), docket_id, ",".join(map(str, document_ids)))
     keys = key_pool()
+    LOG.info("[TRACE %s] KEY_POOL_READY docket=%s valid_keys=%d models=%s elapsed=%.2fs",
+             utc_now(), docket_id, len(keys), ",".join(GEMINI_MODELS),
+             time.monotonic() - queue_started)
     if not keys:
         queue_flash(
             "error",
@@ -3427,13 +3619,19 @@ def queue_saved_documents(docket_id: str, document_ids: List[str]) -> Tuple[int,
         if row["id"] not in wanted or row["status"] not in PROCESSABLE_STATES:
             continue
         document, problem = load_saved_document(docket_id, row["id"])
+        LOG.info("[TRACE %s] QUEUE_DOCUMENT_CHECK filename=%s status=%s bytes=%s",
+                 utc_now(), row["filename"], row["status"], row["size_bytes"])
         if problem:
+            LOG.error("[TRACE %s] QUEUE_DOCUMENT_REJECTED filename=%s reason=%s",
+                      utc_now(), row["filename"], problem)
             set_document_status(row["id"], "failed")
             results.append(job_result(row["filename"], "failed", problem))
             docs.append({"id": row["id"], "filename": row["filename"], "status": "failed",
                          "facts": 0, "message": problem})
             continue
         set_document_status(row["id"], "queued")
+        LOG.info("[TRACE %s] DOCUMENT_QUEUED filename=%s document_id=%s", utc_now(),
+                 row["filename"], row["id"])
         docs.append({"id": row["id"], "filename": row["filename"], "status": "queued",
                      "facts": 0, "message": ""})
         # Snapshot review decisions now; the document's existing facts stay in place until
@@ -3458,6 +3656,8 @@ def queue_saved_documents(docket_id: str, document_ids: List[str]) -> Tuple[int,
         "total": len(payloads),
     }
     PROCESSING_EXECUTOR.submit(_run_processing_job, job_id, docket_id, payloads, keys, results)
+    LOG.info("[TRACE %s] WORKER_SUBMITTED job_id=%s docket=%s documents=%d elapsed=%.2fs",
+             utc_now(), job_id, docket_id, len(payloads), time.monotonic() - queue_started)
     queue_flash("success", f"Queued {len(payloads)} document(s) for Gemini extraction. "
                            "Progress appears in step 2; you can switch tabs safely.")
     return len(payloads), results
@@ -3586,7 +3786,11 @@ def render_process_panel(docket_id: str) -> None:
             )
             if start_selected or start_all:
                 ids = list(chosen) if start_selected else list(labels)
+                LOG.info("[TRACE %s] PROCESS_BUTTON_CLICK docket=%s mode=%s selected=%d",
+                         utc_now(), docket_id, "selected" if start_selected else "all", len(ids))
                 queued_count, immediate_results = queue_saved_documents(docket_id, ids)
+                LOG.info("[TRACE %s] PROCESS_BUTTON_RESULT docket=%s queued=%d immediate_results=%d",
+                         utc_now(), docket_id, queued_count, len(immediate_results))
                 if immediate_results:
                     st.session_state["last_results"] = immediate_results
                 st.session_state["clear_process_pick"] = True
@@ -5555,6 +5759,9 @@ RENDERERS = {
 
 
 def main() -> None:
+    # Streamlit can attach its terminal handler after module import; re-apply the
+    # diagnostic logger configuration at the actual app entry point as well.
+    install_secret_redaction()
     st.set_page_config(page_title="Parchi AI", page_icon="📄", layout="wide",
                        initial_sidebar_state="collapsed")
     inject_css()

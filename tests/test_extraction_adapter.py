@@ -43,3 +43,16 @@ def test_nullable_numeric_values_coerce_and_zero_confidence():
     assert coerce_nullable_value(None, str, 40) == ("", 40.0)
     assert coerce_nullable_value(None, int, 40) == (0, 0.0)
     assert coerce_nullable_value(None, float, 40) == (0.0, 0.0)
+
+
+def test_legacy_fact_name_alias_is_normalized_to_a_real_label():
+    payload = {
+        "documents": [{
+            "document": "scan.jpg",
+            "document_type": "Invoice",
+            "facts": [{"field_name": "Invoice Number", "value": "INV-2"}],
+        }],
+        "cross_references": [],
+    }
+    documents, _ = parse_batch_payload(json.dumps(payload), ["scan.jpg"])
+    assert documents["scan.jpg"]["facts"][0]["label"] == "Invoice Number"
