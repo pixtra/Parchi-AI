@@ -14,7 +14,6 @@ import os
 import re
 import shutil
 import sqlite3
-import sys
 import tempfile
 import time
 import threading
@@ -77,9 +76,9 @@ except ImportError:
     Image = None
 
 try:
-    import pymupdf
+    import fitz  # PyMuPDF
 except ImportError:
-    pymupdf = None
+    fitz = None
 
 try:
     from google import genai
@@ -105,11 +104,6 @@ _VALUE_GROUP_COMPONENT_DIR = BASE_DIR / "value_group_component"
 _value_groups_component = (
     components.declare_component("parchi_value_groups", path=str(_VALUE_GROUP_COMPONENT_DIR))
     if _VALUE_GROUP_COMPONENT_DIR.is_dir() else None
-)
-_TEMPLATE_MAPPING_COMPONENT_DIR = BASE_DIR / "template_mapping_component"
-_template_mapping_component = (
-    components.declare_component("parchi_template_mapping_v2", path=str(_TEMPLATE_MAPPING_COMPONENT_DIR))
-    if _TEMPLATE_MAPPING_COMPONENT_DIR.is_dir() else None
 )
 def _env(name: str, default: Any = "") -> Any:
     """Read PARCHI_<name> configuration values."""
@@ -183,27 +177,13 @@ GEMINI_MODELS = tuple(
     )
     if str(m).strip()
 )
-GEMINI_TIMEOUT_MS = int(_env("GEMINI_TIMEOUT_MS", "7000"))
-# Hard wall-clock budget for one document/unit extraction. A failed key must never
-# make the user wait through every model and cooldown window indefinitely.
-EXTRACTION_DEADLINE_SECONDS = float(_env("EXTRACTION_DEADLINE_SECONDS", "15"))
-DECISIONS_TIMEOUT_MS = int(_env("DECISIONS_TIMEOUT_MS", "5000"))
-# Log probabilities are not supported by the configured Flash models and cause an
-# avoidable failed request before every real extraction request. Keep the existing
-# token-confidence adapter available, but require explicit opt-in for models that
-# actually support response logprobs.
-ENABLE_LOGPROBS = str(_env("ENABLE_LOGPROBS", "0")).strip().lower() in {"1", "true", "yes", "on"}
-# Exhaustive extraction can legitimately require more than 32k output tokens for
-# dense scans.  Keep this configurable, but use the larger Gemini ceiling by default.
-MAX_OUTPUT_TOKENS = int(_env("MAX_OUTPUT_TOKENS", "65536"))
+GEMINI_TIMEOUT_MS = 180_000
+MAX_OUTPUT_TOKENS = int(_env("MAX_OUTPUT_TOKENS", "32768"))
 CHUNK_PAGES = int(_env("CHUNK_PAGES", "10"))
 TOKENS_PER_PAGE = int(_env("TOKENS_PER_PAGE", "1500"))
 MAX_BATCH_TOKENS = int(_env("MAX_BATCH_TOKENS", "400000"))
 MAX_PARTS_PER_BATCH = int(_env("MAX_PARTS_PER_BATCH", "12"))
 MAX_UPLOAD_BYTES = int(_env("MAX_UPLOAD_MB", "50")) * 1024 * 1024
-# Gemini supports inline PDF payloads below 50 MB.  Keep a small margin for the
-# surrounding JSON/request overhead so the inline path does not cross the limit.
-INLINE_BATCH_BYTES = 48 * 1024 * 1024
 KEY_COOLDOWN_SECONDS = 60
 AUTH_COOLDOWN_SECONDS = 3600
 SUPPORTED_TYPES = ["pdf", "png", "jpg", "jpeg", "txt", "xlsx", "csv"]
@@ -241,10 +221,10 @@ def document_state_label(status: str) -> str:
 def document_state_badge(status: str) -> str:
     label, kind = DOCUMENT_STATE_META.get(status, (status.capitalize(), ""))
     return badge(label, kind)
-PAGES = ["Dockets", "Workspace", "Validation", "Groups", "Organize", "Export", "Settings"]
+PAGES = ["Dockets", "Workspace", "Organize", "Viewer", "Validation", "Export", "Settings"]
 PAGE_ICONS = {
     "Dockets": "▤", "Workspace": "⬆", "Organize": "⌘", "Viewer": "▣",
-    "Validation": "✔", "Groups": "◈", "Export": "⇩", "Settings": "⚙",
+    "Validation": "✔", "Export": "⇩", "Settings": "⚙",
 }
 IDENTITY_CONCEPTS = {
     "invoice_number", "po_number", "purchase_order_number", "challan_number",
@@ -356,7 +336,6 @@ CREATE TABLE IF NOT EXISTS facts (
     source_evidence TEXT NOT NULL,
     confidence_band TEXT NOT NULL,
     confidence_score INTEGER NOT NULL,
-    decisions_score INTEGER,
     confidence_reasons TEXT NOT NULL,
     review_status TEXT NOT NULL,
     corrected INTEGER NOT NULL DEFAULT 0,
@@ -408,10 +387,6 @@ Rules:
 - Use specific contextual labels such as Supplier Name, Invoice Number, Invoice Date,
   Gross Weight or Taxable Amount when the document establishes that meaning. Do not invent
   context when it is genuinely ambiguous.
-- Every fact MUST contain a non-empty human-readable "label". Never use "Unlabelled field",
-  "Unlabeled field", "Unknown", or an empty label. If the printed label is unclear, use
-  "Unclear <best contextual description>" and preserve the uncertainty in evidence and
-  confidence rather than emitting a placeholder.
 - Write labels in clear, concise language that names what the field means. Prefer precise
   names ("Supplier GSTIN", "Net Weight", "Challan Date") over vague or overly generic text
   ("Number", "Detail 1", "Other"). Read the surrounding headings, table column headers and
@@ -688,9 +663,9 @@ def validate_upload(filename: str, data: bytes) -> Optional[str]:
                 return "The workbook contains no worksheets."
         except Exception as exc:  # noqa: BLE001
             return f"The workbook could not be opened ({exc.__class__.__name__})."
-    if extension == "pdf" and pymupdf is not None:
+    if extension == "pdf" and fitz is not None:
         try:
-            with pymupdf.open(stream=data, filetype="pdf") as document:
+            with fitz.open(stream=data, filetype="pdf") as document:
                 if document.needs_pass:
                     return "The PDF is password-protected. Remove the password and upload it again."
                 if document.page_count == 0:
@@ -830,9 +805,6 @@ def init_db() -> bool:
         connection.executescript(SCHEMA)
         connection.executescript(VALUE_GROUP_SCHEMA)
         connection.executescript(VALIDATED_DATA_SCHEMA)
-        fact_columns = {row["name"] for row in connection.execute("PRAGMA table_info(facts)")}
-        if "decisions_score" not in fact_columns:
-            connection.execute("ALTER TABLE facts ADD COLUMN decisions_score INTEGER")
         review_columns = {row["name"] for row in connection.execute(
             "PRAGMA table_info(validated_template_records)"
         )}
@@ -926,27 +898,6 @@ def delete_document(docket_id: str, document_id: str) -> Optional[str]:
     return row["storage_path"]
 
 
-def rename_document(docket_id: str, document_id: str, filename: str) -> None:
-    """Rename the display filename without changing the stored original or its facts."""
-    clean = clean_text(filename).strip()
-    if not clean:
-        raise ValueError("Document name cannot be empty.")
-    if len(clean) > 255:
-        raise ValueError("Document name must be 255 characters or fewer.")
-    with connect() as connection:
-        row = connection.execute(
-            "SELECT 1 FROM documents WHERE id = ? AND docket_id = ?",
-            (document_id, docket_id),
-        ).fetchone()
-        if row is None:
-            raise ValueError("That document no longer exists in this docket.")
-        connection.execute(
-            "UPDATE documents SET filename = ? WHERE id = ? AND docket_id = ?",
-            (clean, document_id, docket_id),
-        )
-        connection.execute("UPDATE dockets SET updated_at = ? WHERE id = ?", (utc_now(), docket_id))
-
-
 def list_dockets() -> List[sqlite3.Row]:
     with connect() as connection:
         return connection.execute(
@@ -1006,8 +957,7 @@ def fetch_metadata(docket_id: str) -> List[sqlite3.Row]:
     with connect() as connection:
         return connection.execute(
             """SELECT d.filename AS document_name, f.label AS label, f.value AS value,
-                      f.confidence_score AS confidence_score, f.decisions_score AS decisions_score,
-                      f.review_status AS review_status
+                      f.confidence_score AS confidence_score, f.review_status AS review_status
                FROM facts f JOIN documents d ON d.id = f.document_id
                WHERE f.docket_id = ? AND f.concept != 'page_processing_status'
                ORDER BY d.filename, f.page_number, f.created_at""",
@@ -1135,32 +1085,6 @@ def template_field_rows(template_id: str) -> List[sqlite3.Row]:
             "SELECT * FROM template_fields WHERE template_id = ? ORDER BY position, id",
             (template_id,),
         ).fetchall()
-
-
-def remap_template_field(template_id: str, destination: str, source_type: str,
-                         source_id: str, source_name: str) -> None:
-    """Persist one visual mapping while retaining every other template field."""
-    fields = [dict(row) for row in template_field_rows(template_id)]
-    if not fields:
-        with connect() as connection:
-            template = connection.execute(
-                "SELECT labels_json FROM templates WHERE id = ?", (template_id,)
-            ).fetchone()
-        labels = json.loads(template["labels_json"]) if template else []
-        fields = [
-            {"source_type": "label", "source_id": f"__unmapped__:{label}",
-             "source_name": "Unmapped", "destination_label": label, "position": index}
-            for index, label in enumerate(labels)
-        ]
-    target = normalize_label(destination)
-    found = False
-    for field in fields:
-        if normalize_label(field["destination_label"]) == target:
-            field.update(source_type=source_type, source_id=source_id, source_name=source_name)
-            found = True
-    if not found:
-        raise ValueError("That template label no longer exists. Refresh and try again.")
-    save_template_fields(template_id, fields)
 
 
 def append_template_labels(docket_id: str, template_id: str, labels: List[str]) -> List[str]:
@@ -1324,10 +1248,10 @@ def decode_text(data: bytes) -> str:
 def read_pages(filename: str, data: bytes) -> List[Dict[str, Any]]:
     extension = extension_of(filename)
     if extension == "pdf":
-        if pymupdf is None:
+        if fitz is None:
             raise RuntimeError("PyMuPDF is not installed (pip install pymupdf).")
         pages = []
-        with pymupdf.open(stream=data, filetype="pdf") as document:
+        with fitz.open(stream=data, filetype="pdf") as document:
             for index, page in enumerate(document, start=1):
                 text = clean_text(page.get_text("text")).strip()
                 pages.append({"page_number": index, "sheet_name": "", "text": text, "readable": bool(text)})
@@ -1348,14 +1272,14 @@ def read_pages(filename: str, data: bytes) -> List[Dict[str, Any]]:
 
 
 def split_pdf(data: bytes, pages_per_part: int) -> List[Tuple[int, int, bytes]]:
-    with pymupdf.open(stream=data, filetype="pdf") as source:
+    with fitz.open(stream=data, filetype="pdf") as source:
         total = source.page_count
         if total <= pages_per_part:
             return [(0, total, data)]
         parts = []
         for start in range(0, total, pages_per_part):
             end = min(start + pages_per_part, total)
-        with pymupdf.open() as part:
+            with fitz.open() as part:
                 part.insert_pdf(source, from_page=start, to_page=end - 1)
                 parts.append((start, end - start, part.tobytes()))
         return parts
@@ -1621,28 +1545,8 @@ def install_secret_redaction() -> None:
     emits our records and on every root handler (ancestor logger filters do not
     apply to propagated records, so handler-level filtering is required)."""
     redaction = _SecretRedactionFilter()
-    # Streamlit may install its own root handler after module import and leave the
-    # application logger at WARNING. Explicitly enable INFO so extraction diagnostics
-    # are visible in the terminal running `streamlit run`.
-    LOG.setLevel(logging.INFO)
-    root = logging.getLogger()
-    root.setLevel(min(root.level or logging.INFO, logging.INFO))
-    # Streamlit's root logger configuration differs between local and hosted
-    # versions. Keep a dedicated stderr handler on our logger so extraction traces
-    # cannot disappear because a framework handler filters INFO records.
-    if not any(getattr(handler, "_parchi_trace_handler", False) for handler in LOG.handlers):
-        trace_handler = logging.StreamHandler(sys.stderr)
-        trace_handler._parchi_trace_handler = True
-        trace_handler.setLevel(logging.INFO)
-        trace_handler.setFormatter(logging.Formatter(
-            "%(asctime)s %(levelname)s %(name)s: %(message)s"
-        ))
-        trace_handler.addFilter(redaction)
-        LOG.addHandler(trace_handler)
-    LOG.propagate = False
     LOG.addFilter(redaction)
-    for handler in root.handlers:
-        handler.setLevel(logging.INFO)
+    for handler in logging.getLogger().handlers:
         handler.addFilter(redaction)
 
 
@@ -1862,7 +1766,7 @@ class MalformedResponse(Exception):
 
 
 def make_units(doc: Dict[str, Any], label: Optional[str] = None) -> List[Dict[str, Any]]:
-    if extension_of(doc["filename"]) == "pdf" and pymupdf is not None:
+    if extension_of(doc["filename"]) == "pdf" and fitz is not None:
         parts = split_pdf(doc["data"], CHUNK_PAGES)
         part_meta = [(start, count, blob, doc["mime"], "." + extension_of(doc["filename"]),
                       None) for start, count, blob in parts]
@@ -1976,10 +1880,6 @@ def parse_batch_payload(text: str, labels: List[str]) -> Tuple[Dict[str, Dict[st
 
     def match(name: str) -> Optional[str]:
         name = re.sub(r"^\s*P\d+\s*\|\s*", "", name or "", flags=re.IGNORECASE).strip()
-        # A single-part request is unambiguous even when a model returns an empty
-        # document field.  Never apply this fallback to a multi-part request.
-        if not name and len(labels) == 1:
-            return labels[0]
         if name in labels:
             return name
         key = name.lower()
@@ -2000,41 +1900,16 @@ def parse_batch_payload(text: str, labels: List[str]) -> Tuple[Dict[str, Dict[st
     by_label: Dict[str, Dict[str, Any]] = {}
     for doc in payload["documents"]:
         if not isinstance(doc, dict):
-            raise ValueError("response contains a non-object document entry")
+            continue
         label = match(str(doc.get("document", "")))
         if label is None:
-            # An unrecognised document entry means the model did not follow the
-            # per-part identity contract.  Do not silently discard its facts.
-            raise ValueError(
-                f"response contains an unrecognised document identifier: "
-                f"{str(doc.get('document', ''))[:120]}"
-            )
+            continue
         bucket = by_label.setdefault(label, {"document_type": str(doc.get("document_type") or ""), "facts": []})
         document_type = bucket["document_type"]
         for item in doc.get("facts") or []:
             if not isinstance(item, dict):
-                raise ValueError(
-                    f"response contains a non-object fact in document {label}"
-                )
-            # Gemini occasionally uses a semantically equivalent key despite the
-            # requested JSON contract. Accept those legacy variants, but never accept
-            # a placeholder as a real extracted label.
-            raw_label = str(
-                item.get("label")
-                or item.get("field_name")
-                or item.get("name")
-                or item.get("key")
-                or ""
-            ).strip()
-            if not raw_label or _normalised_phrase(raw_label) in {
-                "unlabelled field", "unlabeled field", "unknown field", "unknown"
-            }:
-                LOG.warning(
-                    "Gemini returned a fact without a usable label for %s; fact keys=%s",
-                    label, sorted(str(key) for key in item.keys()),
-                )
-                raise ValueError(f"response contains a fact without a usable label in document {label}")
-            name = raw_label
+                continue
+            name = str(item.get("label") or "Unlabelled field").strip()
             value, _ = coerce_nullable_value(item.get("value"), str)
             value = value.strip()
             ambiguity_notes = str(item.get("ambiguity_notes") or "").strip()
@@ -2053,7 +1928,7 @@ def parse_batch_payload(text: str, labels: List[str]) -> Tuple[Dict[str, Dict[st
                 evidence,
                 item.get("confidence_score"),
             )
-            fact["_source_label"] = raw_label
+            fact["_source_label"] = str(item.get("label") or "Unlabelled field").strip()
             fact["_legibility"] = legibility if legibility in {"CLEAR", "BLURRY", "HANDWRITTEN", "MISSING"} else "CLEAR"
             fact["_ambiguity_notes"] = ambiguity_notes
             fact["_box_2d"] = box_2d
@@ -2190,25 +2065,15 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
         raise RuntimeError("No valid Gemini API keys are configured.")
 
     labels = [unit["label"] for unit in batch]
-    deadline = time.monotonic() + EXTRACTION_DEADLINE_SECONDS
     errors: List[str] = []
     parse_failure: Optional[str] = None
     uploads: Dict[str, Tuple[Any, List[Any]]] = {}
-    # Keep compatibility with lightweight unit fixtures and older callers that only
-    # provide an already-uploaded handle; those continue through the File API path.
-    use_inline = all("data" in unit for unit in batch) and \
-        sum(len(unit["data"]) for unit in batch) <= INLINE_BATCH_BYTES
     try:
         pool_pass = 0
         while True:
             pool_pass += 1
             for model in GEMINI_MODELS:
                 for entry in rotated_keys(keys):
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise TimeoutError(
-                            f"extraction deadline exceeded after {EXTRACTION_DEADLINE_SECONDS:.0f}s"
-                        )
                     masked = entry["masked"]
                     if cooldown_remaining(entry["id"]) > 0:
                         errors.append(f"{masked}: cooling down")
@@ -2218,37 +2083,19 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
                         continue
                     if entry["id"] not in uploads:
                         try:
-                            if use_inline:
-                                # Small documents are sent directly in the request. This
-                                # avoids Gemini File API processing/ACTIVE polling entirely.
-                                uploads[entry["id"]] = (make_client(entry["key"]), [])
-                            else:
-                                uploads[entry["id"]] = upload_parts(entry, batch)
+                            uploads[entry["id"]] = upload_parts(entry, batch)
                         except Exception as exc:  # noqa: BLE001
                             errors.append(f"{masked} upload: {scrub(exc, entry['key'])}")
                             cooldown = classify_error(exc)
                             if cooldown:
                                 set_cooldown(entry["id"], cooldown)
-                                LOG.warning(
-                                    "[TRACE %s] KEY_COOLDOWN key=%s model=%s seconds=%d reason=%s",
-                                    utc_now(), masked, model, cooldown,
-                                    "authentication/quota/rate-limit",
-                                )
                             continue
                     client, handles = uploads[entry["id"]]
-                    request_started = time.monotonic()
-                    LOG.info("[TIMING] Gemini request START model=%s parts=%d labels=%s",
-                             model, len(batch), ", ".join(unit["label"] for unit in batch))
 
                     contents: List[Any] = []
-                    for number, unit in enumerate(batch, start=1):
+                    for number, (unit, handle) in enumerate(zip(batch, handles), start=1):
                         contents.append(f"=== DOCUMENT: P{number} | {unit['label']} ===")
-                        if use_inline:
-                            contents.append(types.Part.from_bytes(
-                                data=unit["data"], mime_type=unit["mime"]
-                            ))
-                        else:
-                            contents.append(handles[number - 1])
+                        contents.append(handle)
                         ocr_context = "\n".join(
                             str(page.get("text") or "") for page in unit.get("pages_slice", [])
                         )
@@ -2266,40 +2113,22 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
                     set_gemini_activity(True, f"Gemini request in progress · {model}")
                     try:
                         config_args = dict(response_mime_type="application/json", temperature=0.1,
-                                           max_output_tokens=MAX_OUTPUT_TOKENS,
-                                           response_schema=EXTRACTION_RESPONSE_SCHEMA)
-                        if ENABLE_LOGPROBS:
-                            try:
-                                response = client.models.generate_content(
-                                    model=model, contents=contents,
-                                    config=types.GenerateContentConfig(
-                                        **config_args, response_logprobs=True, logprobs=1
-                                    ),
-                                )
-                            except Exception as logprob_exc:
-                                # Explicit opt-in remains backwards compatible for a
-                                # model that supports logprobs, but a rejected optional
-                                # feature must never prevent the normal request.
-                                LOG.info(
-                                    "Gemini log probabilities unavailable; retrying without them: %s",
-                                    str(logprob_exc)[:200],
-                                )
-                                response = client.models.generate_content(
-                                    model=model, contents=contents,
-                                    config=types.GenerateContentConfig(**config_args),
-                                )
-                        else:
+                                           max_output_tokens=MAX_OUTPUT_TOKENS)
+                        try:
+                            response = client.models.generate_content(
+                                model=model, contents=contents,
+                                config=types.GenerateContentConfig(**config_args,
+                                                                  response_logprobs=True, logprobs=1),
+                            )
+                        except Exception as logprob_exc:
+                            # Older models/endpoints may not support response log probabilities.
+                            LOG.info("Gemini log probabilities unavailable; retrying without them: %s",
+                                     str(logprob_exc)[:200])
                             response = client.models.generate_content(
                                 model=model, contents=contents,
                                 config=types.GenerateContentConfig(**config_args),
                             )
                     except Exception as exc:  # noqa: BLE001
-                        elapsed = time.monotonic() - request_started
-                        LOG.warning(
-                            "[TIMING] Gemini request FAILED model=%s key=%s elapsed=%.2fs "
-                            "error=%s",
-                            model, masked, elapsed, scrub(exc, entry["key"]),
-                        )
                         if is_size_error(exc):
                             raise OversizedBatch(scrub(exc, entry["key"]))
                         errors.append(f"{masked} · {model}: {scrub(exc, entry['key'])}")
@@ -2310,11 +2139,6 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
                             set_cooldown(entry["id"], cooldown)
                         elif cooldown:
                             set_cooldown(f"{entry['id']}:{model}", cooldown)
-                        if cooldown:
-                            LOG.warning(
-                                "[TRACE %s] KEY_COOLDOWN key=%s model=%s seconds=%d",
-                                utc_now(), masked, model, cooldown,
-                            )
                         continue
                     finally:
                         set_gemini_activity(False)
@@ -2322,10 +2146,8 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
                     response_reason = finish_reason(response)
                     response_text = response.text or ""
                     LOG.info(
-                        "[TIMING] Gemini response END for %s · %s: elapsed=%.2fs "
-                        "finish_reason=%s, chars=%d",
-                        masked, model, time.monotonic() - request_started,
-                        response_reason or "unknown", len(response_text),
+                        "Gemini response diagnostics for %s · %s: finish_reason=%s, chars=%d",
+                        masked, model, response_reason or "unknown", len(response_text),
                     )
                     if "MAX_TOKENS" in response_reason:
                         raise OversizedBatch("response was truncated at the output token limit")
@@ -2360,9 +2182,7 @@ def call_gemini_batch(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -
             # Full pool pass without a usable candidate: if keys are only rate- or
             # quota-limited, wait for the soonest recovery and go around again.
             wait = earliest_cooldown(keys)
-            remaining = deadline - time.monotonic()
-            if wait <= 0 or wait > MAX_COOLDOWN_WAIT or pool_pass >= MAX_POOL_PASSES \
-                    or wait >= remaining:
+            if wait <= 0 or wait > MAX_COOLDOWN_WAIT or pool_pass >= MAX_POOL_PASSES:
                 break
             set_gemini_activity(True, f"Every pooled key is cooling down; retrying in {int(wait)}s")
             time.sleep(wait)
@@ -2384,7 +2204,6 @@ def unit_failed(unit: Dict[str, Any], message: str) -> None:
     unit["doc_type"] = None
     unit["status"] = "failed"
     unit["message"] = f"Not extracted: {message}"
-    LOG.error("Extraction unit failed: %s | %s", unit.get("label", "unknown"), message)
 
 
 def apply_batch_result(batch: List[Dict[str, Any]], parsed: Any, used: str) -> None:
@@ -2420,9 +2239,6 @@ def apply_batch_result(batch: List[Dict[str, Any]], parsed: Any, used: str) -> N
 
 
 def process_units(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -> None:
-    started = time.monotonic()
-    LOG.info("[TRACE %s] UNIT_BATCH_START parts=%d labels=%s", utc_now(), len(batch),
-             ", ".join(unit.get("label", "unknown") for unit in batch))
     try:
         parsed, used = call_gemini_batch(batch, keys)
     except OversizedBatch as exc:
@@ -2431,7 +2247,7 @@ def process_units(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -> No
             process_units(batch[:middle], keys)
             process_units(batch[middle:], keys)
             return
-        unit_failed(batch[0], f"part too large to process even alone ({type(exc).__name__}: {str(exc)[:250]})")
+        unit_failed(batch[0], f"part too large to process even alone ({str(exc)[:150]})")
         return
     except MalformedResponse as exc:
         # A malformed batched response can be caused by output complexity even when
@@ -2442,34 +2258,13 @@ def process_units(batch: List[Dict[str, Any]], keys: List[Dict[str, str]]) -> No
             process_units(batch[:middle], keys)
             process_units(batch[middle:], keys)
             return
-        unit_failed(batch[0], f"Gemini returned invalid JSON ({type(exc).__name__}: {str(exc)[:350]})")
+        unit_failed(batch[0], f"Gemini returned invalid JSON ({str(exc)[:250]})")
         return
     except Exception as exc:  # noqa: BLE001
-        LOG.exception(
-            "Extraction request failed for %s",
-            ", ".join(unit.get("label", "unknown") for unit in batch),
-        )
-        detail = f"{type(exc).__name__}: {clean_text(exc)[:400]}"
         for unit in batch:
-            unit_failed(unit, detail)
+            unit_failed(unit, clean_text(exc)[:300])
         return
-    # A model can return valid JSON while omitting one part of a multi-part
-    # request.  Apply the complete parts immediately, then retry only the
-    # missing parts.  This preserves successful extraction and prevents silent
-    # loss of facts from a partially compliant response.
-    by_label, _ = parsed
-    complete = [unit for unit in batch if unit["label"] in by_label]
-    missing = [unit for unit in batch if unit["label"] not in by_label]
-    if complete:
-        apply_batch_result(complete, (by_label, []), used)
-    if missing:
-        if len(missing) == len(batch) and len(batch) == 1:
-            unit_failed(missing[0], "model returned no entry for this part")
-        else:
-            for unit in missing:
-                process_units([unit], keys)
-    LOG.info("[TRACE %s] UNIT_BATCH_END parts=%d complete=%d missing=%d elapsed=%.2fs",
-             utc_now(), len(batch), len(complete), len(missing), time.monotonic() - started)
+    apply_batch_result(batch, parsed, used)
 
 
 # ---------------------------------------------------------------- ingestion
@@ -2655,11 +2450,11 @@ def finalize_document(docket_id: str, doc: Dict[str, Any], status: str,
             connection.execute(
                 """INSERT INTO facts (id, docket_id, document_id, page_number, label, concept,
                    value, original_value, source_evidence, confidence_band, confidence_score,
-                   decisions_score, confidence_reasons, review_status, corrected, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   confidence_reasons, review_status, corrected, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (str(uuid.uuid4()), docket_id, doc["id"], page_number, clean_text(item["label"]),
                  clean_text(item["concept"]), value, value, evidence,
-                 assessment["band"], assessment["score"], None, json.dumps(assessment["reasons"]),
+                 assessment["band"], assessment["score"], json.dumps(assessment["reasons"]),
                  "pending", 0, now, now),
             )
         connection.execute(
@@ -2681,88 +2476,6 @@ def finalize_document(docket_id: str, doc: Dict[str, Any], status: str,
             "SELECT COUNT(*) FROM facts WHERE document_id = ? "
             "AND concept != 'page_processing_status'", (doc["id"],)
         ).fetchone()[0])
-
-
-def score_decisions_batch(docket_id: str, document_ids: List[str], keys: List[Dict[str, str]]) -> None:
-    """Score one completed extraction batch with one Gemini Decisions request.
-
-    This only writes the nullable comparison column. Main extraction confidence and
-    every extracted occurrence remain unchanged when the Decisions call fails.
-    """
-    if genai is None or types is None or not keys:
-        return
-    with connect() as connection:
-        rows = connection.execute(
-            """SELECT f.id, d.filename, f.label, f.value, f.source_evidence
-               FROM facts f JOIN documents d ON d.id = f.document_id
-               WHERE f.docket_id = ? AND f.document_id IN ({})
-                 AND f.concept != 'page_processing_status'
-               ORDER BY f.created_at, f.id""".format(
-                ",".join("?" for _ in document_ids)
-            ), [docket_id, *document_ids],
-        ).fetchall()
-    if not rows or len(rows) > 1000:
-        LOG.warning("Skipping Decisions scoring for docket %s: %d occurrences (limit 1000)",
-                    docket_id, len(rows))
-        return
-    started = time.monotonic()
-    LOG.info("[TIMING] Decisions scoring START docket=%s occurrences=%d", docket_id, len(rows))
-    input_text = "\n".join(
-        f"Occurrence {index}: document={row['filename']}; label={row['label']}; "
-        f"value={row['value']}; evidence={row['source_evidence']}"
-        for index, row in enumerate(rows)
-    )
-    questions = {
-        f"q_{index}": {
-            "type": "noul",
-            "instructions": f"Is the extracted value for Occurrence {index} correct according to its supplied evidence?",
-            "criteria": {
-                "true_description": "The label, value, and evidence agree and the value is a reliable transcription.",
-                "false_description": "The value is missing, contradicted, ambiguous, or not supported by the evidence.",
-            },
-        }
-        for index in range(len(rows))
-    }
-    client = None
-    try:
-        client = genai.Client(
-            api_key=keys[0]["key"],
-            http_options=types.HttpOptions(api_version="v1beta", timeout=DECISIONS_TIMEOUT_MS),
-        )
-        if not hasattr(client, "decisions"):
-            LOG.warning(
-                "Gemini Decisions is unavailable in the installed google-genai SDK; "
-                "upgrade to google-genai>=3.2.0. Existing confidence scores were preserved."
-            )
-            return
-        LOG.info("[TIMING] Decisions client ready docket=%s elapsed=%.2fs",
-                 docket_id, time.monotonic() - started)
-        result = client.decisions.create(
-            model="gemini-decision-1", input=input_text, questions=questions,
-        )
-        LOG.info("[TIMING] Decisions response received docket=%s elapsed=%.2fs",
-                 docket_id, time.monotonic() - started)
-        answers = getattr(result, "answers", {}) or {}
-        updates = []
-        for index, row in enumerate(rows):
-            answer = answers.get(f"q_{index}")
-            probability = getattr(answer, "noul", None) if answer is not None else None
-            if probability is not None:
-                updates.append((max(0, min(100, round(float(probability) * 100))), row["id"]))
-        if updates:
-            with connect() as connection:
-                connection.executemany("UPDATE facts SET decisions_score = ? WHERE id = ?", updates)
-        LOG.info("[TIMING] Decisions scoring END docket=%s updates=%d elapsed=%.2fs",
-                 docket_id, len(updates), time.monotonic() - started)
-    except Exception as exc:  # noqa: BLE001
-        LOG.warning("[TIMING] Gemini Decisions scoring FAILED docket=%s elapsed=%.2fs error=%s",
-                    docket_id, time.monotonic() - started, scrub(exc, keys[0]["key"]))
-    finally:
-        if client is not None:
-            try:
-                client.close()
-            except Exception:  # noqa: BLE001
-                pass
 
 
 def _fact_group_key(label: str, concept: str) -> str:
@@ -3019,9 +2732,6 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
             )
 
         for document_index, doc in enumerate(documents, start=1):
-            document_started = time.monotonic()
-            LOG.info("[TIMING] Document START %d/%d filename=%s pages=%d",
-                     document_index, len(documents), doc["filename"], doc["page_count"])
             set_document_status(doc["id"], "processing")
             _job_doc_update(job_id, doc["id"], filename=doc["filename"], status="processing",
                             facts=0, message="Sending to Gemini…")
@@ -3050,11 +2760,7 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
                 # A Gemini request can therefore never contain units from another
                 # uploaded document.
                 batches = pack_batches([u for u in units if u["status"] is None])
-                LOG.info("[TRACE %s] DOCUMENT_UNITS_READY filename=%s units=%d batches=%d",
-                         utc_now(), doc["filename"], len(units), len(batches))
                 for request_index, batch in enumerate(batches, start=1):
-                    LOG.info("[TRACE %s] DOCUMENT_BATCH_START filename=%s batch=%d/%d parts=%d",
-                             utc_now(), doc["filename"], request_index, len(batches), len(batch))
                     progress(
                         f"{doc['filename']}: request {request_index}/{len(batches)}"
                     )
@@ -3070,9 +2776,6 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
                     items,
                     " | ".join(messages),
                 )
-                LOG.info("[TIMING] Document SAVE END filename=%s status=%s facts=%d elapsed=%.2fs",
-                         doc["filename"], outcome["status"], outcome["appended_count"],
-                         time.monotonic() - document_started)
                 results.append(outcome)
                 _job_doc_update(job_id, doc["id"], status=outcome["status"],
                                 facts=outcome["appended_count"], message=outcome["message"])
@@ -3085,13 +2788,6 @@ def _run_processing_job(job_id: str, docket_id: str, uploads: List[Dict[str, Any
                 results.append(job_result(doc["filename"], "failed", message))
                 _job_doc_update(job_id, doc["id"], status="failed", facts=0, message=message)
                 mark_done()
-        # Score the whole completed extraction batch in one Decisions request. This
-        # deliberately runs after all document facts are durable and never blocks or
-        # overwrites the existing confidence_score column.
-        LOG.info("[TIMING] Entering Decisions scoring docket=%s documents=%d",
-                 docket_id, len(documents))
-        score_decisions_batch(docket_id, [doc["id"] for doc in documents], keys)
-        LOG.info("[TIMING] Finished Decisions scoring docket=%s", docket_id)
         with PROCESSING_LOCK:
             PROCESSING_JOBS[job_id].update(
                 status="complete", phase="complete", gemini_active=False,
@@ -3161,40 +2857,6 @@ _LOADER_CSS = """
 </style>
 """
 
-# Machine-enforced response contract; parsing remains defensive for models that stop
-# with a response which does not satisfy structured output.
-EXTRACTION_RESPONSE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "documents": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "document": {"type": "string"},
-                    "document_type": {"type": "string"},
-                    "facts": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "label": {"type": "string"},
-                            },
-                            # Keep value and audit fields permissive because blurry
-                            # fields may legitimately return null or omit optional
-                            # vision metadata. The label itself is never optional.
-                            "required": ["label"],
-                        },
-                    },
-                },
-                "required": ["document", "document_type", "facts"],
-            },
-        },
-        "cross_references": {"type": "array", "items": {"type": "object"}},
-    },
-    "required": ["documents", "cross_references"],
-}
-
 
 PROCESSING_SUMMARY_SECONDS = 90
 
@@ -3235,7 +2897,8 @@ def _render_processing_status(job: Optional[Dict[str, Any]]) -> None:
     if not job:
         return
     if job["status"] in {"queued", "running"}:
-        done, total = processing_counts(job["docket_id"], job)
+        total = max(0, int(job.get("total_docs") or 0))
+        done = max(0, min(int(job.get("done_docs") or 0), total)) if total else 0
         percent = round(100 * done / total) if total else 0
         if job.get("gemini_active"):
             title = "Gemini is extracting facts"
@@ -3243,6 +2906,9 @@ def _render_processing_status(job: Optional[Dict[str, Any]]) -> None:
             title = "Queued for processing"
         else:
             title = "Processing saved documents"
+        # Keep progress outside st.status so hosted Streamlit cannot hide it inside a
+        # collapsed status container. The custom panel also keeps the spinner visible.
+        st.progress(percent, text=f"Overall document progress · {done}/{total} finished")
         _render_processing_panel(
             job,
             title=f"{title}…",
@@ -3263,6 +2929,7 @@ def _render_processing_status(job: Optional[Dict[str, Any]]) -> None:
         for row in rows:
             counts[row["status"]] = counts.get(row["status"], 0) + 1
         facts = sum(row["facts"] for row in rows)
+        st.progress(100, text="Overall document progress · complete")
         summary = " · ".join(
             f"{document_state_label(status)}: {counts[status]}"
             for status in ("completed", "partial", "failed") if status in counts
@@ -3326,7 +2993,8 @@ def _render_processing_panel(job: Dict[str, Any], title: str, message: str,
 def _render_processing_inline(job: Dict[str, Any]) -> None:
     """Show the active run beside the process button in Workspace."""
     # Read the shared worker snapshot so the inline indicator updates with the queue.
-    done, total = processing_counts(job["docket_id"], job)
+    total = max(0, int(job.get("total_docs") or 0))
+    done = max(0, min(int(job.get("done_docs") or 0), total)) if total else 0
     percent = round(100 * done / total) if total else 0
     # Put the spinner and plain-language message directly beside the disabled button.
     st.markdown(
@@ -3337,6 +3005,8 @@ def _render_processing_inline(job: Dict[str, Any]) -> None:
         + f'<div class="pp-msg">{done} of {total} document(s) finished</div></div></div>',
         unsafe_allow_html=True,
     )
+    # Use Streamlit's native progress control so the percentage remains readable.
+    st.progress(percent, text=f"Overall progress · {done}/{total} finished")
 
 
 def _render_processing_recovered() -> None:
@@ -3349,6 +3019,7 @@ def _render_processing_recovered() -> None:
         + '<div class="pp-msg">The documents are queued or processing.</div></div></div>',
         unsafe_allow_html=True,
     )
+    st.progress(0, text="Waiting for live worker progress…")
 
 
 def _watch_processing_progress(job: Optional[Dict[str, Any]]) -> None:
@@ -3361,15 +3032,7 @@ def _watch_processing_progress(job: Optional[Dict[str, Any]]) -> None:
     mid-run doesn't trigger a pointless rerun."""
     if not job:
         return
-    # Include the persisted fact count, not only the worker counter. A document is
-    # saved before the worker increments done_docs, and this makes the UI refresh
-    # immediately when facts become durable in SQLite.
-    with connect() as connection:
-        fact_count = int(connection.execute(
-            "SELECT COUNT(*) FROM facts WHERE docket_id = ? AND concept != 'page_processing_status'",
-            (job["docket_id"],),
-        ).fetchone()[0])
-    progress_mark = (job["id"], job.get("done_docs", 0), fact_count)
+    progress_mark = (job["id"], job.get("done_docs", 0))
     if progress_mark == st.session_state.get("last_seen_progress"):
         return
     st.session_state["last_seen_progress"] = progress_mark
@@ -3403,22 +3066,13 @@ def processing_active(docket_id: Optional[str]) -> bool:
 def save_uploaded_document(docket_id: str, upload: Any) -> Dict[str, Any]:
     """Store ONE uploaded file without processing it. Saving and extraction are
     deliberately independent: the document lands in the Workspace as “saved”."""
-    started = time.monotonic()
     filename = upload_name(upload)
-    LOG.info("[TRACE %s] UPLOAD_RECEIVED docket=%s filename=%s", utc_now(), docket_id, filename)
     data = upload_data(upload)
-    LOG.info("[TRACE %s] UPLOAD_BYTES_READ filename=%s bytes=%d elapsed=%.2fs",
-             utc_now(), filename, len(data), time.monotonic() - started)
     problem = validate_upload(filename, data)
     if problem:
-        LOG.warning("[TRACE %s] UPLOAD_REJECTED filename=%s reason=%s", utc_now(), filename, problem)
         return job_result(filename, "failed", problem)
     try:
-        LOG.info("[TRACE %s] PREPARE_DOCUMENT_START filename=%s", utc_now(), filename)
         doc, skipped = prepare_document(docket_id, filename, data, "Gemini")
-        LOG.info("[TRACE %s] PREPARE_DOCUMENT_END filename=%s pages=%s elapsed=%.2fs",
-                 utc_now(), filename, doc.get("page_count") if doc else "skipped",
-                 time.monotonic() - started)
     except Exception as exc:  # noqa: BLE001
         LOG.exception("could not store %s", filename)
         return job_result(filename, "failed",
@@ -3426,8 +3080,6 @@ def save_uploaded_document(docket_id: str, upload: Any) -> Dict[str, Any]:
     if doc is None:
         return skipped  # identical to an already-completed document
     set_document_status(doc["id"], "saved")
-    LOG.info("[TRACE %s] UPLOAD_SAVED filename=%s document_id=%s elapsed=%.2fs",
-             utc_now(), filename, doc["id"], time.monotonic() - started)
     return job_result(filename, "saved",
                       f"Stored {doc['page_count']} page(s)/sheet(s). Not processed yet.")
 
@@ -3591,13 +3243,7 @@ def _prune_finished_jobs() -> None:
 def queue_saved_documents(docket_id: str, document_ids: List[str]) -> Tuple[int, List[Dict[str, Any]]]:
     """Queue saved documents for background extraction, from stored bytes only.
     Returns (count queued, immediate failure results) and flashes suitable messages."""
-    queue_started = time.monotonic()
-    LOG.info("[TRACE %s] PROCESS_CLICK docket=%s requested_document_ids=%s",
-             utc_now(), docket_id, ",".join(map(str, document_ids)))
     keys = key_pool()
-    LOG.info("[TRACE %s] KEY_POOL_READY docket=%s valid_keys=%d models=%s elapsed=%.2fs",
-             utc_now(), docket_id, len(keys), ",".join(GEMINI_MODELS),
-             time.monotonic() - queue_started)
     if not keys:
         queue_flash(
             "error",
@@ -3619,19 +3265,13 @@ def queue_saved_documents(docket_id: str, document_ids: List[str]) -> Tuple[int,
         if row["id"] not in wanted or row["status"] not in PROCESSABLE_STATES:
             continue
         document, problem = load_saved_document(docket_id, row["id"])
-        LOG.info("[TRACE %s] QUEUE_DOCUMENT_CHECK filename=%s status=%s bytes=%s",
-                 utc_now(), row["filename"], row["status"], row["size_bytes"])
         if problem:
-            LOG.error("[TRACE %s] QUEUE_DOCUMENT_REJECTED filename=%s reason=%s",
-                      utc_now(), row["filename"], problem)
             set_document_status(row["id"], "failed")
             results.append(job_result(row["filename"], "failed", problem))
             docs.append({"id": row["id"], "filename": row["filename"], "status": "failed",
                          "facts": 0, "message": problem})
             continue
         set_document_status(row["id"], "queued")
-        LOG.info("[TRACE %s] DOCUMENT_QUEUED filename=%s document_id=%s", utc_now(),
-                 row["filename"], row["id"])
         docs.append({"id": row["id"], "filename": row["filename"], "status": "queued",
                      "facts": 0, "message": ""})
         # Snapshot review decisions now; the document's existing facts stay in place until
@@ -3649,43 +3289,10 @@ def queue_saved_documents(docket_id: str, document_ids: List[str]) -> Tuple[int,
             "results": results, "total_docs": len(payloads), "done_docs": 0, "finished_at": 0.0,
             "docs": docs,
         }
-    # Keep the run denominator in the Streamlit session as a fallback for hosted
-    # reruns where the in-memory worker snapshot is briefly unavailable.
-    st.session_state[f"processing_run_{docket_id}"] = {
-        "ids": [payload["document"]["id"] for payload in payloads],
-        "total": len(payloads),
-    }
     PROCESSING_EXECUTOR.submit(_run_processing_job, job_id, docket_id, payloads, keys, results)
-    LOG.info("[TRACE %s] WORKER_SUBMITTED job_id=%s docket=%s documents=%d elapsed=%.2fs",
-             utc_now(), job_id, docket_id, len(payloads), time.monotonic() - queue_started)
     queue_flash("success", f"Queued {len(payloads)} document(s) for Gemini extraction. "
                            "Progress appears in step 2; you can switch tabs safely.")
     return len(payloads), results
-
-
-def processing_counts(docket_id: str, job: Optional[Dict[str, Any]]) -> Tuple[int, int]:
-    """Return completed/total counts using the worker, then durable session/DB state."""
-    total = int((job or {}).get("total_docs") or 0)
-    done = int((job or {}).get("done_docs") or 0)
-    run = st.session_state.get(f"processing_run_{docket_id}") or {}
-    run_ids = [str(item) for item in run.get("ids") or []]
-    if total <= 0:
-        total = int(run.get("total") or len(run_ids))
-    if run_ids:
-        placeholders = ",".join("?" for _ in run_ids)
-        with connect() as connection:
-            done = int(connection.execute(
-                f"SELECT COUNT(*) FROM documents WHERE id IN ({placeholders}) "
-                "AND status IN ('completed', 'partial', 'failed')", run_ids,
-            ).fetchone()[0])
-    elif total <= 0 and docket_id:
-        with connect() as connection:
-            total = int(connection.execute(
-                "SELECT COUNT(*) FROM documents WHERE docket_id = ? "
-                "AND status IN ('queued', 'processing', 'saving', 'completed', 'partial', 'failed')",
-                (docket_id,),
-            ).fetchone()[0])
-    return max(0, min(done, total)) if total else 0, max(0, total)
 
 
 @st.fragment(run_every=1)
@@ -3786,11 +3393,7 @@ def render_process_panel(docket_id: str) -> None:
             )
             if start_selected or start_all:
                 ids = list(chosen) if start_selected else list(labels)
-                LOG.info("[TRACE %s] PROCESS_BUTTON_CLICK docket=%s mode=%s selected=%d",
-                         utc_now(), docket_id, "selected" if start_selected else "all", len(ids))
                 queued_count, immediate_results = queue_saved_documents(docket_id, ids)
-                LOG.info("[TRACE %s] PROCESS_BUTTON_RESULT docket=%s queued=%d immediate_results=%d",
-                         utc_now(), docket_id, queued_count, len(immediate_results))
                 if immediate_results:
                     st.session_state["last_results"] = immediate_results
                 st.session_state["clear_process_pick"] = True
@@ -3942,7 +3545,6 @@ def viewer_metadata_records(docket_id: str) -> List[dict]:
             "label": row["label"],
             "value": row["value"],
             "confidence_score": int(row["confidence_score"]),
-            "decisions_score": row["decisions_score"],
             "review_status": row["review_status"],
         }
         for row in fetch_metadata(docket_id)
@@ -3957,7 +3559,6 @@ def viewer_validated_base_records(docket_id: str) -> List[dict]:
             "label": row["label"],
             "value": row["value"],
             "confidence_score": int(row["confidence_score"]),
-            "decisions_score": row["decisions_score"],
             "review_status": row["review_status"],
             "source_label": row["label"],
             "record_id": row["id"],
@@ -3988,11 +3589,8 @@ def client_template_records(docket_id: str, template: sqlite3.Row) -> Tuple[List
     output: List[dict] = []
     if field_rows:
         with connect() as connection:
-            fact_columns = {row["name"] for row in connection.execute("PRAGMA table_info(facts)")}
-            decisions_select = "f.decisions_score" if "decisions_score" in fact_columns else "NULL"
             rows = connection.execute(
-                f"""SELECT f.id, f.label, d.filename AS document_name, f.value, f.confidence_score,
-                          {decisions_select} AS decisions_score
+                """SELECT f.id, f.label, d.filename AS document_name, f.value, f.confidence_score
                    FROM facts f JOIN documents d ON d.id = f.document_id
                    WHERE f.docket_id = ? AND f.concept != 'page_processing_status'""",
                 (docket_id,),
@@ -4034,7 +3632,6 @@ def client_template_records(docket_id: str, template: sqlite3.Row) -> Tuple[List
                         "document_name": primary_record["document_name"],
                         "label": field["destination_label"], "value": primary_record["value"],
                         "confidence_score": int(primary_record["confidence_score"]),
-                        "decisions_score": primary_record["decisions_score"],
                         "source_label": primary_record["label"], "record_id": primary_record["id"],
                     })
                     matched[field["id"]] += 1
@@ -4046,7 +3643,6 @@ def client_template_records(docket_id: str, template: sqlite3.Row) -> Tuple[List
                         "document_name": record["document_name"],
                         "label": field["destination_label"], "value": record["value"],
                         "confidence_score": int(record["confidence_score"]),
-                        "decisions_score": record["decisions_score"],
                         "source_label": record["label"], "record_id": record["id"],
                     })
                     matched[field["id"]] += 1
@@ -4058,7 +3654,6 @@ def client_template_records(docket_id: str, template: sqlite3.Row) -> Tuple[List
                     "document_name": record["document_name"],
                     "label": field["destination_label"], "value": record["value"],
                     "confidence_score": int(record["confidence_score"]),
-                    "decisions_score": record["decisions_score"],
                     "source_label": record["label"], "record_id": record["id"],
                 })
                 matched[field["id"]] += 1
@@ -4236,10 +3831,6 @@ def inject_css() -> None:
         }
 
         /* navigation */
-        .nav-bottom-spacing { height: 14px; }
-        .document-card-icon { width:180px; height:96px; display:grid; place-items:center;
-            border:1px dashed var(--line); border-radius:8px; background:var(--panel2);
-            font-size:38px; margin-bottom:10px; }
         button[kind="tertiary"], button[data-testid="stBaseButton-tertiary"] {
             color: var(--muted) !important; font-weight: 600 !important; background: transparent !important;
             border: 1px solid transparent !important; border-radius: 8px !important; }
@@ -4382,12 +3973,11 @@ def render_topbar_status(docket_id: Optional[str]) -> None:
         )
     processing_chip = ""
     if (active_job and active_job["status"] in {"queued", "running"}) or database_active:
-        done, total = processing_counts(docket_id, active_job) if docket_id else (0, 0)
         processing_chip = (
             '<span class="chip processing" role="status" aria-live="polite" '
             'title="Document extraction is active">'
             '<span class="topbar-throbber" aria-hidden="true"></span>'
-            f'Processing Documents {done}/{total}</span>'
+            'Processing documents, please wait</span>'
         )
     extra = ""
     if cooling:
@@ -4455,7 +4045,8 @@ def render_topbar(dockets: List[sqlite3.Row]) -> Optional[sqlite3.Row]:
                 unsafe_allow_html=True,
             )
         else:
-            st.empty()
+            st.button("＋ Create your first docket", type="primary", on_click=go_to, args=("Dockets",),
+                      **stretch())
     with chips_col:
         render_topbar_status(str(current_docket["id"]) if current_docket is not None else None)
 
@@ -4465,7 +4056,7 @@ def render_topbar(dockets: List[sqlite3.Row]) -> Optional[sqlite3.Row]:
             st.button(f"{PAGE_ICONS[page]}  {page}", key=f"nav_{page}",
                       type="primary" if page == current else "tertiary",
                       on_click=go_to, args=(page,), **stretch())
-    st.markdown('<div class="nav-bottom-spacing"></div>', unsafe_allow_html=True)
+    st.divider()
     return active_docket(dockets)
 
 
@@ -4526,15 +4117,6 @@ def delete_document_callback(docket_id: str, document_id: str, filename: str) ->
         queue_flash("success", f"“{filename}” and its extracted facts were removed.")
     else:
         queue_flash("warning", "That document was already removed.")
-
-
-@guarded
-def rename_document_callback(docket_id: str, document_id: str, input_key: str) -> None:
-    try:
-        rename_document(docket_id, document_id, st.session_state.get(input_key, ""))
-        queue_flash("success", "Document renamed.")
-    except ValueError as exc:
-        queue_flash("error", str(exc))
 
 
 @guarded
@@ -4622,63 +4204,84 @@ def page_workspace(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) ->
                     "Save files in step 1 above. They stay available here until you process or remove them.")
         return
 
-    st.markdown("**Documents**")
-    for start in range(0, len(documents), 2):
-        card_cols = st.columns(2, gap="medium")
-        for slot, document in enumerate(documents[start:start + 2]):
-            with card_cols[slot]:
-                with st.container(border=True):
-                    path = resolve_stored_safe(document["storage_path"])
-                    if path is not None and extension_of(path.name) in {"png", "jpg", "jpeg"}:
-                        st.image(path.read_bytes(), width=180)
-                    elif path is not None and extension_of(path.name) == "pdf" and pymupdf is not None:
-                        try:
-                            st.image(render_pdf_page(str(path), 1, path.stat().st_mtime), width=180)
-                        except Exception:
-                            st.caption("PDF preview unavailable")
-                    else:
-                        st.markdown("<div class='document-card-icon'>📄</div>", unsafe_allow_html=True)
-                    title_col, state_col = st.columns([3, 2], vertical_alignment="center")
-                    title_col.markdown(f"**{esc(document['filename'])}**", unsafe_allow_html=True)
-                    state_col.markdown(document_state_badge(document["status"]), unsafe_allow_html=True)
-                    st.caption(f"{document['mime_type']} · {document['page_count']} page(s)/sheet(s) · "
-                               f"{fmt_size(document['size_bytes'])} · "
-                               f"{document['processed_units']}/{document['page_count']} processed")
-                    rename_key = f"rename_document_{document['id']}"
-                    st.text_input("Document name", value=document["filename"], key=rename_key,
-                                  max_chars=255)
-                    rename_col, download_col, process_col, delete_col = st.columns(4)
-                    rename_col.button("Rename", key=f"rename_document_button_{document['id']}",
-                                      on_click=rename_document_callback,
-                                      args=(docket_id, document["id"], rename_key), **stretch())
-                    data, problem = read_verified(document["storage_path"], document["sha256"])
-                    if data is not None:
-                        download_col.download_button("Download", data, file_name=document["filename"],
-                                                     mime=document["mime_type"],
-                                                     key=f"download_document_{document['id']}", **stretch())
-                    else:
-                        download_col.button("Unavailable", disabled=True, key=f"unavailable_{document['id']}", **stretch())
-                    can_process = document["status"] in PROCESSABLE_STATES
-                    if can_process:
-                        if process_col.button("Process", type="primary",
-                                              key=f"process_one_{document['id']}",
-                                              disabled=processing_active(docket_id), **stretch()):
-                            queue_saved_documents(docket_id, [document["id"]])
-                            st.rerun(scope="app")
-                    else:
-                        process_col.button("Processed", disabled=True,
-                                           key=f"processed_{document['id']}", **stretch())
-                    with delete_col.popover("Delete", **stretch()):
-                        st.caption("Deletes the original, pages and extracted facts.")
-                        confirm_key = f"card_confirm_doc_{document['id']}"
-                        st.checkbox("I understand", key=confirm_key)
-                        st.button("Delete permanently", type="primary",
-                                  key=f"card_remove_doc_{document['id']}",
-                                  disabled=not st.session_state.get(confirm_key, False),
-                                  on_click=delete_document_callback,
-                                  args=(docket_id, document["id"], document["filename"]))
-                    if problem:
-                        st.error(problem, icon="🚫")
+    st.dataframe(
+        [
+            {
+                "Document": d["filename"],
+                "State": document_state_label(d["status"]),
+                "Type": d["document_type"],
+                "Pages": d["page_count"],
+                "Processed": f"{d['processed_units']}/{d['page_count']}",
+                "Completeness": d["completeness_status"],
+                "Size": fmt_size(d["size_bytes"]),
+                "Extraction": d["extraction_mode"],
+                "Added": display_time(d["created_at"]),
+                "File on disk": "✔" if resolve_stored_safe(d["storage_path"]) else "missing",
+            }
+            for d in documents
+        ],
+        hide_index=True,
+        **stretch(),
+    )
+
+    st.markdown("#### 4 · Document actions")
+    by_id = {d["id"]: d for d in documents}
+    chosen_id = st.selectbox(
+        "Choose a document",
+        list(by_id),
+        format_func=lambda i: f"{by_id[i]['filename']} — {document_state_label(by_id[i]['status'])}",
+        key="file_pick",
+        help="Select the document you want to inspect, download, process or remove.",
+    )
+    chosen = by_id[chosen_id]
+    with st.container(border=True):
+        badge_col, hint_col = st.columns([3, 1])
+        badge_col.markdown(
+            f"**{esc(chosen['filename'])}** · {document_state_badge(chosen['status'])}",
+            unsafe_allow_html=True,
+        )
+        hint_col.caption(f"{document_state_label(chosen['status'])}")
+        st.caption(f"{chosen['mime_type']} · {chosen['page_count']} page(s)/sheet(s) · "
+                   f"{fmt_size(chosen['size_bytes'])} · added {display_time(chosen['created_at'])}")
+        data, problem = read_verified(chosen["storage_path"], chosen["sha256"])
+        action_cols = st.columns([2, 1, 2], vertical_alignment="center")
+        with action_cols[0]:
+            if chosen["status"] in PROCESSABLE_STATES:
+                if st.button(
+                    "Process this document",
+                    type="primary",
+                    key=f"process_one_{chosen_id}",
+                    disabled=processing_active(docket_id),
+                    help="Run Gemini extraction on the stored original now.",
+                    **stretch(),
+                ):
+                    queue_saved_documents(docket_id, [chosen_id])
+                    st.rerun(scope="app")
+            elif chosen["status"] in ("queued", "processing", "saving"):
+                st.button("Process this document", disabled=True,
+                          help="This document is already queued or processing.", **stretch())
+            else:
+                st.button("Process this document", disabled=True,
+                          help="Already processed. Remove it and save it again to re-extract.",
+                          **stretch())
+        with action_cols[1]:
+            if data is not None:
+                st.download_button("Download", data, file_name=chosen["filename"],
+                                   mime=chosen["mime_type"], **stretch())
+            else:
+                st.button("Unavailable", disabled=True, help=problem, **stretch())
+        with action_cols[2]:
+            with st.popover("Remove document", **stretch()):
+                st.markdown(f"Remove **{chosen['filename']}**?")
+                st.caption("Deletes the stored original, its pages and every fact extracted from it. "
+                           "Other documents are unaffected.")
+                confirm_key = f"confirm_doc_{chosen_id}"
+                st.checkbox("I understand", key=confirm_key)
+                st.button("Remove permanently", type="primary", key=f"remove_doc_{chosen_id}",
+                          disabled=not st.session_state.get(confirm_key, False),
+                          on_click=delete_document_callback, args=(docket_id, chosen_id, chosen["filename"]))
+        if problem:
+            st.error(problem, icon="🚫")
 
     with st.expander("5 · Docket actions"):
         st.caption("Rename or delete this docket. Deleting removes all of its documents and stored files.")
@@ -4696,9 +4299,9 @@ def page_workspace(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) ->
 
 @st.cache_data(show_spinner=False, max_entries=48)
 def render_pdf_page(path: str, page_number: int, mtime: float) -> bytes:
-    with pymupdf.open(path) as document:
+    with fitz.open(path) as document:
         index = min(max(1, page_number), document.page_count) - 1
-        return document[index].get_pixmap(matrix=pymupdf.Matrix(1.5, 1.5)).tobytes("png")
+        return document[index].get_pixmap(matrix=fitz.Matrix(1.5, 1.5)).tobytes("png")
 
 
 def source_preview(fact: sqlite3.Row) -> None:
@@ -4712,7 +4315,7 @@ def source_preview(fact: sqlite3.Row) -> None:
     try:
         if extension in ("png", "jpg", "jpeg"):
             st.image(path.read_bytes(), caption=f"{fact['filename']}", **stretch())
-        elif extension == "pdf" and pymupdf is not None:
+        elif extension == "pdf" and fitz is not None:
             image = render_pdf_page(str(path), fact["page_number"], path.stat().st_mtime)
             st.image(image, caption=f"{fact['filename']} · page {fact['page_number']}", **stretch())
         elif extension == "txt":
@@ -4969,27 +4572,6 @@ def _render_grouping(active: sqlite3.Row) -> None:
 def _render_create(active: sqlite3.Row, metadata: List[dict]) -> None:
     """Create an ordered template from live group or label sources."""
     docket_id = active["id"]
-    all_labels = unique_labels(metadata)
-    with st.container(border=True):
-        st.markdown("**Default template from Main Metadata**")
-        st.caption("Select all currently available Main Metadata labels. This creates a normal editable template and never changes Main Metadata.")
-        default_name = st.text_input("Default template name", value="Main Metadata — All Labels",
-                                     key=f"org_default_name_{docket_id}", max_chars=120)
-        if st.button("Create from all Main Metadata labels", key=f"org_default_save_{docket_id}",
-                     disabled=not all_labels or not default_name.strip(), **stretch()):
-            try:
-                template_id = save_template(docket_id, default_name, all_labels)
-                save_template_fields(template_id, [
-                    {"source_type": "label", "source_id": label, "source_name": label,
-                     "destination_label": label, "position": index + 1}
-                    for index, label in enumerate(all_labels)
-                ])
-            except ValueError as exc:
-                st.error(str(exc), icon="🚫")
-            else:
-                queue_flash("success", f"Created “{clean_text(default_name).strip()}” from Main Metadata labels.")
-                st.rerun()
-    st.markdown("#### Custom Client Template")
     with connect() as connection:
         groups = load_groups(connection, docket_id)
         all_rows = connection.execute(
@@ -5060,13 +4642,7 @@ def _render_apply(active: sqlite3.Row, metadata: List[dict]) -> None:
                                   key=f"org_apply_pick_{docket_id}")
     template = next(row for row in templates if row["name"] == selected)
     template_id = template["id"]
-    raw_template_labels = json.loads(template["labels_json"])
-    template_labels = [
-        str(item.get("label") or item.get("destination_label") or "").strip()
-        if isinstance(item, dict) else str(item).strip()
-        for item in raw_template_labels
-    ]
-    template_labels = [label for label in template_labels if label]
+    template_labels = json.loads(template["labels_json"])
     fact_rows = fetch_facts(docket_id)
     document_names = {}
     for fact in fact_rows:
@@ -5081,10 +4657,6 @@ def _render_apply(active: sqlite3.Row, metadata: List[dict]) -> None:
     if not chosen:
         st.info("Select at least one document.")
         return
-    if not template_labels:
-        st.error("This template has no destination labels. Edit the template in Organize → Manage saved templates.",
-                 icon="🚫")
-        return
 
     chosen_records = [
         {"document_name": fact["filename"], "label": fact["label"], "value": fact["value"],
@@ -5092,87 +4664,119 @@ def _render_apply(active: sqlite3.Row, metadata: List[dict]) -> None:
         for fact in fact_rows if fact["document_id"] in set(chosen)
         and fact["concept"] != "page_processing_status"
     ]
-    # Manual mapping board: the same three-column pill language used by Value Groups.
-    # The database remains authoritative; the component only reports one explicit drop.
-    if _template_mapping_component is not None:
-        fields = template_field_rows(template_id)
-        # Older templates may predate template_fields. Materialize their labels as
-        # explicit unmapped placeholders so the mapping board is never blank.
-        if not fields:
-            fields = [
-                {"destination_label": str(label), "source_type": "label",
-                 "source_id": f"__unmapped__:{label}", "source_name": "Unmapped",
-                 "position": index}
-                for index, label in enumerate(template_labels)
-            ]
-        with connect() as connection:
-            groups = load_groups(connection, docket_id)
-        chosen_set = set(chosen)
-        board_documents = []
-        for document_id in chosen:
-            document_facts = [
-                {"id": fact["id"], "label": fact["label"], "value": fact["value"],
-                 "score": int(fact["confidence_score"]), "document_id": document_id,
-                 "document": document_names[document_id]}
-                for fact in fact_rows if fact["document_id"] == document_id
-                and fact["concept"] != "page_processing_status"
-            ]
-            board_documents.append({"id": document_id, "name": document_names[document_id],
-                                    "facts": document_facts})
-        board_groups = []
-        for group in groups:
-            # Always send the complete current group list. Group membership can span
-            # several selected documents, so filtering by one document here made
-            # newly-created or cross-document groups disappear from the board.
-            primary = group["members"][0] if group["members"] else None
-            board_groups.append({"id": group["id"], "name": group["name"],
-                                 "primary": group["primary_label"],
-                                 "score": primary.confidence_score if primary else 0})
-        mappings = {}
-        for field in fields:
-            if str(field["source_id"]).startswith("__unmapped__:"):
-                continue
-            mappings[field["destination_label"]] = {
-                "id": field["source_id"], "kind": field["source_type"],
-                "label": field["source_name"], "value": "",
-            }
-        board = _template_mapping_component(
-            labels=[{"label": field["destination_label"]} for field in fields],
-            mappings=mappings, documents=board_documents, groups=board_groups,
-            key=f"template_mapping_v2_{docket_id}_{template_id}",
-        ) or {}
-        board_action = board.get("action")
-        if board_action in {"map", "remove_mapping"}:
-            try:
-                if board_action == "map":
-                    source_type = "group" if board.get("source_type") == "group" else "label"
-                    source_id = (
-                        str(board.get("group_id") or "")
-                        if source_type == "group"
-                        else str(board.get("source") or "")
-                    )
-                    source_name = str(board.get("name") or board.get("source") or "")
-                    remap_template_field(template_id, str(board.get("target") or ""),
-                                         source_type, source_id, source_name)
-                    queue_flash("success", "Template mapping saved.")
-                else:
-                    target = str(board.get("target") or "")
-                    remap_template_field(template_id, target, "label",
-                                         f"__unmapped__:{target}", "Unmapped")
-                    queue_flash("success", "Mapping removed.")
-            except (ValueError, sqlite3.Error) as exc:
-                st.error(f"Could not save this mapping: {clean_text(exc)}", icon="🚫")
-            else:
+    labels = unique_labels(chosen_records)
+    sources_map = documents_by_label(chosen_records)
+
+    def from_docs(source: str) -> str:
+        names = sources_map.get(normalize_label(source), [])
+        return ", ".join(names) if names else "—"
+
+    current = approved_mappings(docket_id, template_id)
+    current_normalized = {normalize_label(source): target for source, target in current.items()}
+    rejected = rejected_suggestions(docket_id, template_id)
+    rejected_normalized = {(normalize_label(source), normalize_label(target))
+                           for source, target in rejected}
+
+    suggested: Dict[str, List[Dict[str, Any]]] = {}
+    unmatched: List[str] = []
+    for source in labels:
+        exact_target = exact_template_label(source, template_labels)
+        if exact_target is not None:
+            if normalize_label(source) not in current_normalized:
+                save_mapping(docket_id, template_id, source, exact_target, "exact")
+            continue
+        if normalize_label(source) in current_normalized:
+            continue
+        options = [m for m in fuzzy_suggestions(source, template_labels)
+                   if (normalize_label(source), normalize_label(m["label"])) not in rejected_normalized]
+        if options:
+            suggested[source] = options
+        else:
+            unmatched.append(source)
+
+    details = mapping_details(docket_id, template_id)
+
+    st.info(
+        "**How mapping works:** the left label (**source**) comes from Main Metadata, "
+        "the right label (**target**) is a field in your template. "
+        "The output file uses the target name."
+    )
+
+    decided_tab, suggested_tab, unmatched_tab = st.tabs([
+        f"Decided ({len(details)})",
+        f"Suggested ({sum(len(v) for v in suggested.values())})",
+        f"Unmatched ({len(unmatched)})",
+    ])
+
+    with decided_tab:
+        st.subheader("Decided")
+        if not details:
+            st.caption("No mappings yet.")
+        for source, info in sorted(details.items(), key=lambda item: item[0].casefold()):
+            text_col, unmap_col = st.columns([5, 1], vertical_alignment="center")
+            text_col.markdown(
+                f"**{source}**  →  **{info['target']}**  \n"
+                f"<small>from: {esc(from_docs(source))}</small>",
+                unsafe_allow_html=True,
+            )
+            if unmap_col.button("Unmap", key=f"tpl_unmap_{docket_id}_{template_id}_{key_id(source)}",
+                                **stretch()):
+                delete_mapping(docket_id, template_id, source, info["target"])
                 st.rerun()
-        st.markdown("#### Manual mapping board")
-        st.caption("Drag one Main Metadata occurrence or grouped value into each template placeholder. "
-                   "Drop a replacement onto an occupied placeholder to replace it.")
-    else:
-        st.error("The template mapping board is unavailable. Ensure template_mapping_component/index.html "
-                 "is deployed beside app.py.", icon="🚫")
-    # The three-column board is now the complete Apply Existing Template workflow.
-    # Do not render the legacy Decided/Suggested/Unmatched panels beneath it.
-    return
+
+    with suggested_tab:
+        st.subheader("Suggested")
+        if not suggested:
+            st.caption("No suggestions.")
+        for source, options in suggested.items():
+            for match in options:
+                target = match["label"]
+                pid = key_id(f"{source}\u241f{target}")
+                text_col, approve_col, reject_col = st.columns([4, 1, 1], vertical_alignment="center")
+                text_col.markdown(
+                    f"**{source}**  →  **{target}**  ({match['score']:.0f}%)  \n"
+                    f"<small>from: {esc(from_docs(source))}</small>",
+                    unsafe_allow_html=True,
+                )
+                if approve_col.button("Approve", key=f"tpl_approve_{docket_id}_{template_id}_{pid}",
+                                      **stretch()):
+                    save_mapping(docket_id, template_id, source, target, "user-approved")
+                    st.rerun()
+                if reject_col.button("Reject", key=f"tpl_reject_{docket_id}_{template_id}_{pid}",
+                                     **stretch()):
+                    reject_suggestion(docket_id, template_id, source, target)
+                    delete_mapping(docket_id, template_id, source, target)
+                    st.rerun()
+
+    with unmatched_tab:
+        st.subheader("Unmatched")
+        if not unmatched:
+            st.caption("Nothing unmatched.")
+        for source in unmatched:
+            label_col, target_col, map_col, add_col = st.columns([2, 2, 1, 1.5], vertical_alignment="bottom")
+            label_col.markdown(f"**{source}**  \n<small>from: {esc(from_docs(source))}</small>",
+                               unsafe_allow_html=True)
+            occurrences = [record for record in chosen_records
+                           if normalize_label(record["label"]) == normalize_label(source)]
+            with st.expander(f"Inspect {len(occurrences)} occurrence(s) · {source}"):
+                st.dataframe(
+                    [{"Source document": row["document_name"], "Original label": row["label"],
+                      "Value": row["value"], "Confidence score": row["confidence_score"]}
+                     for row in occurrences],
+                    hide_index=True, **stretch(),
+                )
+            target = target_col.selectbox(f"Field for {source}", template_labels,
+                                          key=f"tpl_manual_t_{docket_id}_{template_id}_{key_id(source)}",
+                                          label_visibility="collapsed")
+            if map_col.button("Map", key=f"tpl_manual_b_{docket_id}_{template_id}_{key_id(source)}",
+                              **stretch()):
+                save_mapping(docket_id, template_id, source, target, "manual")
+                st.rerun()
+            if add_col.button("Add as field", key=f"tpl_add_{docket_id}_{template_id}_{key_id(source)}",
+                              **stretch()):
+                append_template_labels(docket_id, template_id, [source])
+                queue_flash("success", f"“{source}” added to {template['name']}.")
+                st.rerun()
 
 def _render_manage(active: sqlite3.Row, metadata: List[dict]) -> None:
     """Rename a template, change its fields, or delete it."""
@@ -5255,19 +4859,7 @@ def _render_manage(active: sqlite3.Row, metadata: List[dict]) -> None:
             st.rerun()
 
 
-ORGANIZE_MODES = ("Create new template", "Apply existing template")
-
-
-def page_groups(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
-    page_header("Groups", "Manually group equivalent extracted occurrences without changing Main Metadata.",
-                active["name"] if active else None)
-    if not need_docket(active):
-        return
-    metadata = metadata_records(active["id"])
-    if not metadata:
-        st.info("Process documents first. Once Main Metadata has facts, groups can be created here.")
-        return
-    _render_grouping(active)
+ORGANIZE_MODES = ("Group values", "Create new template", "Apply existing template")
 
 
 def page_organize(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
@@ -5288,11 +4880,14 @@ def page_organize(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> 
     mode = st.radio("Workflow", list(ORGANIZE_MODES), horizontal=True, key="org_mode",
                     label_visibility="collapsed")
     if mode == ORGANIZE_MODES[0]:
+        _render_grouping(active)
+    elif mode == ORGANIZE_MODES[1]:
         _render_create(active, metadata)
     else:
         _render_apply(active, metadata)
-    with st.expander("Manage saved templates"):
-        _render_manage(active, metadata)
+    if mode != ORGANIZE_MODES[0]:
+        with st.expander("Manage saved templates"):
+            _render_manage(active, metadata)
 
 
 def confidence_score_style(value: object) -> str:
@@ -5306,7 +4901,7 @@ def confidence_score_style(value: object) -> str:
     return "background-color: #8c3540; color: #fff1f2; font-weight: 700"
 
 
-VIEWER_COLUMNS = ["Document Name", "Label", "Value", "Confidence Score", "Decisions Score"]
+VIEWER_COLUMNS = ["Document Name", "Label", "Value", "Confidence Score"]
 
 
 def viewer_frame(rows: List[dict], show_status: bool = False) -> None:
@@ -5324,7 +4919,6 @@ def viewer_frame(rows: List[dict], show_status: bool = False) -> None:
                 "Label": record["label"],
                 "Value": record["value"],
                 "Confidence Score": clamp_confidence(record["confidence_score"], 50),
-                "Decisions Score": record.get("decisions_score"),
                 "Source Label": record.get("source_label", ""),
                 "Record ID": record.get("record_id", ""),
                 "Review Status": record.get("review_status", ""),
@@ -5334,7 +4928,7 @@ def viewer_frame(rows: List[dict], show_status: bool = False) -> None:
         columns=columns,
     )
     st.dataframe(
-        frame.style.map(confidence_score_style, subset=["Confidence Score", "Decisions Score"]),
+        frame.style.map(confidence_score_style, subset=["Confidence Score"]),
         hide_index=True,
         width="stretch",
         height=min(720, max(180, 44 + 36 * len(frame))),
@@ -5349,17 +4943,16 @@ def viewer_template_editor(docket_id: str, template_id: str, rows: List[dict]) -
             "Label": row["label"],
             "Value": row["value"],
             "Confidence Score": int(row["confidence_score"]),
-            "Decisions Score": row.get("decisions_score"),
             "Approved": bool(row.get("review_approved", False)),
             "Source Label": row.get("source_label", ""),
             "Record ID": row["record_id"],
             **({"Review Status": row.get("review_status", "")} if has_status else {}),
         } for row in rows]
-    columns = ["Approved", "Document Name", "Label", "Value", "Confidence Score", "Decisions Score", "Source Label", "Record ID"]
+    columns = ["Approved", "Document Name", "Label", "Value", "Confidence Score", "Source Label", "Record ID"]
     if has_status:
         columns.append("Review Status")
     frame = pd.DataFrame(data, columns=columns)
-    styled_frame = frame.style.map(confidence_score_style, subset=["Confidence Score", "Decisions Score"])
+    styled_frame = frame.style.map(confidence_score_style, subset=["Confidence Score"])
     revision_key = f"viewer_editor_revision_{docket_id}_{template_id}"
     revision = int(st.session_state.get(revision_key, 0))
     edited = st.data_editor(
@@ -5375,12 +4968,11 @@ def viewer_template_editor(docket_id: str, template_id: str, rows: List[dict]) -
             "Label": st.column_config.TextColumn("Label", required=True),
             "Value": st.column_config.TextColumn("Value"),
             "Confidence Score": st.column_config.NumberColumn("Confidence Score"),
-            "Decisions Score": st.column_config.NumberColumn("Decisions Score"),
             "Source Label": st.column_config.TextColumn("Source Label"),
             "Record ID": None,
             **({"Review Status": st.column_config.TextColumn("Review Status")} if has_status else {}),
         },
-        disabled=["Document Name", "Confidence Score", "Decisions Score", "Source Label", "Record ID"]
+        disabled=["Document Name", "Confidence Score", "Source Label", "Record ID"]
                  + (["Review Status"] if has_status else []),
     )
     baseline_by_id = {row["record_id"]: row for row in rows}
@@ -5453,7 +5045,7 @@ def render_viewer_edit_history(docket_id: str) -> None:
 
 def page_viewer(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
     page_header(
-        "Validation",
+        "Viewer",
         "Edit Review Metadata separately from the untouched original — duplicates, "
         "conflicting values, document names and confidence scores are all preserved.",
         active["name"] if active else None,
@@ -5538,23 +5130,6 @@ def page_viewer(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> No
                    "edited records receive confidence 100, while source facts remain untouched.")
         viewer_template_editor(docket_id, editor_template_id, rows)
     render_viewer_edit_history(docket_id)
-
-    with st.expander("Validation checks", expanded=False):
-        st.caption("Deterministic completeness, evidence, consistency and arithmetic checks for this docket.")
-        with st.spinner("Running validation checks…"):
-            report = validation_report(docket_id)
-        counts = {band: sum(row["severity"] == band for row in report) for band in BANDS}
-        check_cols = st.columns(3)
-        check_cols[0].metric("Red issues", counts["Red"])
-        check_cols[1].metric("Yellow issues", counts["Yellow"])
-        check_cols[2].metric("Green", counts["Green"])
-        if counts["Red"] == 0 and counts["Yellow"] == 0:
-            st.success("No unresolved issues. This docket is ready to export.", icon="✅")
-        st.dataframe(
-            [{"Severity": f"{BAND_META[row['severity']][1]} {row['severity']}",
-              "Check": row["check"], "Details": row["message"]} for row in report],
-            hide_index=True, **stretch(),
-        )
 
 
 def page_validation(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> None:
@@ -5750,18 +5325,15 @@ def page_settings(dockets: List[sqlite3.Row], active: Optional[sqlite3.Row]) -> 
 RENDERERS = {
     "Dockets": page_dockets,
     "Workspace": page_workspace,
-    "Validation": page_viewer,
-    "Groups": page_groups,
     "Organize": page_organize,
+    "Viewer": page_viewer,
+    "Validation": page_validation,
     "Export": page_export,
     "Settings": page_settings,
 }
 
 
 def main() -> None:
-    # Streamlit can attach its terminal handler after module import; re-apply the
-    # diagnostic logger configuration at the actual app entry point as well.
-    install_secret_redaction()
     st.set_page_config(page_title="Parchi AI", page_icon="📄", layout="wide",
                        initial_sidebar_state="collapsed")
     inject_css()
